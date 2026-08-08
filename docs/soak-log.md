@@ -51,7 +51,7 @@ Run at or after 16:00 ET each trading day.
 5. **Confirm `intents.submitted` is 0.** In `SHADOW` this must be zero every day. A non-zero value
    is the most serious thing the report can find and stops the soak immediately.
 
-6. **Note `rungVerification.skipped`.** A skip is *not* a pass — it means the day's check could not
+6. **Note `rungVerification.skipped`.** A skip is _not_ a pass — it means the day's check could not
    run. A skipped day cannot count toward a clean week.
 
 ## Restart verification
@@ -81,9 +81,9 @@ a mismatch is the system working. What matters is whether the mismatch itself is
 
 One row per trading day. `Report clean` is the `clean` field from `GET /reports/daily`.
 
-| Date | Intents | Submitted | Cycles closed | Realized | Rung check | Reconciliation | Report clean | Notes |
-|---|---|---|---|---|---|---|---|---|
-| _(not started)_ | | | | | | | | |
+| Date            | Intents | Submitted | Cycles closed | Realized | Rung check | Reconciliation | Report clean | Notes |
+| --------------- | ------- | --------- | ------------- | -------- | ---------- | -------------- | ------------ | ----- |
+| _(not started)_ |         |           |               |          |            |                |              |       |
 
 **Week status:** not started. Clock starts on the first full trading day meeting the preconditions.
 
@@ -94,21 +94,21 @@ One row per trading day. `Report clean` is the `clean` field from `GET /reports/
 Every anomaly, including ones resolved as benign. An anomaly with no root cause recorded is by
 definition unexplained, and an unexplained anomaly restarts the week.
 
-| # | Date | Code | What was observed | Root cause | Resolution | Regression test | Week restarted |
-|---|---|---|---|---|---|---|---|
-| _(none recorded)_ | | | | | | | |
+| #                 | Date | Code | What was observed | Root cause | Resolution | Regression test | Week restarted |
+| ----------------- | ---- | ---- | ----------------- | ---------- | ---------- | --------------- | -------------- |
+| _(none recorded)_ |      |      |                   |            |            |                 |                |
 
 ### Anomaly codes the report raises
 
-| Code | Meaning | Severity |
-|---|---|---|
-| `SUBMISSION_IN_SHADOW` | An intent was recorded as submitted while in `SHADOW` | **Stop the soak.** The mode guarantee has been violated |
-| `RUNG_PRICE_MISMATCH` | An entry intent fired at a price the recomputed ladder does not explain | **Stop and investigate.** State and rules have diverged |
-| `LOT_CLOSED_AT_LOSS` | A lot closed below its fill price | **Stop and investigate.** No code path may book a loss |
-| `RECONCILIATION_MISMATCH` | The last reconciliation did not reconcile cleanly | Investigate; expected in `SHADOW` with a held ladder — see above |
-| `ACTIVE_SYMBOL_HALT` | A symbol is halted and not trading | Investigate the halt's own reason |
-| `INTENT_OUTSIDE_FIRING_WINDOW` | An intent was stamped outside 09:45–16:00 ET | Investigate; the firing window is a hard rule |
-| `RUNG_VERIFICATION_SKIPPED` | The day's rung check could not run | The day does not count toward a clean week |
+| Code                           | Meaning                                                                 | Severity                                                         |
+| ------------------------------ | ----------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `SUBMISSION_IN_SHADOW`         | An intent was recorded as submitted while in `SHADOW`                   | **Stop the soak.** The mode guarantee has been violated          |
+| `RUNG_PRICE_MISMATCH`          | An entry intent fired at a price the recomputed ladder does not explain | **Stop and investigate.** State and rules have diverged          |
+| `LOT_CLOSED_AT_LOSS`           | A lot closed below its fill price                                       | **Stop and investigate.** No code path may book a loss           |
+| `RECONCILIATION_MISMATCH`      | The last reconciliation did not reconcile cleanly                       | Investigate; expected in `SHADOW` with a held ladder — see above |
+| `ACTIVE_SYMBOL_HALT`           | A symbol is halted and not trading                                      | Investigate the halt's own reason                                |
+| `INTENT_OUTSIDE_FIRING_WINDOW` | An intent was stamped outside 09:45–16:00 ET                            | Investigate; the firing window is a hard rule                    |
+| `RUNG_VERIFICATION_SKIPPED`    | The day's rung check could not run                                      | The day does not count toward a clean week                       |
 
 ---
 
