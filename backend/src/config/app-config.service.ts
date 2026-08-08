@@ -37,9 +37,20 @@ export class AppConfigService {
     return this.databaseUrl !== undefined;
   }
 
-  /** IB Gateway host, or undefined when no gateway is configured (Story 10). */
+  /**
+   * IB Gateway host, or undefined when no gateway is configured (Story 10).
+   *
+   * **A blank value is normalized to `undefined`.** Compose passes `IB_HOST:
+   * ${IB_HOST:-}`, so an unset variable arrives as `''` rather than absent, and
+   * `ConfigService.get` reads the raw environment — an empty string here would
+   * make `usesIbBroker` true and bind the IB adapter with no host to reach,
+   * leaving `docker compose up` with no `.env` stuck on a gateway that cannot
+   * connect. Normalizing at the accessor keeps every reader of this switch in
+   * agreement.
+   */
   get ibHost(): string | undefined {
-    return this.config.get('IB_HOST', { infer: true });
+    const host = this.config.get('IB_HOST', { infer: true });
+    return typeof host === 'string' && host.trim() === '' ? undefined : host;
   }
 
   get ibPort(): number {

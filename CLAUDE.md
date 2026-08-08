@@ -2,11 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Follow practices from @WORKING-NOTES.md
+Follow the practices in "Working style" at the end of this file.
 
 ## Current State
 
-Stories 0–12 of `stories.md` are built. The engine runs end to end on mock data: fixtures replay
+Stories 0–12 of `docs/stories.md` are built. The engine runs end to end on mock data: fixtures replay
 through the dip-ladder strategy, the risk manager, and a mock broker, the resulting state is served
 over HTTP, and the dashboard renders it in a browser. `EXECUTION_MODE` is `SHADOW` everywhere and
 **nothing is submitted to any broker**.
@@ -22,7 +22,7 @@ remains is running `SHADOW` against live IB for a full trading week with zero un
 anomalies. `docs/soak-log.md` is the running record and holds the daily procedure and sign-off.
 Story 13 (`PAPER`) is gated on that week completing.
 
-`stories.md` is the plan of record; read the relevant story before starting work on it.
+`docs/stories.md` is the plan of record; read the relevant story before starting work on it.
 
 ## Commands
 
@@ -81,8 +81,13 @@ Coverage thresholds are enforced by Jest exiting non-zero, which fails the job.
 
 ## Architecture
 
-A local, personal quantitative trading platform on the Interactive Brokers API. `PRD.md` is the
-specification and `project-scope.md` the original design note; `stories.md` sequences the work.
+A local, personal quantitative trading platform on the Interactive Brokers API. `docs/PRD.md` is the
+specification and `docs/project-scope.md` the original design note; `docs/stories.md` sequences the
+work.
+
+**In-code citations like `PRD.md:343` refer to `docs/PRD.md`.** The files moved into `docs/` when the
+README was rewritten for outside readers; their contents were not edited, so every line number in
+those ~395 comments still resolves.
 
 **Stack as built:** NestJS backend daemon (`backend/`) · Next.js App Router + Tailwind dashboard
 (`ui/`) · MySQL 8.0 + Prisma · Jest + Supertest · Jest + React Testing Library (`ui/`) ·
@@ -397,3 +402,75 @@ reason; a safety check that cannot fail reports confidence it has not earned.
   new entries, raise an alert, and leave existing positions alone. No code path may auto-liquidate.
 - This code places real orders through a broker. `SHADOW` is the default and stays so until Story 13.
   Confirm before any change that could affect live order submission.
+
+## Working style
+
+### Approach
+
+- Before implementing a change, restate the requirement, identify any ambiguous decisions, and
+  recommend sensible defaults before writing code.
+- Inspect existing patterns before introducing new abstractions, dependencies, or architectural
+  changes. Match the repository's conventions first.
+- Prefer the smallest change that solves the problem. Avoid unrelated refactoring.
+- Explain the implementation plan briefly before making significant code changes.
+- When debugging, identify and verify the root cause before proposing a fix.
+- Consider failure paths (failed requests, empty data, invalid input, unexpected states) before
+  considering a task complete.
+- Before finishing, review the implementation against the original request and identify anything
+  incomplete or any assumptions that were made.
+
+### Development guidelines
+
+These are guiding principles, not rigid rules. When trade-offs exist, explain them briefly and choose
+the approach that best fits the existing architecture.
+
+Prefer solutions that:
+
+- Preserve existing architecture and coding conventions.
+- Keep changes localized and easy to review.
+- Minimize coupling between components and modules.
+- Localize loading and error handling where appropriate.
+- Preserve clear ownership of state and data.
+- Optimize for correctness, readability, and maintainability before optimization.
+
+### Communication
+
+- When multiple reasonable approaches exist, recommend one and explain the trade-offs.
+- State assumptions explicitly instead of silently choosing one interpretation.
+- Keep explanations concise and focused on engineering decisions.
+
+### Next.js conventions
+
+Defaults for this repo, not hard rules — deviate when a requirement or existing pattern doesn't fit,
+and say why.
+
+- **Server vs. Client Components.** Default to Server Components. Add `'use client'` only where
+  `useState`/`useEffect`/event handlers/browser APIs are needed, and prefer isolating just the
+  interactive piece over converting the whole component.
+- **Server Action vs. Route Handler.** Default to a Server Action for mutations from this app's own
+  UI. Use a Route Handler (`route.ts`) only for endpoints called from outside the app (webhooks,
+  third-party clients).
+- **Data fetching location.** Fetch in Server Components or Server Actions, not `useEffect` — a
+  Client Component should receive data as props or from a Server Action's return value, except for
+  genuinely client-only cases (polling, client-only state).
+- **Colocation.** Route-specific components/actions/types live next to the route (`app/characters/`)
+  until reused by more than one route, or unless the repo's existing structure already centralizes
+  that kind of code.
+- **Loading/error boundaries.** Add `loading.tsx`/`error.tsx` per segment where a slow or failing
+  fetch would otherwise block or crash something that doesn't need to be — skip where the boilerplate
+  outweighs the benefit.
+- **Dynamic segment naming.** Match existing bracket conventions (`[id]` vs `[slug]`) where a sibling
+  route sets one; if none exists, pick the clearest name and note you're setting precedent.
+
+### Code comments
+
+Comment **why**, not **what**.
+
+Use comments to explain:
+
+- Non-obvious design decisions.
+- Edge-case handling.
+- Framework or API behavior that isn't immediately apparent.
+- Important trade-offs.
+
+Avoid comments that simply restate what the code already expresses.
