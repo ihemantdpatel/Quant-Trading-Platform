@@ -40,4 +40,30 @@ describe('validateConfig', () => {
   it('names the offending variable in the error message', () => {
     expect(() => validateConfig({ EXECUTION_MODE: 'YOLO' })).toThrow(/EXECUTION_MODE/);
   });
+
+  describe('IB_HOST', () => {
+    it('is undefined when unset, selecting the mock broker', () => {
+      expect(validateConfig({}).IB_HOST).toBeUndefined();
+    });
+
+    it('treats an empty value as unset rather than rejecting it', () => {
+      // Compose passes `IB_HOST: ${IB_HOST:-}`, which supplies '' rather than
+      // omitting the variable. Rejecting blank here crashed the backend at boot
+      // on `docker compose up` with no .env — the default path for a new
+      // checkout, where the mock broker is exactly what should bind.
+      //
+      // This deliberately differs from EXECUTION_MODE above, which rejects
+      // blank: there, a blank value would silently pick a *behaviour* the
+      // operator did not choose. Here, blank and absent select the same broker,
+      // so treating them alike hides nothing.
+      expect(validateConfig({ IB_HOST: '' }).IB_HOST).toBeUndefined();
+      expect(validateConfig({ IB_HOST: '   ' }).IB_HOST).toBeUndefined();
+    });
+
+    it('keeps a real host value', () => {
+      expect(validateConfig({ IB_HOST: 'host.docker.internal' }).IB_HOST).toBe(
+        'host.docker.internal',
+      );
+    });
+  });
 });

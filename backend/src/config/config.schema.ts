@@ -36,8 +36,19 @@ export const configSchema = z.object({
    * Unset keeps the Story 0 property that the whole stack runs and tests green
    * with zero external dependencies. `GET /status` reports which broker is
    * live.
+   *
+   * **An empty string means unset, not invalid.** Compose passes `IB_HOST:
+   * ${IB_HOST:-}` (`docker-compose.yml`), which supplies `''` rather than
+   * omitting the variable — so without this, `docker compose up` with no `.env`
+   * fails validation at boot and the backend never starts. That is the default
+   * path for a new checkout, where the mock broker is exactly what should bind.
+   * Blank is coerced to `undefined` so "absent" and "explicitly blank" select
+   * the same broker; a non-empty value is still validated.
    */
-  IB_HOST: z.string().min(1).optional(),
+  IB_HOST: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.string().min(1).optional(),
+  ),
   /** 4001 live / 4002 paper are IB Gateway's defaults; 7496/7497 are TWS. */
   IB_PORT: z.coerce.number().int().positive().default(4002),
   /**
