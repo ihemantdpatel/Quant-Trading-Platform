@@ -1,0 +1,196 @@
+# Story 10: backend + UI + MySQL, with IB Gateway either on the host or in a
+# container.
+#
+# ## Two ways to reach IB, and the default is the host
+#
+# Most setups already run IB Gateway or TWS as a desktop app. That is the
+# simpler arrangement — the login is interactive and already working, and IBC
+# auto-login in a container is the fragile part of this stack. To use it, point
+# the backend at the host and start nothing extra:
+#
+#     IB_HOST=host.docker.internal   IB_PORT=4001 (live) or 4002 (paper)
+#     docker compose up
+#
+# The containerized gateway below is **opt-in**, behind the `ib-gateway`
+# profile, so it never competes with a Gateway already running on the host for
+# the same client id:
+#
+#     IB_HOST=ib-gateway docker compose --profile ib-gateway up
+#
+# Leave `IB_HOST` unset entirely and the stack runs on mock data with no IB at
+# all, which is what every test and the whole mock-data path depend on.
+
+services:
+  # IB Gateway, headless, with IBC driving the login (`stories.md:583`).
+  #
+  # **Opt-in only** — see the header. Without `--profile ib-gateway` this
+  # service does not start, so a host Gateway is left undisturbed.
+  #
+  # The backend reaches it on the compose network at `ib-gateway:4002`; the
+  # published port is loopback-only, because this container holds live
+  # brokerage credentials and an exposed API port is an unauthenticated order
+  # entry point.
+  #
+  # **Credentials come from the environment and are never committed.** With
+  # `TWS_USERID` unset the container will not authenticate — which is the
+  # correct default, since the whole stack runs on mock data without it.
+  #
+  # `TRADING_MODE` defaults to `paper`. Story 10 runs in SHADOW and submits
+  # nothing regardless, but if that ever changes by mistake, the account it
+  # reaches should not be the funded one.
+  ib-gateway:
+    profiles: ['ib-gateway']
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
+    environment:
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      # IB Gateway logs itself out daily by design. IBC restarts it on a
+      # schedule chosen to sit outside US market hours, so the forced re-auth
+      # the adapter treats as routine happens when no bar is expected
+      # (`reconnect.ts`).
+      TWS_COLD_RESTART: ${TWS_COLD_RESTART:-04:00}
+      TIME_ZONE: ${TIME_ZONE:-America/New_York}
+      READ_ONLY_API: ${READ_ONLY_API:-yes}
+      BYPASS_WARNING: 'yes'
+    ports:
+      # Bound to loopback only — reachable for debugging from this host, never
+      # from the network.
+      - '127.0.0.1:4002:4002'
+    healthcheck:
+      # The API port accepting a TCP connection is what the backend actually
+      # needs; the process being up is not the same thing.
+      test: ['CMD-SHELL', 'nc -z 127.0.0.1 4002 || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  # Durable store for lots, rungs, intents, and the parameter audit trail.
+  # Joins the stack at Story 8 so re-arming and lot composition survive a
+  # restart (`stories.md:483`).
+  mysql:
+    image: mysql:8.0
+    container_name: ib-mysql
+    # `log_bin_trust_function_creators` lets a non-SUPER user create the
+    # append-only triggers on `ParameterChange` while binary logging is on
+    # (error 1419 otherwise). It relaxes a replication-safety check that exists
+    # for *non-deterministic* routines; these triggers only raise SQLSTATE
+    # 45000 and touch no data, so there is nothing for a replica to diverge on.
+    # The alternative — granting the app user SUPER — is far broader.
+    #
+    # Stock MySQL 8 auth (caching_sha2_password) is left alone deliberately.
+    # Prisma's *darwin-arm64* schema-engine binary fails against it with a
+    # misleading "Unknown authentication plugin `sha256_password'"; the same
+    # engine on linux/amd64 — which is what CI and every container here run —
+    # connects without complaint. Weakening the server's auth policy to work
+    # around a host-only toolchain bug would be a real security downgrade
+    # applied to the wrong layer. See `prisma/README.md` for the local workflow.
+    command: --log-bin-trust-function-creators=1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-ib_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ib}
+      MYSQL_USER: ${MYSQL_USER:-ib}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-ib_password}
+    ports:
+      - '3306:3306'
+    healthcheck:
+      # `mysqladmin ping` answers before the server is ready for connections on
+      # first boot, while the init scripts still run. Selecting from the target
+      # database is what actually proves it is usable, and the backend's
+      # `service_healthy` gate depends on that distinction.
+      test:
+        [
+          'CMD',
+          'mysql',
+          '-h',
+          '127.0.0.1',
+          '-u',
+          '${MYSQL_USER:-ib}',
+          '-p${MYSQL_PASSWORD:-ib_password}',
+          '-e',
+          'SELECT 1',
+          '${MYSQL_DATABASE:-ib}',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - mysql-data:/var/lib/mysql
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: ib-backend
+    environment:
+      # SHADOW is the default and stays so until Story 13. Overriding this in a
+      # compose file is not how PAPER/LIVE get enabled — see the Story 5 guards.
+      EXECUTION_MODE: ${EXECUTION_MODE:-SHADOW}
+      PORT: 3000
+      # Presence of this variable is what selects the Prisma repositories over
+      # the in-memory ones (`engine.module.ts`). Unset it and the engine still
+      # runs, just without durability.
+      DATABASE_URL: mysql://${MYSQL_USER:-ib}:${MYSQL_PASSWORD:-ib_password}@mysql:3306/${MYSQL_DATABASE:-ib}
+      # Presence of IB_HOST selects the IB broker over the mock, mirroring how
+      # DATABASE_URL selects storage (`engine.module.ts`). Left **unset by
+      # default**: without credentials the gateway cannot authenticate, and the
+      # stack must still come up on mock data. Set it in `.env` once
+      # TWS_USERID/TWS_PASSWORD are present.
+      IB_HOST: ${IB_HOST:-}
+      IB_PORT: ${IB_PORT:-4002}
+      IB_CLIENT_ID: ${IB_CLIENT_ID:-1}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      # **No `depends_on` for IB.** The gateway may be on the host, in the
+      # optional container, or absent entirely, and compose cannot express
+      # "wait only if that profile is active". The adapter's bounded reconnect
+      # is what handles a gateway that is not ready yet — which is the right
+      # mechanism anyway, since a Gateway can also go away *after* startup.
+    extra_hosts:
+      # Lets `IB_HOST=host.docker.internal` resolve to the Docker host, so the
+      # backend can reach a Gateway or TWS running as a desktop app. Native on
+      # Docker Desktop; this mapping is what makes it work on Linux too.
+      - 'host.docker.internal:host-gateway'
+    ports:
+      - '3000:3000'
+    healthcheck:
+      # No curl/wget in node:alpine; node itself is guaranteed present.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ./ui
+    container_name: ib-ui
+    environment:
+      # Read by the Next.js *server*, not the browser: the dashboard is a Server
+      # Component and every control is a Server Action, so the fetch originates
+      # inside this container. `localhost:3000` here would be the ui container
+      # itself; the backend is reachable only by its compose service name.
+      API_URL: ${API_URL:-http://backend:3000}
+    ports:
+      - '3001:3001'
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  # Named rather than bind-mounted: the whole point of Story 8 is that state
+  # outlives the container, and `docker compose down` must not take it with it.
+  mysql-data:

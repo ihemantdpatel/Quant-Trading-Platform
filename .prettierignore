@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+.next
+
+# Spec and planning documents are hand-wrapped and are the reference this
+# project is built against — reformatting them would churn the source of truth.
+PRD.md
+project-scope.md
+stories.md
+CLAUDE.md
+WORKING-NOTES.md
+
+# Vendored tooling, not ours to format.
+.agents/
+.claude/

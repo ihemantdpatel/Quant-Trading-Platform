@@ -1,0 +1,322 @@
+// Story 8 — durable storage behind the Story 6 repository interfaces.
+//
+// The interfaces in `src/repositories/repository.interfaces.ts` are the
+// contract; this schema exists to satisfy them **with no call-site changes**
+// (`stories.md:487`). Where a modelling choice was forced, it was resolved in
+// favour of the interface shape rather than the other way round.
+//
+// ## Money is Decimal, never Float
+//
+// Every price, quantity-times-price, and threshold is `Decimal`. A dip ladder
+// averages down across many lots and each lot's exit target is a percentage of
+// what *that lot* paid (`PRD.md:129`); binary floating point would drift a
+// cost basis by fractions of a cent per round trip, and the lot-sum assertion
+// at Story 9 compares those sums against a broker's net position for exact
+// equality. `Decimal` is converted to `number` at the repository boundary so
+// the interfaces stay unchanged — see `decimal.ts`.
+//
+// ## Timestamps are stored as strings
+//
+// The domain types carry ISO-8601 with an explicit ET offset
+// (`market-data/types.ts:3`) and the whole engine compares them as strings.
+// Storing them as `DateTime` would round-trip through UTC and silently drop
+// the offset that makes EST/EDT visible in the data, so the *sort key* for
+// FIFO would change meaning across a restart. They are `VarChar` here and
+// ordered lexicographically, which is correct for fixed-width ISO-8601.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+/// Instrument vocabulary, mirroring `domain/contract.ts`. Options are modelled
+/// from day one (`PRD.md:226`) — retrofitting them later is a rewrite.
+model Instrument {
+  id         Int      @id @default(autoincrement())
+  symbol     String   @db.VarChar(32)
+  secType    String   @db.VarChar(16)
+  exchange   String?  @db.VarChar(32)
+  currency   String   @db.VarChar(8)
+  strike     Decimal? @db.Decimal(18, 6)
+  expiry     String?  @db.VarChar(16)
+  right      String?  @db.VarChar(8)
+  multiplier Int?
+
+  bars Bar[]
+
+  // A contract is identified by the whole option tuple, not by symbol: two
+  // TQQQ options differ only in strike/expiry/right.
+  @@unique([symbol, secType, strike, expiry, right], name: "instrument_identity")
+}
+
+/// Cached historical bars. Story 10 serves all history from here and calls IB
+/// only to fill gaps, so this table is on the hot path of every backfill.
+model Bar {
+  id           BigInt  @id @default(autoincrement())
+  instrumentId Int
+  symbol       String  @db.VarChar(32)
+  barSize      String  @db.VarChar(16)
+  timestamp    String  @db.VarChar(32)
+  open         Decimal @db.Decimal(18, 6)
+  high         Decimal @db.Decimal(18, 6)
+  low          Decimal @db.Decimal(18, 6)
+  close        Decimal @db.Decimal(18, 6)
+  volume       BigInt
+
+  /// Story 10 synthesizes 3x QQQ returns for pre-2010 history. Flagged so it
+  /// can never be silently mixed with real bars (`stories.md:619`).
+  synthetic Boolean @default(false)
+
+  instrument Instrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+
+  // The same bar must not be ingested twice by an incremental gap-fill.
+  @@unique([symbol, barSize, timestamp], name: "bar_identity")
+  // The composite index the story calls for (`stories.md:484`). Column order
+  // matches the query shape: equality on symbol + barSize, range on timestamp.
+  @@index([symbol, barSize, timestamp], name: "bar_symbol_size_time")
+}
+
+/// An intent, persisted **before** the order is submitted (`PRD.md:366`).
+///
+/// This row is what makes the crash window between "order sent" and "fill
+/// recorded" recoverable at Story 9 rather than a silent gap.
+model OrderIntent {
+  id            String  @id @db.VarChar(191)
+  strategyId    String  @db.VarChar(128)
+  symbol        String  @db.VarChar(32)
+  side          String  @db.VarChar(8)
+  quantity      Int
+  orderType     String  @db.VarChar(16)
+  limitPrice    Decimal @db.Decimal(18, 6)
+  timeInForce   String  @db.VarChar(16)
+  timestamp     String  @db.VarChar(32)
+  reason        String  @db.Text
+  /// The full `OrderIntent`, including `contract` and `metadata`. Stored whole
+  /// so the record replays exactly, rather than being reassembled from columns
+  /// that would need widening every time the intent shape grows.
+  intent        Json
+  /// Null only in the instant between persistence and evaluation.
+  decision      Json?
+  submitted     Boolean @default(false)
+  clientOrderId String? @db.VarChar(128)
+  createdAt     String  @db.VarChar(32)
+
+  @@index([symbol], name: "order_intent_symbol")
+}
+
+model Order {
+  clientOrderId String  @id @db.VarChar(128)
+  brokerOrderId String? @db.VarChar(128)
+  symbol        String  @db.VarChar(32)
+  side          String  @db.VarChar(8)
+  quantity      Int
+  limitPrice    Decimal @db.Decimal(18, 6)
+  status        String  @db.VarChar(32)
+  rejectReason  String? @db.Text
+  strategyId    String  @db.VarChar(128)
+  createdAt     String  @db.VarChar(32)
+
+  @@index([symbol], name: "order_symbol")
+}
+
+model Fill {
+  fillId        String  @id @db.VarChar(191)
+  clientOrderId String  @db.VarChar(128)
+  brokerOrderId String? @db.VarChar(128)
+  symbol        String  @db.VarChar(32)
+  side          String  @db.VarChar(8)
+  quantity      Int
+  price         Decimal @db.Decimal(18, 6)
+  commission    Decimal @db.Decimal(18, 6)
+  timestamp     String  @db.VarChar(32)
+
+  // `clientOrderId` is deliberately **not** a foreign key.
+  //
+  // A fill is evidence that something traded, and that evidence must be
+  // recordable even when the matching `Order` row is missing. Story 9 recovers
+  // from a crash between order submission and fill persistence (`PRD.md:334`),
+  // where a fill can legitimately arrive with no parent row written — and the
+  // engine saves fills from a broker callback that has no ordering guarantee
+  // against the order write. An FK here would reject exactly the record
+  // reconciliation needs in order to detect the discrepancy, converting
+  // recoverable evidence into a lost write.
+  //
+  // Indexed, so the join `findByClientOrderId` performs is still cheap. One
+  // order can produce many fills — partial fills are modelled, not an edge case.
+  @@index([clientOrderId], name: "fill_client_order")
+}
+
+/// Broker net position. IB is authoritative here; the DB is authoritative on
+/// lot composition, and Story 9 asserts the two agree.
+model Position {
+  symbol      String  @id @db.VarChar(32)
+  quantity    Int
+  averageCost Decimal @db.Decimal(18, 6)
+  updatedAt   String  @db.VarChar(32)
+}
+
+/// `Lot` — the durable unit of the ladder (`lot.ts:1`).
+///
+/// A held position is a *set* of lots with independent state, not one object
+/// with a blended basis. IB reports only a net figure, so these rows are the
+/// only authoritative record of which lot is which.
+model Lot {
+  id       String @id @db.VarChar(191)
+  symbol   String @db.VarChar(32)
+  /// The rung level this lot occupies — its re-arm price.
+  rungPrice  Decimal @db.Decimal(18, 6)
+  /// What this lot actually paid. The *only* basis for its exit target.
+  fillPrice  Decimal @db.Decimal(18, 6)
+  quantity   Int
+  /// ISO-8601 ET. The FIFO sort key — ordering must survive this round trip
+  /// (`stories.md:515`), because which lot is sold depends on it.
+  openedAt   String  @db.VarChar(32)
+  /// Frozen at open from the parameters in force at that moment
+  /// (`PRD.md:386`). Stored, never recomputed.
+  exitTarget Decimal @db.Decimal(18, 6)
+  status     String  @db.VarChar(16)
+  closedAt   String? @db.VarChar(32)
+  exitPrice  Decimal? @db.Decimal(18, 6)
+
+  // FIFO reads are `WHERE symbol = ? ORDER BY openedAt, id`. `id` is in the
+  // index so the ordering is total and stable when one bar fills two rungs.
+  @@index([symbol, openedAt, id], name: "lot_symbol_fifo")
+  @@index([symbol, status], name: "lot_symbol_status")
+}
+
+/// `Rung` — a price level, not a one-shot slot (`rung.ts:4`).
+///
+/// Stored rather than derived: once a rung can be empty *and still exist at its
+/// original price*, there is nothing to recompute it from. This table is what
+/// makes **re-arming survive a restart** (`stories.md:490`).
+model Rung {
+  symbol String  @db.VarChar(32)
+  /// The level. Immutable for the life of the rung — what re-arming preserves.
+  price  Decimal @db.Decimal(18, 6)
+  status String  @db.VarChar(16)
+  /// Id of the lot currently held here, or null.
+  lotId  String? @db.VarChar(191)
+  completedCycles Int    @default(0)
+  lastExitAt      String? @db.VarChar(32)
+
+  // A rung is identified by its level within a symbol; there is at most one
+  // rung per price, which is what makes "already holds a lot" answerable.
+  @@id([symbol, price])
+}
+
+/// A registered strategy instance and whether it is enabled.
+model StrategyInstance {
+  id        String  @id @db.VarChar(128)
+  name      String  @db.VarChar(128)
+  enabled   Boolean @default(false)
+  symbols   Json
+  updatedAt String  @db.VarChar(32)
+
+  snapshots StrategyStateSnapshot[]
+}
+
+/// Versioned strategy state — the durable recovery unit (`types.ts:107`).
+///
+/// **Versioned so a schema change does not orphan live state**
+/// (`stories.md:495`). A snapshot whose `version` the running code does not
+/// understand must be explicitly rejected rather than loaded as though its
+/// fields still mean what they used to; Story 9 owns that load path.
+///
+/// Append-a-row-per-save rather than update-in-place, so recovery can fall back
+/// to the previous good snapshot if the newest one was written mid-crash.
+model StrategyStateSnapshot {
+  id         BigInt @id @default(autoincrement())
+  strategyId String @db.VarChar(128)
+  /// Schema version of `data`. Checked before the state is trusted.
+  version    Int
+  symbols    Json
+  data       Json
+  capturedAt String @db.VarChar(32)
+
+  strategy StrategyInstance @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  // Recovery wants the newest snapshot for a strategy.
+  @@index([strategyId, capturedAt], name: "snapshot_strategy_time")
+}
+
+/// One row per rejection, resize, halt, and kill-switch activation
+/// (`stories.md:340`). Approvals are deliberately absent — an approved intent
+/// becomes an order, and the order log is that record.
+model RiskEvent {
+  id                BigInt  @id @default(autoincrement())
+  type              String  @db.VarChar(32)
+  reason            String  @db.VarChar(64)
+  detail            String  @db.Text
+  timestamp         String  @db.VarChar(32)
+  /// Null for events not tied to a specific intent (halts, kill switch).
+  intent            Json?
+  /// Populated on RESIZE. Null otherwise.
+  approvedQuantity  Int?
+
+  @@index([timestamp], name: "risk_event_time")
+}
+
+/// **Append-only** (`PRD.md:392`).
+///
+/// The interface offers no `update` and no `deleteOne`, but an interface is not
+/// an enforcement — this table is the audit trail, and an audit trail that can
+/// be rewritten is not one. The migration adds `BEFORE UPDATE` and
+/// `BEFORE DELETE` triggers that raise SQLSTATE 45000, so the property holds
+/// against any client, including a DBA at a mysql prompt (`stories.md:494`).
+model ParameterChange {
+  id         String @id @db.VarChar(191)
+  /// Shared by every field in the same edit request.
+  changeId   String @db.VarChar(191)
+  strategyId String @db.VarChar(128)
+  parameter  String @db.VarChar(64)
+  oldValue   Json
+  newValue   Json
+  timestamp  String @db.VarChar(32)
+  /// The strategy's full state at the moment of the edit (`PRD.md:392`) —
+  /// what makes a frozen exit target reconstructable after the fact.
+  stateAtChange Json?
+  reason        String? @db.Text
+
+  @@index([strategyId], name: "parameter_change_strategy")
+  @@index([changeId], name: "parameter_change_group")
+}
+
+/// Story 11 persists these so results are comparable across parameter sets.
+/// Declared now because the story lists them in the Story 8 schema
+/// (`stories.md:486`); no repository implements them yet.
+model BacktestRun {
+  id         String  @id @db.VarChar(191)
+  strategyId String  @db.VarChar(128)
+  symbol     String  @db.VarChar(32)
+  barSize    String  @db.VarChar(16)
+  rangeStart String  @db.VarChar(32)
+  rangeEnd   String  @db.VarChar(32)
+  /// The full parameter set this run used, so a result is interpretable
+  /// without joining against whatever the config happens to say today.
+  parameters Json
+  /// True when the run used synthetic 3x history (`stories.md:619`).
+  synthetic  Boolean @default(false)
+  createdAt  String  @db.VarChar(32)
+
+  results BacktestResult[]
+
+  @@index([strategyId, createdAt], name: "backtest_run_strategy_time")
+}
+
+model BacktestResult {
+  id            String  @id @db.VarChar(191)
+  runId         String  @db.VarChar(191)
+  metric        String  @db.VarChar(64)
+  value         Decimal @db.Decimal(24, 8)
+  /// Free-form detail for metrics that are not a single number — rung
+  /// distribution, time at the hard floor.
+  detail        Json?
+
+  run BacktestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, metric], name: "backtest_result_metric")
+}

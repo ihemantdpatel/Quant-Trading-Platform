@@ -1,0 +1,1581 @@
+{
+  "name": "gap-down-recover",
+  "symbol": "TQQQ",
+  "barSize": "5min",
+  "expectation": "Session 1 closes at 100.00; session 2 gaps down 4% to 96.00 then recovers to close at 102.00, trading back above the prior close. Because the anchor takes max(previous close, open), no stale anchor is left stranded below the market.",
+  "invariants": [
+    {
+      "kind": "gapDownFromPreviousClosePct",
+      "value": 3.9
+    },
+    {
+      "kind": "recoversToPreviousClose"
+    },
+    {
+      "kind": "minBarCount",
+      "value": 156
+    }
+  ],
+  "bars": [
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T09:30:00.000-05:00",
+      "open": 100,
+      "high": 100.11,
+      "low": 99.9,
+      "close": 99.99,
+      "volume": 1289526
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T09:35:00.000-05:00",
+      "open": 99.99,
+      "high": 100.12,
+      "low": 99.92,
+      "close": 100,
+      "volume": 874092
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T09:40:00.000-05:00",
+      "open": 100,
+      "high": 100.09,
+      "low": 99.83,
+      "close": 100.08,
+      "volume": 1339990
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T09:45:00.000-05:00",
+      "open": 100.08,
+      "high": 100.24,
+      "low": 99.84,
+      "close": 99.9,
+      "volume": 1197269
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T09:50:00.000-05:00",
+      "open": 99.9,
+      "high": 99.95,
+      "low": 99.82,
+      "close": 99.94,
+      "volume": 601684
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T09:55:00.000-05:00",
+      "open": 99.94,
+      "high": 100.14,
+      "low": 99.8,
+      "close": 99.97,
+      "volume": 1676606
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:00:00.000-05:00",
+      "open": 99.97,
+      "high": 100.08,
+      "low": 99.94,
+      "close": 99.99,
+      "volume": 865166
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:05:00.000-05:00",
+      "open": 99.99,
+      "high": 100.05,
+      "low": 99.82,
+      "close": 100,
+      "volume": 1222153
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:10:00.000-05:00",
+      "open": 100,
+      "high": 100.11,
+      "low": 99.88,
+      "close": 99.97,
+      "volume": 2204750
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:15:00.000-05:00",
+      "open": 99.97,
+      "high": 100.11,
+      "low": 99.81,
+      "close": 99.96,
+      "volume": 1656039
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:20:00.000-05:00",
+      "open": 99.96,
+      "high": 100.09,
+      "low": 99.95,
+      "close": 99.99,
+      "volume": 1597564
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:25:00.000-05:00",
+      "open": 99.99,
+      "high": 100.24,
+      "low": 99.9,
+      "close": 100.07,
+      "volume": 995284
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:30:00.000-05:00",
+      "open": 100.07,
+      "high": 100.17,
+      "low": 99.83,
+      "close": 100.02,
+      "volume": 690714
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:35:00.000-05:00",
+      "open": 100.02,
+      "high": 100.04,
+      "low": 99.71,
+      "close": 99.91,
+      "volume": 1767780
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:40:00.000-05:00",
+      "open": 99.91,
+      "high": 99.93,
+      "low": 99.88,
+      "close": 99.91,
+      "volume": 913540
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:45:00.000-05:00",
+      "open": 99.91,
+      "high": 100.17,
+      "low": 99.87,
+      "close": 100.05,
+      "volume": 2196936
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:50:00.000-05:00",
+      "open": 100.05,
+      "high": 100.17,
+      "low": 100.05,
+      "close": 100.1,
+      "volume": 559836
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T10:55:00.000-05:00",
+      "open": 100.1,
+      "high": 100.25,
+      "low": 99.81,
+      "close": 99.92,
+      "volume": 1000582
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:00:00.000-05:00",
+      "open": 99.92,
+      "high": 100.18,
+      "low": 99.8,
+      "close": 100,
+      "volume": 1371556
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:05:00.000-05:00",
+      "open": 100,
+      "high": 100.18,
+      "low": 99.79,
+      "close": 99.91,
+      "volume": 1756034
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:10:00.000-05:00",
+      "open": 99.91,
+      "high": 100.26,
+      "low": 99.81,
+      "close": 100.06,
+      "volume": 2408338
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:15:00.000-05:00",
+      "open": 100.06,
+      "high": 100.14,
+      "low": 99.89,
+      "close": 100.04,
+      "volume": 1961778
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:20:00.000-05:00",
+      "open": 100.04,
+      "high": 100.23,
+      "low": 100.01,
+      "close": 100.01,
+      "volume": 1752520
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:25:00.000-05:00",
+      "open": 100.01,
+      "high": 100.05,
+      "low": 99.87,
+      "close": 99.98,
+      "volume": 1976813
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:30:00.000-05:00",
+      "open": 99.98,
+      "high": 100.16,
+      "low": 99.98,
+      "close": 100.04,
+      "volume": 2259258
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:35:00.000-05:00",
+      "open": 100.04,
+      "high": 100.12,
+      "low": 99.78,
+      "close": 99.94,
+      "volume": 1285033
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:40:00.000-05:00",
+      "open": 99.94,
+      "high": 100.03,
+      "low": 99.78,
+      "close": 100.02,
+      "volume": 2461723
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:45:00.000-05:00",
+      "open": 100.02,
+      "high": 100.12,
+      "low": 99.8,
+      "close": 99.91,
+      "volume": 838528
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:50:00.000-05:00",
+      "open": 99.91,
+      "high": 100.2,
+      "low": 99.9,
+      "close": 100.03,
+      "volume": 1706134
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T11:55:00.000-05:00",
+      "open": 100.03,
+      "high": 100.17,
+      "low": 99.97,
+      "close": 99.99,
+      "volume": 679518
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:00:00.000-05:00",
+      "open": 99.99,
+      "high": 100.02,
+      "low": 99.79,
+      "close": 99.99,
+      "volume": 1520054
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:05:00.000-05:00",
+      "open": 99.99,
+      "high": 100.18,
+      "low": 99.8,
+      "close": 100.05,
+      "volume": 1284179
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:10:00.000-05:00",
+      "open": 100.05,
+      "high": 100.07,
+      "low": 99.84,
+      "close": 100,
+      "volume": 1409823
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:15:00.000-05:00",
+      "open": 100,
+      "high": 100.18,
+      "low": 99.82,
+      "close": 100.01,
+      "volume": 1992628
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:20:00.000-05:00",
+      "open": 100.01,
+      "high": 100.05,
+      "low": 99.92,
+      "close": 99.97,
+      "volume": 872778
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:25:00.000-05:00",
+      "open": 99.97,
+      "high": 100.06,
+      "low": 99.8,
+      "close": 99.96,
+      "volume": 535395
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:30:00.000-05:00",
+      "open": 99.96,
+      "high": 100.22,
+      "low": 99.84,
+      "close": 100.08,
+      "volume": 1856682
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:35:00.000-05:00",
+      "open": 100.08,
+      "high": 100.18,
+      "low": 99.95,
+      "close": 100.04,
+      "volume": 911124
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:40:00.000-05:00",
+      "open": 100.04,
+      "high": 100.12,
+      "low": 99.84,
+      "close": 99.91,
+      "volume": 2336573
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:45:00.000-05:00",
+      "open": 99.91,
+      "high": 100.15,
+      "low": 99.8,
+      "close": 100.04,
+      "volume": 1555090
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:50:00.000-05:00",
+      "open": 100.04,
+      "high": 100.05,
+      "low": 99.82,
+      "close": 100.01,
+      "volume": 929337
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T12:55:00.000-05:00",
+      "open": 100.01,
+      "high": 100.11,
+      "low": 99.92,
+      "close": 100.1,
+      "volume": 856840
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:00:00.000-05:00",
+      "open": 100.1,
+      "high": 100.2,
+      "low": 99.76,
+      "close": 99.91,
+      "volume": 559629
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:05:00.000-05:00",
+      "open": 99.91,
+      "high": 100.25,
+      "low": 99.78,
+      "close": 100.05,
+      "volume": 1418660
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:10:00.000-05:00",
+      "open": 100.05,
+      "high": 100.24,
+      "low": 99.72,
+      "close": 99.92,
+      "volume": 1800438
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:15:00.000-05:00",
+      "open": 99.92,
+      "high": 100.04,
+      "low": 99.8,
+      "close": 99.98,
+      "volume": 2151999
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:20:00.000-05:00",
+      "open": 99.98,
+      "high": 100.17,
+      "low": 99.83,
+      "close": 100.01,
+      "volume": 737903
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:25:00.000-05:00",
+      "open": 100.01,
+      "high": 100.14,
+      "low": 99.81,
+      "close": 99.91,
+      "volume": 1293105
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:30:00.000-05:00",
+      "open": 99.91,
+      "high": 100.24,
+      "low": 99.85,
+      "close": 100.07,
+      "volume": 1874963
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:35:00.000-05:00",
+      "open": 100.07,
+      "high": 100.17,
+      "low": 99.87,
+      "close": 100.07,
+      "volume": 652526
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:40:00.000-05:00",
+      "open": 100.07,
+      "high": 100.1,
+      "low": 99.87,
+      "close": 100.05,
+      "volume": 1621596
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:45:00.000-05:00",
+      "open": 100.05,
+      "high": 100.1,
+      "low": 99.75,
+      "close": 99.95,
+      "volume": 1778540
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:50:00.000-05:00",
+      "open": 99.95,
+      "high": 100.13,
+      "low": 99.85,
+      "close": 99.95,
+      "volume": 2160072
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T13:55:00.000-05:00",
+      "open": 99.95,
+      "high": 100.15,
+      "low": 99.88,
+      "close": 100.05,
+      "volume": 1424198
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:00:00.000-05:00",
+      "open": 100.05,
+      "high": 100.17,
+      "low": 99.81,
+      "close": 99.94,
+      "volume": 637390
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:05:00.000-05:00",
+      "open": 99.94,
+      "high": 100.13,
+      "low": 99.92,
+      "close": 99.93,
+      "volume": 2013214
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:10:00.000-05:00",
+      "open": 99.93,
+      "high": 100,
+      "low": 99.82,
+      "close": 99.93,
+      "volume": 926069
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:15:00.000-05:00",
+      "open": 99.93,
+      "high": 100.21,
+      "low": 99.9,
+      "close": 100.08,
+      "volume": 1572858
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:20:00.000-05:00",
+      "open": 100.08,
+      "high": 100.13,
+      "low": 99.93,
+      "close": 99.99,
+      "volume": 1891282
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:25:00.000-05:00",
+      "open": 99.99,
+      "high": 100.17,
+      "low": 99.82,
+      "close": 99.98,
+      "volume": 1251647
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:30:00.000-05:00",
+      "open": 99.98,
+      "high": 100.14,
+      "low": 99.91,
+      "close": 99.97,
+      "volume": 2258625
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:35:00.000-05:00",
+      "open": 99.97,
+      "high": 100.03,
+      "low": 99.79,
+      "close": 99.97,
+      "volume": 905991
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:40:00.000-05:00",
+      "open": 99.97,
+      "high": 100.15,
+      "low": 99.92,
+      "close": 100.04,
+      "volume": 2311273
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:45:00.000-05:00",
+      "open": 100.04,
+      "high": 100.18,
+      "low": 99.93,
+      "close": 100.07,
+      "volume": 649167
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:50:00.000-05:00",
+      "open": 100.07,
+      "high": 100.24,
+      "low": 99.78,
+      "close": 99.94,
+      "volume": 1645422
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T14:55:00.000-05:00",
+      "open": 99.94,
+      "high": 100,
+      "low": 99.78,
+      "close": 99.9,
+      "volume": 1582250
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:00:00.000-05:00",
+      "open": 99.9,
+      "high": 100.13,
+      "low": 99.79,
+      "close": 100.06,
+      "volume": 1613786
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:05:00.000-05:00",
+      "open": 100.06,
+      "high": 100.09,
+      "low": 99.87,
+      "close": 100.05,
+      "volume": 756880
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:10:00.000-05:00",
+      "open": 100.05,
+      "high": 100.12,
+      "low": 99.79,
+      "close": 99.96,
+      "volume": 1056102
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:15:00.000-05:00",
+      "open": 99.96,
+      "high": 100.02,
+      "low": 99.85,
+      "close": 99.94,
+      "volume": 2457122
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:20:00.000-05:00",
+      "open": 99.94,
+      "high": 100.06,
+      "low": 99.81,
+      "close": 99.95,
+      "volume": 636533
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:25:00.000-05:00",
+      "open": 99.95,
+      "high": 100.05,
+      "low": 99.87,
+      "close": 99.94,
+      "volume": 2250551
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:30:00.000-05:00",
+      "open": 99.94,
+      "high": 100.04,
+      "low": 99.82,
+      "close": 99.9,
+      "volume": 1927377
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:35:00.000-05:00",
+      "open": 99.9,
+      "high": 100.13,
+      "low": 99.72,
+      "close": 100.08,
+      "volume": 1403361
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:40:00.000-05:00",
+      "open": 100.08,
+      "high": 100.19,
+      "low": 99.84,
+      "close": 99.99,
+      "volume": 707971
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:45:00.000-05:00",
+      "open": 99.99,
+      "high": 100.2,
+      "low": 99.8,
+      "close": 100.01,
+      "volume": 816051
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:50:00.000-05:00",
+      "open": 100.01,
+      "high": 100.1,
+      "low": 99.81,
+      "close": 100.06,
+      "volume": 809411
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-02T15:55:00.000-05:00",
+      "open": 100.06,
+      "high": 100.21,
+      "low": 99.8,
+      "close": 100,
+      "volume": 1551108
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T09:30:00.000-05:00",
+      "open": 96,
+      "high": 96.15,
+      "low": 95.9,
+      "close": 96.03,
+      "volume": 1479855
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T09:35:00.000-05:00",
+      "open": 96.03,
+      "high": 96.2,
+      "low": 96.02,
+      "close": 96.09,
+      "volume": 1618296
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T09:40:00.000-05:00",
+      "open": 96.09,
+      "high": 96.43,
+      "low": 95.93,
+      "close": 96.28,
+      "volume": 1864476
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T09:45:00.000-05:00",
+      "open": 96.28,
+      "high": 96.43,
+      "low": 96.27,
+      "close": 96.33,
+      "volume": 895540
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T09:50:00.000-05:00",
+      "open": 96.33,
+      "high": 96.56,
+      "low": 96.32,
+      "close": 96.41,
+      "volume": 1656821
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T09:55:00.000-05:00",
+      "open": 96.41,
+      "high": 96.48,
+      "low": 96.36,
+      "close": 96.47,
+      "volume": 556470
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:00:00.000-05:00",
+      "open": 96.47,
+      "high": 96.57,
+      "low": 96.44,
+      "close": 96.55,
+      "volume": 1238985
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:05:00.000-05:00",
+      "open": 96.55,
+      "high": 96.77,
+      "low": 96.41,
+      "close": 96.67,
+      "volume": 2163796
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:10:00.000-05:00",
+      "open": 96.67,
+      "high": 96.78,
+      "low": 96.48,
+      "close": 96.73,
+      "volume": 1656134
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:15:00.000-05:00",
+      "open": 96.73,
+      "high": 96.79,
+      "low": 96.62,
+      "close": 96.73,
+      "volume": 1038231
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:20:00.000-05:00",
+      "open": 96.73,
+      "high": 96.89,
+      "low": 96.61,
+      "close": 96.76,
+      "volume": 2099178
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:25:00.000-05:00",
+      "open": 96.76,
+      "high": 97.12,
+      "low": 96.58,
+      "close": 96.99,
+      "volume": 1152615
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:30:00.000-05:00",
+      "open": 96.99,
+      "high": 97.19,
+      "low": 96.84,
+      "close": 97.08,
+      "volume": 897178
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:35:00.000-05:00",
+      "open": 97.08,
+      "high": 97.26,
+      "low": 97,
+      "close": 97.15,
+      "volume": 1067111
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:40:00.000-05:00",
+      "open": 97.15,
+      "high": 97.21,
+      "low": 97.07,
+      "close": 97.16,
+      "volume": 2462962
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:45:00.000-05:00",
+      "open": 97.16,
+      "high": 97.37,
+      "low": 97.11,
+      "close": 97.28,
+      "volume": 2465626
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:50:00.000-05:00",
+      "open": 97.28,
+      "high": 97.28,
+      "low": 97.15,
+      "close": 97.27,
+      "volume": 842303
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T10:55:00.000-05:00",
+      "open": 97.27,
+      "high": 97.37,
+      "low": 97.17,
+      "close": 97.31,
+      "volume": 606660
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:00:00.000-05:00",
+      "open": 97.31,
+      "high": 97.71,
+      "low": 97.14,
+      "close": 97.52,
+      "volume": 1000203
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:05:00.000-05:00",
+      "open": 97.52,
+      "high": 97.69,
+      "low": 97.28,
+      "close": 97.48,
+      "volume": 2313863
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:10:00.000-05:00",
+      "open": 97.48,
+      "high": 97.78,
+      "low": 97.39,
+      "close": 97.62,
+      "volume": 2280390
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:15:00.000-05:00",
+      "open": 97.62,
+      "high": 97.78,
+      "low": 97.47,
+      "close": 97.7,
+      "volume": 1383156
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:20:00.000-05:00",
+      "open": 97.7,
+      "high": 97.84,
+      "low": 97.55,
+      "close": 97.75,
+      "volume": 1765626
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:25:00.000-05:00",
+      "open": 97.75,
+      "high": 97.86,
+      "low": 97.57,
+      "close": 97.77,
+      "volume": 1082784
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:30:00.000-05:00",
+      "open": 97.77,
+      "high": 98.09,
+      "low": 97.73,
+      "close": 97.95,
+      "volume": 884981
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:35:00.000-05:00",
+      "open": 97.95,
+      "high": 98.14,
+      "low": 97.81,
+      "close": 97.99,
+      "volume": 1534648
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:40:00.000-05:00",
+      "open": 97.99,
+      "high": 98.15,
+      "low": 97.9,
+      "close": 98.09,
+      "volume": 1586510
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:45:00.000-05:00",
+      "open": 98.09,
+      "high": 98.27,
+      "low": 98.06,
+      "close": 98.07,
+      "volume": 1892832
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:50:00.000-05:00",
+      "open": 98.07,
+      "high": 98.4,
+      "low": 97.87,
+      "close": 98.33,
+      "volume": 1094593
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T11:55:00.000-05:00",
+      "open": 98.33,
+      "high": 98.43,
+      "low": 98.12,
+      "close": 98.24,
+      "volume": 1712781
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:00:00.000-05:00",
+      "open": 98.24,
+      "high": 98.46,
+      "low": 98.18,
+      "close": 98.42,
+      "volume": 1008282
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:05:00.000-05:00",
+      "open": 98.42,
+      "high": 98.51,
+      "low": 98.31,
+      "close": 98.47,
+      "volume": 1649496
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:10:00.000-05:00",
+      "open": 98.47,
+      "high": 98.73,
+      "low": 98.44,
+      "close": 98.57,
+      "volume": 1003378
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:15:00.000-05:00",
+      "open": 98.57,
+      "high": 98.83,
+      "low": 98.44,
+      "close": 98.67,
+      "volume": 1059672
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:20:00.000-05:00",
+      "open": 98.67,
+      "high": 98.7,
+      "low": 98.46,
+      "close": 98.61,
+      "volume": 790920
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:25:00.000-05:00",
+      "open": 98.61,
+      "high": 98.9,
+      "low": 98.44,
+      "close": 98.8,
+      "volume": 1166696
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:30:00.000-05:00",
+      "open": 98.8,
+      "high": 99.03,
+      "low": 98.79,
+      "close": 98.89,
+      "volume": 2050758
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:35:00.000-05:00",
+      "open": 98.89,
+      "high": 99.06,
+      "low": 98.79,
+      "close": 99,
+      "volume": 683695
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:40:00.000-05:00",
+      "open": 99,
+      "high": 99.08,
+      "low": 98.89,
+      "close": 99.05,
+      "volume": 1714093
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:45:00.000-05:00",
+      "open": 99.05,
+      "high": 99.35,
+      "low": 98.9,
+      "close": 99.16,
+      "volume": 1698130
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:50:00.000-05:00",
+      "open": 99.16,
+      "high": 99.25,
+      "low": 98.99,
+      "close": 99.12,
+      "volume": 1177182
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T12:55:00.000-05:00",
+      "open": 99.12,
+      "high": 99.45,
+      "low": 98.97,
+      "close": 99.31,
+      "volume": 743725
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:00:00.000-05:00",
+      "open": 99.31,
+      "high": 99.32,
+      "low": 99.17,
+      "close": 99.26,
+      "volume": 2249706
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:05:00.000-05:00",
+      "open": 99.26,
+      "high": 99.35,
+      "low": 99.16,
+      "close": 99.29,
+      "volume": 1421284
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:10:00.000-05:00",
+      "open": 99.29,
+      "high": 99.65,
+      "low": 99.28,
+      "close": 99.5,
+      "volume": 609033
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:15:00.000-05:00",
+      "open": 99.5,
+      "high": 99.72,
+      "low": 99.45,
+      "close": 99.63,
+      "volume": 800441
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:20:00.000-05:00",
+      "open": 99.63,
+      "high": 99.69,
+      "low": 99.34,
+      "close": 99.53,
+      "volume": 538288
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:25:00.000-05:00",
+      "open": 99.53,
+      "high": 99.72,
+      "low": 99.36,
+      "close": 99.68,
+      "volume": 2000565
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:30:00.000-05:00",
+      "open": 99.68,
+      "high": 99.84,
+      "low": 99.66,
+      "close": 99.75,
+      "volume": 564839
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:35:00.000-05:00",
+      "open": 99.75,
+      "high": 99.97,
+      "low": 99.73,
+      "close": 99.9,
+      "volume": 853101
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:40:00.000-05:00",
+      "open": 99.9,
+      "high": 100.02,
+      "low": 99.77,
+      "close": 99.95,
+      "volume": 2232998
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:45:00.000-05:00",
+      "open": 99.95,
+      "high": 100.17,
+      "low": 99.89,
+      "close": 100.05,
+      "volume": 702214
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:50:00.000-05:00",
+      "open": 100.05,
+      "high": 100.21,
+      "low": 99.99,
+      "close": 100.05,
+      "volume": 1599550
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T13:55:00.000-05:00",
+      "open": 100.05,
+      "high": 100.27,
+      "low": 100.03,
+      "close": 100.21,
+      "volume": 2398783
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:00:00.000-05:00",
+      "open": 100.21,
+      "high": 100.3,
+      "low": 100.07,
+      "close": 100.21,
+      "volume": 2438444
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:05:00.000-05:00",
+      "open": 100.21,
+      "high": 100.44,
+      "low": 100.09,
+      "close": 100.32,
+      "volume": 1217706
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:10:00.000-05:00",
+      "open": 100.32,
+      "high": 100.59,
+      "low": 100.23,
+      "close": 100.44,
+      "volume": 1084102
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:15:00.000-05:00",
+      "open": 100.44,
+      "high": 100.51,
+      "low": 100.36,
+      "close": 100.5,
+      "volume": 527016
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:20:00.000-05:00",
+      "open": 100.5,
+      "high": 100.6,
+      "low": 100.36,
+      "close": 100.58,
+      "volume": 1696778
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:25:00.000-05:00",
+      "open": 100.58,
+      "high": 100.77,
+      "low": 100.42,
+      "close": 100.53,
+      "volume": 946480
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:30:00.000-05:00",
+      "open": 100.53,
+      "high": 100.73,
+      "low": 100.49,
+      "close": 100.66,
+      "volume": 2261850
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:35:00.000-05:00",
+      "open": 100.66,
+      "high": 100.9,
+      "low": 100.6,
+      "close": 100.8,
+      "volume": 883170
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:40:00.000-05:00",
+      "open": 100.8,
+      "high": 101.09,
+      "low": 100.7,
+      "close": 100.92,
+      "volume": 2133274
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:45:00.000-05:00",
+      "open": 100.92,
+      "high": 101.03,
+      "low": 100.86,
+      "close": 100.9,
+      "volume": 2420929
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:50:00.000-05:00",
+      "open": 100.9,
+      "high": 101.08,
+      "low": 100.8,
+      "close": 101.08,
+      "volume": 2391467
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T14:55:00.000-05:00",
+      "open": 101.08,
+      "high": 101.22,
+      "low": 100.89,
+      "close": 101.04,
+      "volume": 2378444
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:00:00.000-05:00",
+      "open": 101.04,
+      "high": 101.24,
+      "low": 100.94,
+      "close": 101.1,
+      "volume": 2173118
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:05:00.000-05:00",
+      "open": 101.1,
+      "high": 101.22,
+      "low": 100.98,
+      "close": 101.16,
+      "volume": 680456
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:10:00.000-05:00",
+      "open": 101.16,
+      "high": 101.52,
+      "low": 101,
+      "close": 101.38,
+      "volume": 2414693
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:15:00.000-05:00",
+      "open": 101.38,
+      "high": 101.44,
+      "low": 101.31,
+      "close": 101.38,
+      "volume": 2326729
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:20:00.000-05:00",
+      "open": 101.38,
+      "high": 101.59,
+      "low": 101.18,
+      "close": 101.45,
+      "volume": 2232957
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:25:00.000-05:00",
+      "open": 101.45,
+      "high": 101.49,
+      "low": 101.36,
+      "close": 101.44,
+      "volume": 1043145
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:30:00.000-05:00",
+      "open": 101.44,
+      "high": 101.69,
+      "low": 101.43,
+      "close": 101.65,
+      "volume": 1629034
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:35:00.000-05:00",
+      "open": 101.65,
+      "high": 101.85,
+      "low": 101.47,
+      "close": 101.62,
+      "volume": 1737028
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:40:00.000-05:00",
+      "open": 101.62,
+      "high": 101.92,
+      "low": 101.6,
+      "close": 101.85,
+      "volume": 823892
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:45:00.000-05:00",
+      "open": 101.85,
+      "high": 101.86,
+      "low": 101.77,
+      "close": 101.82,
+      "volume": 1170273
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:50:00.000-05:00",
+      "open": 101.82,
+      "high": 102.02,
+      "low": 101.67,
+      "close": 101.85,
+      "volume": 2255590
+    },
+    {
+      "symbol": "TQQQ",
+      "barSize": "5min",
+      "timestamp": "2025-01-03T15:55:00.000-05:00",
+      "open": 101.85,
+      "high": 102.13,
+      "low": 101.7,
+      "close": 102,
+      "volume": 765974
+    }
+  ]
+}

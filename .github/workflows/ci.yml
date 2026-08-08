@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend — lint, test, build
+    runs-on: ubuntu-latest
+
+    # Story 8's durable repositories are tested against a real MySQL, not a
+    # substitute: the append-only triggers, the composite index, and Decimal
+    # round-tripping are all properties of this engine specifically.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ib_root
+          MYSQL_DATABASE: ib
+          MYSQL_USER: ib
+          MYSQL_PASSWORD: ib_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pib_root"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+
+      # The shared ESLint config lives at the repo root and its parser is
+      # resolved from the root's node_modules, so this install is required
+      # before either package can lint.
+      - name: Install root lint tooling
+        run: npm ci
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      # The build imports `@prisma/client`, whose types only exist once the
+      # client is generated from the schema.
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npm run prisma:generate
+
+      - name: Lint
+        working-directory: backend
+        run: npm run lint
+
+      # Coverage thresholds are enforced here: jest exits non-zero when the 80%
+      # global or 95% strategies/risk floors are breached, failing the job.
+      - name: Test with coverage thresholds
+        working-directory: backend
+        run: npm run test:cov
+
+      # The append-only triggers on `ParameterChange` need this: creating a
+      # trigger as a non-SUPER user fails with error 1419 while binary logging
+      # is on. The compose file sets the same flag as a server argument, which
+      # the Actions service container has no equivalent for.
+      - name: Allow trigger creation
+        run: >-
+          mysql -h 127.0.0.1 -P 3306 -uroot -pib_root
+          -e "SET GLOBAL log_bin_trust_function_creators = 1;"
+
+      - name: Apply migrations
+        working-directory: backend
+        env:
+          DATABASE_URL: mysql://ib:ib_password@127.0.0.1:3306/ib
+        run: npm run prisma:migrate
+
+      # `REQUIRE_DATABASE_TESTS=1` turns a missing or unreachable database into
+      # a failure instead of a silent skip. Without it, losing the MySQL service
+      # would leave the durable-storage layer untested behind a green build.
+      - name: Database tests
+        working-directory: backend
+        env:
+          DATABASE_URL: mysql://ib:ib_password@127.0.0.1:3306/ib
+          REQUIRE_DATABASE_TESTS: '1'
+        run: npm run test:db:cov
+
+      - name: Build
+        working-directory: backend
+        run: npm run build
+
+  ui:
+    name: UI — lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - name: Install root lint tooling
+        run: npm ci
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Lint
+        working-directory: ui
+        run: npm run lint
+
+      # Component tests for the dashboard (`stories.md:463`). The Server
+      # Components and Server Actions are covered by the backend's integration
+      # suite over the same HTTP API the UI calls.
+      - name: Test
+        working-directory: ui
+        run: npm test
+
+      - name: Build
+        working-directory: ui
+        run: npm run build
+
+  format:
+    name: Prettier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+  compose:
+    name: Docker Compose builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+      - name: Build images
+        run: docker compose build

@@ -1,0 +1,446 @@
+/**
+ * `MockBrokerAdapter` — a deterministic test double, and **a real artifact
+ * rather than scaffolding** (`stories.md:385`).
+ *
+ * It is the only broker in existence until Story 10, so every integration test,
+ * the Story 7 dashboard, and Story 9's reconciliation are all built against it.
+ * That makes its fidelity load-bearing: a mock that only ever fills perfectly
+ * would let the engine ship with no handling for partial fills, rejections, or
+ * a socket dropping mid-order, and those paths would first execute against a
+ * live broker with real money.
+ *
+ * So it models the awkward cases on purpose:
+ *
+ * - **Fills are asynchronous and configurable** — immediate, partial, delayed
+ *   until a later bar, or never.
+ * - **Rejections are answers, not faults.** A rejected order is acknowledged
+ *   with a reason; the engine keeps running.
+ * - **Disconnects are faults.** `submit()` throws, and the engine must halt new
+ *   entries while **never liquidating** (`PRD.md:316`).
+ * - **Reconnect uses real exponential backoff** with the same bounded-retry
+ *   shape Story 10 needs, so that logic is exercised before it meets IB.
+ *
+ * Determinism is absolute: no clock, no randomness. Fill prices and timing come
+ * from configuration and from the bar timestamps the engine passes in, so a
+ * replay produces byte-identical results every run.
+ */
+
+import { Injectable, Logger } from '@nestjs/common';
+import {
+  AccountSummary,
+  BrokerAdapter,
+  BrokerOrder,
+  BrokerPosition,
+  ConnectionHealth,
+  ConnectionState,
+  Fill,
+  OrderAck,
+  OrderStatus,
+} from '../broker-adapter.interface';
+
+export enum FillMode {
+  /** Fills completely, at the limit price, on submission. The default. */
+  IMMEDIATE = 'IMMEDIATE',
+  /** Fills `partialFillRatio` of the quantity, leaving the rest resting. */
+  PARTIAL = 'PARTIAL',
+  /** Acknowledged and left resting — filled only by an explicit `fillResting`. */
+  RESTING = 'RESTING',
+  /** Refused with `rejectReason`. */
+  REJECT = 'REJECT',
+}
+
+export interface MockBrokerConfig {
+  fillMode: FillMode;
+  /** 0–1. Used by `PARTIAL`; floored to whole shares. */
+  partialFillRatio: number;
+  /** Per-share slippage added to a BUY and subtracted from a SELL. */
+  slippagePerShare: number;
+  commissionPerOrder: number;
+  rejectReason: string;
+  /** Starting account equity, what the global capital cap measures against. */
+  equity: number;
+  /** Max reconnect attempts before the connection is declared FAILED. */
+  maxReconnectAttempts: number;
+  /** First backoff delay in ms; doubles each attempt. */
+  baseBackoffMs: number;
+}
+
+export const DEFAULT_MOCK_BROKER_CONFIG: MockBrokerConfig = {
+  fillMode: FillMode.IMMEDIATE,
+  partialFillRatio: 0.5,
+  slippagePerShare: 0,
+  commissionPerOrder: 0,
+  rejectReason: 'mock rejection',
+  equity: 100_000,
+  maxReconnectAttempts: 5,
+  baseBackoffMs: 10,
+};
+
+/** A resting order the broker still holds. */
+interface RestingOrder {
+  order: BrokerOrder;
+  brokerOrderId: string;
+  filledQuantity: number;
+}
+
+@Injectable()
+export class MockBrokerAdapter implements BrokerAdapter {
+  readonly name = 'mock';
+
+  private readonly logger = new Logger(MockBrokerAdapter.name);
+  private config: MockBrokerConfig;
+
+  private health: ConnectionHealth = {
+    state: ConnectionState.DISCONNECTED,
+    connectedAt: null,
+    reconnectAttempts: 0,
+    lastError: null,
+  };
+
+  private readonly positions = new Map<string, BrokerPosition>();
+  private readonly resting = new Map<string, RestingOrder>();
+  private readonly fillHandlers = new Set<(fill: Fill) => void>();
+  private readonly statusHandlers = new Set<(ack: OrderAck) => void>();
+  private readonly connectionHandlers = new Set<(health: ConnectionHealth) => void>();
+
+  /** Monotonic counters — determinism requires ids not derived from a clock. */
+  private orderSequence = 0;
+  private fillSequence = 0;
+
+  /** Every order ever accepted, for field-by-field payload assertions. */
+  private readonly submitted: BrokerOrder[] = [];
+
+  constructor(config: Partial<MockBrokerConfig> = {}) {
+    this.config = { ...DEFAULT_MOCK_BROKER_CONFIG, ...config };
+  }
+
+  configure(config: Partial<MockBrokerConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+
+  async connect(): Promise<void> {
+    this.setHealth({
+      state: ConnectionState.CONNECTED,
+      connectedAt: '1970-01-01T00:00:00.000Z',
+      reconnectAttempts: 0,
+      lastError: null,
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    this.setHealth({ ...this.health, state: ConnectionState.DISCONNECTED, connectedAt: null });
+  }
+
+  isConnected(): boolean {
+    return this.health.state === ConnectionState.CONNECTED;
+  }
+
+  connectionHealth(): ConnectionHealth {
+    return { ...this.health };
+  }
+
+  /**
+   * Simulates an unexpected socket drop — the fault the engine must survive
+   * without liquidating anything.
+   */
+  simulateDisconnect(reason = 'simulated socket drop'): void {
+    this.setHealth({
+      state: ConnectionState.DISCONNECTED,
+      connectedAt: null,
+      reconnectAttempts: 0,
+      lastError: reason,
+    });
+    this.logger.warn(`connection lost: ${reason}`);
+  }
+
+  /**
+   * Bounded reconnect with exponential backoff (`PRD.md:312`).
+   *
+   * `attemptSucceedsOn` makes the outcome deterministic: the attempt at that
+   * number succeeds, and a value above `maxReconnectAttempts` exhausts the
+   * retries and lands in `FAILED` — the state that halts new entries while
+   * leaving positions untouched.
+   *
+   * Returns the backoff delays actually waited, so a test can assert the
+   * doubling rather than infer it from timing.
+   */
+  async reconnect(attemptSucceedsOn = 1): Promise<number[]> {
+    const delays: number[] = [];
+    this.setHealth({ ...this.health, state: ConnectionState.CONNECTING });
+
+    for (let attempt = 1; attempt <= this.config.maxReconnectAttempts; attempt += 1) {
+      const delay = this.config.baseBackoffMs * Math.pow(2, attempt - 1);
+      delays.push(delay);
+      await sleep(delay);
+
+      if (attempt >= attemptSucceedsOn) {
+        this.setHealth({
+          state: ConnectionState.CONNECTED,
+          connectedAt: '1970-01-01T00:00:00.000Z',
+          reconnectAttempts: attempt,
+          lastError: null,
+        });
+        this.logger.log(`reconnected after ${attempt} attempt(s)`);
+        return delays;
+      }
+
+      this.setHealth({ ...this.health, reconnectAttempts: attempt });
+    }
+
+    // Retries exhausted. Positions are deliberately left exactly as they were.
+    this.setHealth({
+      state: ConnectionState.FAILED,
+      connectedAt: null,
+      reconnectAttempts: this.config.maxReconnectAttempts,
+      lastError: 'reconnect attempts exhausted',
+    });
+    this.logger.error('reconnect attempts exhausted — halting new entries');
+
+    return delays;
+  }
+
+  /**
+   * Submits an order.
+   *
+   * Throws when disconnected. That is the correct signal: an unreachable broker
+   * is a technical fault, categorically different from a rejection, and the
+   * engine handles the two differently.
+   */
+  async submit(order: BrokerOrder): Promise<OrderAck> {
+    if (!this.isConnected()) {
+      throw new Error(
+        `broker not connected (${this.health.state}) — cannot submit ${order.clientOrderId}`,
+      );
+    }
+
+    this.validate(order);
+
+    this.orderSequence += 1;
+    const brokerOrderId = `mock-order-${this.orderSequence}`;
+    this.submitted.push({ ...order });
+
+    if (this.config.fillMode === FillMode.REJECT) {
+      const ack: OrderAck = {
+        clientOrderId: order.clientOrderId,
+        brokerOrderId,
+        status: OrderStatus.REJECTED,
+        rejectReason: this.config.rejectReason,
+      };
+      this.emitStatus(ack);
+      return ack;
+    }
+
+    this.resting.set(order.clientOrderId, { order, brokerOrderId, filledQuantity: 0 });
+
+    const ack: OrderAck = {
+      clientOrderId: order.clientOrderId,
+      brokerOrderId,
+      status: OrderStatus.SUBMITTED,
+    };
+    this.emitStatus(ack);
+
+    if (this.config.fillMode === FillMode.IMMEDIATE) {
+      this.fillResting(order.clientOrderId, order.quantity);
+    } else if (this.config.fillMode === FillMode.PARTIAL) {
+      const quantity = Math.max(1, Math.floor(order.quantity * this.config.partialFillRatio));
+      this.fillResting(order.clientOrderId, Math.min(quantity, order.quantity));
+    }
+
+    return ack;
+  }
+
+  /**
+   * Fills a resting order, wholly or partially.
+   *
+   * The seam a test uses to drive delayed and partial fills explicitly, and
+   * what the engine calls to settle a `RESTING` order on a later bar.
+   */
+  fillResting(clientOrderId: string, quantity?: number, atPrice?: number): Fill | null {
+    const resting = this.resting.get(clientOrderId);
+
+    if (!resting) {
+      return null;
+    }
+
+    const outstanding = resting.order.quantity - resting.filledQuantity;
+    const fillQuantity = Math.min(quantity ?? outstanding, outstanding);
+
+    if (fillQuantity <= 0) {
+      return null;
+    }
+
+    const price = atPrice ?? this.fillPrice(resting.order);
+    this.fillSequence += 1;
+
+    const fill: Fill = {
+      clientOrderId,
+      brokerOrderId: resting.brokerOrderId,
+      fillId: `mock-fill-${this.fillSequence}`,
+      symbol: resting.order.contract.symbol,
+      side: resting.order.side,
+      quantity: fillQuantity,
+      price,
+      commission: this.config.commissionPerOrder,
+      timestamp: resting.order.timestamp,
+    };
+
+    resting.filledQuantity += fillQuantity;
+    this.applyToPosition(fill);
+
+    const complete = resting.filledQuantity >= resting.order.quantity;
+
+    if (complete) {
+      this.resting.delete(clientOrderId);
+    }
+
+    this.fillHandlers.forEach((handler) => handler(fill));
+    this.emitStatus({
+      clientOrderId,
+      brokerOrderId: resting.brokerOrderId,
+      status: complete ? OrderStatus.FILLED : OrderStatus.PARTIALLY_FILLED,
+    });
+
+    return fill;
+  }
+
+  async cancel(clientOrderId: string): Promise<OrderAck> {
+    const resting = this.resting.get(clientOrderId);
+
+    if (!resting) {
+      throw new Error(`no resting order ${clientOrderId} to cancel`);
+    }
+
+    this.resting.delete(clientOrderId);
+
+    const ack: OrderAck = {
+      clientOrderId,
+      brokerOrderId: resting.brokerOrderId,
+      status: OrderStatus.CANCELLED,
+    };
+    this.emitStatus(ack);
+
+    return ack;
+  }
+
+  async getPositions(): Promise<BrokerPosition[]> {
+    return [...this.positions.values()].map((position) => ({ ...position }));
+  }
+
+  async getAccountSummary(): Promise<AccountSummary> {
+    return { equity: this.config.equity, availableFunds: this.config.equity, currency: 'USD' };
+  }
+
+  onFill(handler: (fill: Fill) => void): () => void {
+    this.fillHandlers.add(handler);
+    return () => this.fillHandlers.delete(handler);
+  }
+
+  onOrderStatus(handler: (ack: OrderAck) => void): () => void {
+    this.statusHandlers.add(handler);
+    return () => this.statusHandlers.delete(handler);
+  }
+
+  onConnectionChange(handler: (health: ConnectionHealth) => void): () => void {
+    this.connectionHandlers.add(handler);
+    return () => this.connectionHandlers.delete(handler);
+  }
+
+  /** Every order accepted, in submission order — for payload assertions. */
+  submittedOrders(): BrokerOrder[] {
+    return this.submitted.map((order) => ({ ...order }));
+  }
+
+  restingOrders(): BrokerOrder[] {
+    return [...this.resting.values()].map((entry) => ({ ...entry.order }));
+  }
+
+  /**
+   * Seeds a position without a fill — used by Story 9 to inject the
+   * broker/database mismatch that must halt a symbol.
+   */
+  seedPosition(position: BrokerPosition): void {
+    this.positions.set(position.symbol, { ...position });
+  }
+
+  reset(): void {
+    this.positions.clear();
+    this.resting.clear();
+    this.submitted.length = 0;
+    this.orderSequence = 0;
+    this.fillSequence = 0;
+  }
+
+  /**
+   * Rejects malformed orders the way a real broker would, rather than
+   * accepting them and producing a nonsense fill. A zero-quantity or
+   * zero-price order reaching this point is an engine bug, and it should
+   * surface here rather than in a position report.
+   */
+  private validate(order: BrokerOrder): void {
+    if (!Number.isFinite(order.quantity) || order.quantity <= 0) {
+      throw new Error(`invalid order quantity ${order.quantity} for ${order.clientOrderId}`);
+    }
+
+    if (
+      order.orderType === 'LMT' &&
+      (!Number.isFinite(order.limitPrice) || order.limitPrice <= 0)
+    ) {
+      throw new Error(`invalid limit price ${order.limitPrice} for ${order.clientOrderId}`);
+    }
+  }
+
+  /** Slippage works against the order, which is the only honest direction. */
+  private fillPrice(order: BrokerOrder): number {
+    const slip = this.config.slippagePerShare;
+    const price = order.side === 'BUY' ? order.limitPrice + slip : order.limitPrice - slip;
+
+    return Math.round(price * 100) / 100;
+  }
+
+  /**
+   * Maintains net position and average cost — the only two things a broker
+   * reports. A SELL reduces quantity and **leaves average cost unchanged**,
+   * matching how IB reports a partial disposal.
+   */
+  private applyToPosition(fill: Fill): void {
+    const existing = this.positions.get(fill.symbol) ?? {
+      symbol: fill.symbol,
+      quantity: 0,
+      averageCost: 0,
+    };
+
+    if (fill.side === 'BUY') {
+      const totalCost = existing.quantity * existing.averageCost + fill.quantity * fill.price;
+      const quantity = existing.quantity + fill.quantity;
+
+      this.positions.set(fill.symbol, {
+        symbol: fill.symbol,
+        quantity,
+        averageCost: quantity === 0 ? 0 : Math.round((totalCost / quantity) * 100) / 100,
+      });
+      return;
+    }
+
+    const quantity = existing.quantity - fill.quantity;
+
+    if (quantity <= 0) {
+      this.positions.delete(fill.symbol);
+      return;
+    }
+
+    this.positions.set(fill.symbol, { ...existing, quantity });
+  }
+
+  private setHealth(health: ConnectionHealth): void {
+    this.health = health;
+    this.connectionHandlers.forEach((handler) => handler({ ...health }));
+  }
+
+  private emitStatus(ack: OrderAck): void {
+    this.statusHandlers.forEach((handler) => handler({ ...ack }));
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
