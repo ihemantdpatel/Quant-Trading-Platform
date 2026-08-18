@@ -73,6 +73,19 @@ export interface FillRepository {
   save(fill: Fill): Promise<void>;
   findAll(): Promise<Fill[]>;
   findByClientOrderId(clientOrderId: string): Promise<Fill[]>;
+  /**
+   * One fill by IB's `execId`, or null.
+   *
+   * **The durable half of fill deduplication.** IB replays the day's executions
+   * to every client that subscribes, so a reconnect — including the routine
+   * daily logout — re-delivers fills already processed. The in-memory working
+   * order map cannot catch that: reconciliation repopulates it at startup
+   * precisely so a pre-restart order can still find its rung, which is the same
+   * moment the replay arrives. Only persisted evidence distinguishes "this fill
+   * is new" from "this fill is being told to us again", and opening a second lot
+   * for one execution would double a position the broker holds once.
+   */
+  findByFillId(fillId: string): Promise<Fill | null>;
   clear(): Promise<void>;
 }
 

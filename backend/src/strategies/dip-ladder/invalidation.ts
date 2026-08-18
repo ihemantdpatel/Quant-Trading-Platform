@@ -63,6 +63,25 @@ export function heldRungCount(position: LadderPosition): number {
 }
 
 /**
+ * Counts committed slots: held lots **plus** rungs with an order resting at the
+ * broker.
+ *
+ * A resting order is exposure the ladder has already committed to — it can fill
+ * at any moment without another decision being made. Counting only held lots
+ * would let the ladder place a sixth resting order while five lots are held,
+ * and `maxConcurrentRungs` would be breached the instant it filled, with no
+ * point at which the limit could intervene.
+ *
+ * This is the conservative direction, and deliberately so: the cost of
+ * over-counting is a rung the ladder declines to place, while the cost of
+ * under-counting is real exposure beyond the configured ceiling.
+ */
+export function committedRungCount(position: LadderPosition): number {
+  const working = position.rungs.filter((rung) => Boolean(rung.workingOrderId)).length;
+  return position.heldLots.length + working;
+}
+
+/**
  * Decides whether the ladder may open another lot at `price`.
  *
  * Order matters only for which reason is reported; both conditions block. The
@@ -74,13 +93,16 @@ export function evaluateInvalidation(
   price: number,
   config: DipLadderConfig,
 ): InvalidationResult {
-  const held = heldRungCount(position);
+  // Counts resting orders as committed, not just filled lots — see
+  // `committedRungCount`. With no resting orders this is identical to the
+  // held-lot count, so the pre-existing behaviour is unchanged.
+  const committed = committedRungCount(position);
 
-  if (held >= config.maxConcurrentRungs) {
+  if (committed >= config.maxConcurrentRungs) {
     return {
       canAdd: false,
       reason: BlockReason.MAX_RUNGS_HELD,
-      detail: `${held} of ${config.maxConcurrentRungs} concurrent rungs already held`,
+      detail: `${committed} of ${config.maxConcurrentRungs} concurrent rungs already committed`,
     };
   }
 

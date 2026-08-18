@@ -386,3 +386,170 @@ describe('DipLadderStrategy', () => {
     });
   });
 });
+
+/**
+ * The state transitions the engine drives when an order rests at the broker.
+ *
+ * Static rather than instance methods because the engine holds `StrategyState`,
+ * not the strategy object, at the point a fill arrives — the coordinator owns
+ * the state and hands the same reference to every hook.
+ */
+describe('resting-order state transitions', () => {
+  const config = buildDipLadderConfig('TQQQ', { symbolCapital: 40_000 });
+
+  async function freshState(): Promise<StrategyState> {
+    return new DipLadderStrategy(config).initialize({} as never);
+  }
+
+  it('records a working order, creating the rung if it is new', async () => {
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+
+    const [rung] = DipLadderStrategy.rungsOf(state)!;
+    expect(rung.price).toBe(95);
+    expect(rung.status).toBe(RungStatus.WORKING);
+    expect(rung.workingOrderId).toBe('co-1');
+  });
+
+  it('marks an existing rung working rather than duplicating the level', async () => {
+    // The re-arm path: the rung already exists at its original price, and a new
+    // order at that level must reuse it or the ledger accumulates duplicates.
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+    DipLadderStrategy.clearWorkingOrder(state, 'co-1');
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-2');
+
+    const rungs = DipLadderStrategy.rungsOf(state)!;
+    expect(rungs).toHaveLength(1);
+    expect(rungs[0].workingOrderId).toBe('co-2');
+  });
+
+  it('clears a working order by its id and leaves others alone', async () => {
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+    DipLadderStrategy.recordWorkingOrder(state, 90.25, 'co-2');
+    DipLadderStrategy.clearWorkingOrder(state, 'co-1');
+
+    const rungs = DipLadderStrategy.rungsOf(state)!;
+    expect(rungs.find((r) => r.price === 95)!.workingOrderId).toBeNull();
+    expect(rungs.find((r) => r.price === 90.25)!.workingOrderId).toBe('co-2');
+  });
+
+  it('opens a lot from the actual fill, not the rung price', async () => {
+    // A lot's exit target is a percentage of what *that lot actually paid*
+    // (`PRD.md:129`), so a fill below the rung must move the target with it.
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+
+    const lot = DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: 95,
+      price: 94.5,
+      quantity: 100,
+      at: NOW,
+    });
+
+    expect(lot.fillPrice).toBe(94.5);
+    expect(lot.quantity).toBe(100);
+    expect(lot.exitTarget).toBeCloseTo(99.23, 2);
+
+    const [rung] = DipLadderStrategy.rungsOf(state)!;
+    expect(rung.status).toBe(RungStatus.HELD);
+    expect(rung.lotId).toBe(lot.id);
+    expect(rung.workingOrderId).toBeNull();
+  });
+
+  it('records the first entry price for the hard floor', async () => {
+    const state = await freshState();
+
+    DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: 95,
+      price: 94.5,
+      quantity: 100,
+      at: NOW,
+    });
+    DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: 90.25,
+      price: 90,
+      quantity: 100,
+      at: NOW,
+    });
+
+    // The floor is measured from where the ladder *started*, not from the most
+    // recent fill.
+    expect(DipLadderStrategy.lotsOf(state)).toHaveLength(2);
+    expect(state.data.firstEntryPrice).toBe(94.5);
+  });
+
+  it('creates the rung when a fill arrives for a level with no record', async () => {
+    // The adopted-order path: reconciliation may hand the engine a fill for an
+    // order placed by a previous process, whose rung this state never had.
+    const state = await freshState();
+
+    const lot = DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: 88,
+      price: 88,
+      quantity: 50,
+      at: NOW,
+    });
+
+    const [rung] = DipLadderStrategy.rungsOf(state)!;
+    expect(rung.price).toBe(88);
+    expect(rung.lotId).toBe(lot.id);
+  });
+
+  it('leaves other rungs untouched when marking one working', async () => {
+    // Exercises the non-matching side of the per-rung map: a ledger with
+    // several levels must update only the one whose price matches.
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+    DipLadderStrategy.clearWorkingOrder(state, 'co-1');
+    DipLadderStrategy.recordWorkingOrder(state, 90.25, 'co-2');
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-3');
+
+    const rungs = DipLadderStrategy.rungsOf(state)!;
+    expect(rungs).toHaveLength(2);
+    expect(rungs.find((r) => r.price === 95)!.workingOrderId).toBe('co-3');
+    expect(rungs.find((r) => r.price === 90.25)!.workingOrderId).toBe('co-2');
+  });
+
+  it('marks only the filled rung held when several exist', async () => {
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+    DipLadderStrategy.recordWorkingOrder(state, 90.25, 'co-2');
+
+    DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: 90.25,
+      price: 90.25,
+      quantity: 100,
+      at: NOW,
+    });
+
+    const rungs = DipLadderStrategy.rungsOf(state)!;
+    expect(rungs.find((r) => r.price === 90.25)!.status).toBe(RungStatus.HELD);
+    // The other level still has its order working — a fill at one rung must not
+    // disturb another.
+    expect(rungs.find((r) => r.price === 95)!.status).toBe(RungStatus.WORKING);
+  });
+
+  it('keeps state JSON-serializable after every transition', async () => {
+    // `StrategyState` is the durable recovery unit — a Date or Map creeping in
+    // here would corrupt recovery rather than fail loudly.
+    const state = await freshState();
+
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'co-1');
+    DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: 95,
+      price: 94.5,
+      quantity: 100,
+      at: NOW,
+    });
+
+    expect(JSON.parse(JSON.stringify(state))).toEqual(state);
+  });
+});

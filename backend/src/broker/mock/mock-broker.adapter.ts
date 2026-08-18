@@ -34,6 +34,9 @@ import {
   ConnectionHealth,
   ConnectionState,
   Fill,
+  CompletedOrder,
+  OpenOrder,
+  OrderSide,
   OrderAck,
   OrderStatus,
 } from '../broker-adapter.interface';
@@ -99,6 +102,14 @@ export class MockBrokerAdapter implements BrokerAdapter {
 
   private readonly positions = new Map<string, BrokerPosition>();
   private readonly resting = new Map<string, RestingOrder>();
+  /**
+   * Terminal-state orders, in the order they completed.
+   *
+   * The broker's own history, kept because the engine cannot reconstruct it:
+   * a status it could not attribute at the time is exactly what this list is
+   * for.
+   */
+  private readonly completed: CompletedOrder[] = [];
   private readonly fillHandlers = new Set<(fill: Fill) => void>();
   private readonly statusHandlers = new Set<(ack: OrderAck) => void>();
   private readonly connectionHandlers = new Set<(health: ConnectionHealth) => void>();
@@ -106,6 +117,9 @@ export class MockBrokerAdapter implements BrokerAdapter {
   /** Monotonic counters — determinism requires ids not derived from a clock. */
   private orderSequence = 0;
   private fillSequence = 0;
+
+  /** Every fill emitted this session, for `replayFill`. */
+  private readonly emitted: Fill[] = [];
 
   /** Every order ever accepted, for field-by-field payload assertions. */
   private readonly submitted: BrokerOrder[] = [];
@@ -226,6 +240,16 @@ export class MockBrokerAdapter implements BrokerAdapter {
         status: OrderStatus.REJECTED,
         rejectReason: this.config.rejectReason,
       };
+      this.recordCompletion(
+        order.clientOrderId,
+        brokerOrderId,
+        order.contract.symbol,
+        order.side,
+        order.quantity,
+        0,
+        OrderStatus.REJECTED,
+        this.config.rejectReason ?? null,
+      );
       this.emitStatus(ack);
       return ack;
     }
@@ -291,8 +315,19 @@ export class MockBrokerAdapter implements BrokerAdapter {
 
     if (complete) {
       this.resting.delete(clientOrderId);
+      this.recordCompletion(
+        clientOrderId,
+        resting.brokerOrderId,
+        resting.order.contract.symbol,
+        resting.order.side,
+        resting.order.quantity,
+        resting.filledQuantity,
+        OrderStatus.FILLED,
+        null,
+      );
     }
 
+    this.emitted.push({ ...fill });
     this.fillHandlers.forEach((handler) => handler(fill));
     this.emitStatus({
       clientOrderId,
@@ -303,6 +338,52 @@ export class MockBrokerAdapter implements BrokerAdapter {
     return fill;
   }
 
+  /**
+   * Delivers an arbitrary execution to current subscribers.
+   *
+   * IB reports executions for orders this process never placed — a manual
+   * trade in TWS, or an order that outlived the strategy that created it — and
+   * `fillResting` cannot express those, because it requires an order the mock
+   * itself is holding. The engine must decline them rather than attribute them
+   * to a rung, and only a seam that bypasses the resting book can prove it
+   * does.
+   */
+  deliverFill(fill: Fill): void {
+    this.emitted.push({ ...fill });
+    this.fillHandlers.forEach((handler) => handler({ ...fill }));
+  }
+
+  /**
+   * Drops every fill and status subscriber, modelling a daemon that is no
+   * longer running.
+   *
+   * A test seam, and the only way to express "the process was down when this
+   * filled" against an in-process broker: `disconnect()` will not do, because
+   * it models a broker that went away while the engine kept running, which is
+   * the opposite arrangement. Fills emitted after this are still recorded in
+   * `emitted`, so `replayFill` can deliver them to whatever subscribes next —
+   * exactly as IB replays a session's executions to a reconnecting client.
+   */
+  detachHandlers(): void {
+    this.fillHandlers.clear();
+    this.statusHandlers.clear();
+  }
+
+  /**
+   * Re-delivers fills already emitted for an order, as IB does on reconnect.
+   *
+   * IB pushes executions only to a client that has subscribed, and replays the
+   * session's executions each time one does — so every reconnect re-delivers
+   * fills the engine has already turned into lots. The seam exists because
+   * nothing else offline can produce a duplicate fill, and a consumer that
+   * opens a second lot for one execution would otherwise look correct.
+   */
+  replayFill(clientOrderId: string): void {
+    this.emitted
+      .filter((fill) => fill.clientOrderId === clientOrderId)
+      .forEach((fill) => this.fillHandlers.forEach((handler) => handler({ ...fill })));
+  }
+
   async cancel(clientOrderId: string): Promise<OrderAck> {
     const resting = this.resting.get(clientOrderId);
 
@@ -311,6 +392,16 @@ export class MockBrokerAdapter implements BrokerAdapter {
     }
 
     this.resting.delete(clientOrderId);
+    this.recordCompletion(
+      clientOrderId,
+      resting.brokerOrderId,
+      resting.order.contract.symbol,
+      resting.order.side,
+      resting.order.quantity,
+      resting.filledQuantity,
+      OrderStatus.CANCELLED,
+      null,
+    );
 
     const ack: OrderAck = {
       clientOrderId,
@@ -320,6 +411,91 @@ export class MockBrokerAdapter implements BrokerAdapter {
     this.emitStatus(ack);
 
     return ack;
+  }
+
+  /**
+   * Ends a resting order **without telling the engine** — the way IB expiring a
+   * DAY order overnight, or an operator cancelling in TWS, actually behaves
+   * from this process's point of view.
+   *
+   * Deliberately silent: no `emitStatus`. A status the engine receives is the
+   * easy case it already handles. The case worth testing is the one where the
+   * order is gone at the broker and the engine still believes it is working,
+   * which is only reachable if nothing is emitted here.
+   */
+  expireOrder(clientOrderId: string, reason = 'expired at the close'): void {
+    const resting = this.resting.get(clientOrderId);
+
+    if (!resting) {
+      throw new Error(`no resting order ${clientOrderId} to expire`);
+    }
+
+    this.resting.delete(clientOrderId);
+    this.recordCompletion(
+      clientOrderId,
+      resting.brokerOrderId,
+      resting.order.contract.symbol,
+      resting.order.side,
+      resting.order.quantity,
+      resting.filledQuantity,
+      OrderStatus.CANCELLED,
+      reason,
+    );
+  }
+
+  private recordCompletion(
+    clientOrderId: string,
+    brokerOrderId: string,
+    symbol: string,
+    side: OrderSide,
+    quantity: number,
+    filledQuantity: number,
+    status: OrderStatus.FILLED | OrderStatus.CANCELLED | OrderStatus.REJECTED,
+    reason: string | null,
+  ): void {
+    this.completed.push({
+      clientOrderId,
+      brokerOrderId,
+      symbol,
+      side,
+      quantity,
+      filledQuantity,
+      status,
+      reason,
+    });
+  }
+
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    if (!this.isConnected()) {
+      // Matches the IB adapter: an unreachable broker must throw, because
+      // "no open orders" and "cannot tell" lead to opposite decisions on boot.
+      throw new Error(`broker not connected (${this.health.state}) — cannot list open orders`);
+    }
+
+    return [...this.resting.entries()].map(([clientOrderId, resting]) => ({
+      clientOrderId,
+      brokerOrderId: resting.brokerOrderId,
+      symbol: resting.order.contract.symbol,
+      side: resting.order.side,
+      quantity: resting.order.quantity,
+      filledQuantity: resting.filledQuantity,
+      limitPrice: resting.order.limitPrice,
+    }));
+  }
+
+  /**
+   * Terminal-state orders this broker has seen.
+   *
+   * Recorded as they complete rather than derived from `orders`, so a test can
+   * assert the history the engine reads back is the history the broker
+   * actually produced.
+   */
+  async getCompletedOrders(): Promise<CompletedOrder[]> {
+    if (!this.isConnected()) {
+      throw new Error(`broker not connected (${this.health.state}) — cannot list completed orders`);
+    }
+
+    return this.completed.map((order) => ({ ...order }));
   }
 
   async getPositions(): Promise<BrokerPosition[]> {

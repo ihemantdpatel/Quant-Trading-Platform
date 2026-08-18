@@ -16,7 +16,7 @@ import { BacktestController } from '../api/backtest.controller';
 import { BacktestService } from '../backtest/backtest.service';
 import { EngineController } from '../api/engine.controller';
 import { ParametersController } from '../api/parameters.controller';
-import { BROKER_ADAPTER, BrokerAdapter } from '../broker/broker-adapter.interface';
+import { BROKER_ADAPTER, BrokerAdapter, ConnectionState } from '../broker/broker-adapter.interface';
 import { equityContract } from '../domain/contract';
 import { IBBrokerAdapter } from '../broker/ib/ib-broker.adapter';
 import { StoqeyIbSocket } from '../broker/ib/stoqey-ib-socket';
@@ -31,6 +31,7 @@ import {
   HistoryCacheService,
 } from '../market-data/history/cache.service';
 import { LiveFeedService } from '../market-data/live/live-feed.service';
+import { PostCloseReconcileService } from '../reconciliation/post-close-reconcile.service';
 import { ReplayService } from '../market-data/mock/replay.service';
 import { ReconciliationModule } from '../reconciliation/reconciliation.module';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
@@ -227,6 +228,7 @@ import { StartupSequence } from './startup.sequence';
 export class EngineModule implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(EngineModule.name);
   private liveFeed: LiveFeedService | null = null;
+  private postClose: PostCloseReconcileService | null = null;
 
   constructor(
     private readonly coordinator: CoordinatorService,
@@ -237,6 +239,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     private readonly parameters: ParameterService,
     private readonly startup: StartupSequence,
     private readonly engine: EngineService,
+    private readonly reconciliation: ReconciliationService,
     private readonly appConfig: AppConfigService,
   ) {}
 
@@ -266,6 +269,14 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // visible to the next bar's `evaluateBar`. Registering a copy would let
     // edits apply to nothing (`parameter.service.ts:24`).
     this.parameters.register(ladder.id, this.ladderConfig);
+
+    // Rebuilds the engine's in-memory working-order registry from the orders
+    // reconciliation found still resting at the broker. A callback rather than
+    // a direct reference so `ReconciliationService` does not depend on
+    // `EngineService`, which already depends on it via `StartupSequence`.
+    this.reconciliation.onOpenOrdersReconciled = (strategyId, symbol, orders) => {
+      this.engine.adoptWorkingOrders(strategyId, symbol, orders);
+    };
 
     for (const strategy of [new GridStrategy(), new WheelStrategy(), new LeapsStrategy()]) {
       this.coordinator.register({
@@ -333,15 +344,31 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       {
         subscribeBars: (contract, barSize, handler) => ib.subscribeBars(contract, barSize, handler),
         isDataStale: () => ib.isDataStale(),
+        // A bar subscription does not survive the socket it was made on, and
+        // IB Gateway logs itself out daily. Without this the feed ends at the
+        // first logout and never returns. See `LiveFeedService.start`.
+        onConnectionChange: (handler) =>
+          ib.onConnectionChange((health) => handler(health.state === ConnectionState.CONNECTED)),
       },
       this.engine,
     );
 
     this.liveFeed.start(equityContract(this.ladderConfig.symbol));
     this.liveFeed.startWatchdog();
+
+    // **Started alongside the live feed, and gated on the same condition.**
+    //
+    // Under the mock broker there is no session and no resting order that
+    // outlives one: `POST /engine/replay` drives everything, and a nightly job
+    // would reconcile a ledger nothing had changed. Against IB the opposite is
+    // true — DAY orders expire at the close whether or not this process was
+    // watching, which is exactly what the job exists to notice.
+    this.postClose = new PostCloseReconcileService(this.reconciliation);
+    this.postClose.start();
   }
 
   onModuleDestroy(): void {
     this.liveFeed?.stop();
+    this.postClose?.stop();
   }
 }

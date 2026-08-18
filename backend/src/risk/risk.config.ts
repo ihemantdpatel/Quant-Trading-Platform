@@ -39,12 +39,32 @@ export enum LossBasis {
 
 export interface RiskConfig {
   /**
-   * Account equity the global cap is measured against.
+   * Account equity the global cap is measured against, denominated in
+   * `accountCurrency`.
    *
    * Supplied by the broker at Story 6+; configured here so the arithmetic is
    * testable and so SHADOW replay has a figure to reason about.
    */
   accountEquity: number;
+
+  /**
+   * The currency `accountEquity` and every limit in this config are expressed
+   * in — IB's *base* currency for the account, not the currency of any
+   * instrument traded.
+   *
+   * Explicit rather than assumed, because the two are genuinely different here:
+   * the paper account reports `NetLiquidation` in **CAD** while TQQQ trades in
+   * **USD**. Comparing a USD position notional against a CAD cap silently
+   * permits roughly `USDCAD` times more exposure than intended (~1.39×), and
+   * nothing about the resulting number looks wrong on a dashboard.
+   *
+   * Carrying it here does not by itself convert anything — `deployed` totals
+   * are still summed in instrument currency, so a cap comparison is only sound
+   * while every traded symbol shares this currency. `assertSingleCurrency`
+   * below is what enforces that precondition instead of leaving it to a
+   * comment.
+   */
+  accountCurrency: string;
 
   /**
    * Per-symbol notional ceiling, keyed by symbol. A symbol absent from the map
@@ -79,6 +99,7 @@ export interface RiskConfig {
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
   accountEquity: 0,
+  accountCurrency: 'USD',
   perSymbolLimits: {},
   perStrategyLimits: {},
   dailyLossThreshold: null,
@@ -124,4 +145,38 @@ export function buildRiskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig
 /** The absolute notional ceiling across all strategies: 60% of equity. */
 export function globalCapitalCap(config: RiskConfig): number {
   return Math.round(config.accountEquity * GLOBAL_CAPITAL_CAP_FRACTION * 100) / 100;
+}
+
+/**
+ * Fails when a traded instrument is denominated in anything but the account
+ * currency.
+ *
+ * `globalCapitalCap` compares a sum of position notionals against equity, and
+ * that comparison is only meaningful when both sides are in the same currency.
+ * Nothing in the deployed totals records a currency, so a USD position counted
+ * against a CAD cap produces a number that is wrong by the exchange rate and
+ * looks entirely normal.
+ *
+ * This is deliberately a **refusal, not a conversion**. Converting would need a
+ * live FX rate, which is market data with its own staleness and failure modes —
+ * a stale rate mis-sizes every order silently, which is strictly worse than not
+ * booting. Until that is built, mixing currencies is a configuration error and
+ * is reported as one.
+ */
+export function assertSingleCurrency(config: RiskConfig, instrumentCurrencies: string[]): string[] {
+  const foreign = [...new Set(instrumentCurrencies)].filter(
+    (currency) => currency !== config.accountCurrency,
+  );
+
+  if (foreign.length === 0) {
+    return [];
+  }
+
+  return [
+    `account equity is denominated in ${config.accountCurrency} but ` +
+      `${foreign.join(', ')}-denominated instruments are configured. The global ` +
+      `capital cap compares position notional against equity directly, so this ` +
+      `comparison would be wrong by the exchange rate. Either fund the account in ` +
+      `${foreign.join('/')} or implement FX conversion in the risk layer.`,
+  ];
 }

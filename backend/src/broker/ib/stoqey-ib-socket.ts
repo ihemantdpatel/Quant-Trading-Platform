@@ -35,13 +35,17 @@ import {
   EventName,
   Execution as IbExecution,
   IBApi,
+  Order as IbOrder,
+  OrderState as IbOrderState,
   IBApiNext,
   IBApiNextError,
+  OrderAction,
   WhatToShow,
 } from '@stoqey/ib';
 import { Observable } from 'rxjs';
 import { DateTime } from 'luxon';
 import { Contract } from '../../domain/contract';
+import { LiveBarGate } from './live-bar-gate';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
 import {
@@ -49,11 +53,14 @@ import {
   BrokerOrder,
   BrokerPosition,
   Fill,
+  CompletedOrder,
+  OpenOrder,
   OrderAck,
   OrderStatus,
 } from '../broker-adapter.interface';
 import {
   CommissionCorrection,
+  DataErrorEvent,
   DisconnectEvent,
   DisconnectReason,
   HistoricalRequest,
@@ -65,13 +72,24 @@ import {
 import {
   durationString,
   parseIbTime,
+  resolveClientOrderId,
   toDomainBar,
   toIbContract,
   toIbEndDateTime,
+  toCompletedOrder,
   toIbOrder,
+  toOrderStatus,
 } from './ib-wire';
 
-export { durationString, parseIbTime, toIbContract, toIbEndDateTime, toIbOrder } from './ib-wire';
+export {
+  durationString,
+  parseIbTime,
+  toCompletedOrder,
+  toIbContract,
+  toIbEndDateTime,
+  toIbOrder,
+  toOrderStatus,
+} from './ib-wire';
 
 export interface StoqeyIbSocketConfig {
   host: string;
@@ -83,6 +101,15 @@ export interface StoqeyIbSocketConfig {
    */
   clientId: number;
 }
+
+/**
+ * Request id for the execution subscription.
+ *
+ * Fixed rather than sequential: this is the only execution request this client
+ * issues, and re-using the id on reconnect means IB replaces the previous
+ * subscription rather than accumulating one per reconnect.
+ */
+const EXECUTIONS_REQ_ID = 1;
 
 /** IB's bar-size wire strings, for the two sizes this system uses. */
 const BAR_SIZE_SETTING: Record<BarSize, BarSizeSetting> = {
@@ -117,6 +144,7 @@ export class StoqeyIbSocket implements IbSocket {
   private readonly statusHandlers = new Set<(ack: OrderAck) => void>();
   private readonly commissionHandlers = new Set<(report: CommissionCorrection) => void>();
   private readonly disconnectHandlers = new Set<(event: DisconnectEvent) => void>();
+  private readonly dataErrorHandlers = new Set<(event: DataErrorEvent) => void>();
 
   constructor(config: StoqeyIbSocketConfig) {
     this.config = config;
@@ -143,8 +171,44 @@ export class StoqeyIbSocket implements IbSocket {
     // makes bounded retry meaningful.
     await this.awaitConnected();
 
+    // **Executions must be requested, or `execDetails` never fires.**
+    //
+    // IB pushes executions only to a client that has asked for them. Without
+    // this call the handler wired in `wireErrorHandling` sits there and the
+    // socket looks entirely healthy while every fill is silently dropped — no
+    // lot is opened, no order leaves `SUBMITTED`, and the ladder holds shares
+    // it does not know about.
+    //
+    // Requested **after** `awaitConnected` and on **every** connect, not once
+    // in the constructor: a subscription does not survive the socket it was
+    // made on, and IB Gateway logs itself out daily. The same reasoning as
+    // `LiveFeedService` re-subscribing bars on every CONNECTED.
+    this.requestExecutions();
+
     this.connected = true;
     this.logger.log(`connected to IB Gateway at ${this.config.host}:${this.config.port}`);
+  }
+
+  /**
+   * Asks IB for executions, on this session and the current day.
+   *
+   * An empty filter is deliberate. Narrowing by symbol or account would mean
+   * this socket silently ignoring a fill for anything the filter did not
+   * anticipate — a manual TWS order against the same account, or a symbol
+   * added to the ladder later — and a dropped execution is invisible rather
+   * than loud. Fills the engine cannot attribute are discarded downstream by
+   * `clientOrderIdFor`, which is the right place for that decision because it
+   * has the `orderRef` correlation this layer does not.
+   *
+   * IB replays the day's executions in response, including ones already
+   * processed before a reconnect. That replay is the reason `routeFill`
+   * deduplicates on `fillId` against persisted fills rather than trusting
+   * in-memory state.
+   */
+  private requestExecutions(): void {
+    // reqId is per-request and this is the only execution request on this
+    // client, so a fixed id is safe and keeps the correlation obvious.
+    this.eventApi.reqExecutions(EXECUTIONS_REQ_ID, {});
   }
 
   async disconnect(): Promise<void> {
@@ -190,24 +254,65 @@ export class StoqeyIbSocket implements IbSocket {
       .filter((bar): bar is Bar => bar !== null);
   }
 
+  /**
+   * Subscribes to live bars.
+   *
+   * **`getHistoricalDataUpdates` is a backfill-then-stream subscription, not a
+   * pure live feed.** On subscribe IB replays a window of *historical* bars and
+   * only then begins emitting live updates, and it re-emits the in-progress bar
+   * repeatedly as it forms. Forwarding every emission treats all three as new
+   * closed bars, which walked the ladder down five rungs in sixteen seconds
+   * against stale prices — in `PAPER`, straight at the submission path.
+   *
+   * `LiveBarGate` decides which emissions are new closed bars — see that file
+   * for the rule and its reasoning.
+   *
+   * Filtering here rather than in `LiveFeedService` is deliberate: this is IB
+   * protocol behaviour, and `stoqey-ib-socket.ts` is the one file allowed to
+   * know IB's vocabulary. Above this boundary a bar means "a new closed bar",
+   * which is what the engine has always assumed.
+   */
   subscribeBars(contract: Contract, barSize: BarSize, handler: (bar: Bar) => void): () => void {
+    // Per-subscription, so a reconnect re-subscribes and correctly re-absorbs
+    // the fresh backfill rather than replaying it into the ladder.
+    const gate = new LiveBarGate();
+
     const subscription = this.api
       .getHistoricalDataUpdates(
         toIbContract(contract),
         BAR_SIZE_SETTING[barSize],
         WhatToShow.TRADES,
+        // Format 2 is epoch seconds — see the note in `getHistoricalBars`.
         2,
       )
       .subscribe({
         next: (bar) => {
           const domain = toDomainBar(bar, contract.symbol, barSize);
 
-          if (domain) {
-            handler(domain);
+          if (!domain) {
+            return;
+          }
+
+          // Suppresses the historical backfill burst and the repeated emissions
+          // of the forming bar. See `live-bar-gate.ts`.
+          const live = gate.accept(domain);
+
+          if (live) {
+            handler(live);
           }
         },
         error: (error: IBApiNextError) => {
+          const code = typeof error.code === 'number' ? error.code : null;
+
           this.logger.warn(`bar subscription error for ${contract.symbol}: ${error.error.message}`);
+
+          // Also reported upward: IB answers an unentitled request here and
+          // then delivers nothing, leaving a socket that looks healthy in every
+          // other field. A log line alone made "no bars are arriving" invisible
+          // to `GET /status` and the dashboard.
+          this.dataErrorHandlers.forEach((handler) =>
+            handler({ symbol: contract.symbol, code, message: error.error.message }),
+          );
         },
       });
 
@@ -253,6 +358,109 @@ export class StoqeyIbSocket implements IbSocket {
     this.emitStatus(ack);
 
     return ack;
+  }
+
+  /**
+   * Orders working at IB, keyed back to the engine's own `clientOrderId` via
+   * `orderRef` (`ib-wire.ts:toIbOrder`).
+   *
+   * Rebuilds the `orderIds` map as a side effect, so a cancel issued after a
+   * restart can still find IB's numeric id for an order this process never
+   * placed. Without that, an adopted order could be reconciled but never
+   * cancelled.
+   *
+   * An order with no `orderRef` is skipped: it was not placed by this engine —
+   * a manual order in TWS, most likely — and adopting it would attach a rung to
+   * something the ladder does not own.
+   */
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    const update = await withTimeout(this.api.getAllOpenOrders());
+    const orders: OpenOrder[] = [];
+
+    for (const open of update) {
+      const clientOrderId = open.order.orderRef;
+
+      if (!clientOrderId || open.orderId === undefined) {
+        continue;
+      }
+
+      this.orderIds.set(clientOrderId, open.orderId);
+
+      orders.push({
+        clientOrderId,
+        brokerOrderId: String(open.orderId),
+        symbol: open.contract.symbol ?? '',
+        side: open.order.action === OrderAction.SELL ? 'SELL' : 'BUY',
+        quantity: open.order.totalQuantity ?? 0,
+        filledQuantity: open.orderStatus?.filled ?? 0,
+        limitPrice: open.order.lmtPrice ?? 0,
+      });
+    }
+
+    return orders;
+  }
+
+  /**
+   * IB's terminal-order history for the current day.
+   *
+   * **Event-based, unlike every other query here**, because `api-next` offers
+   * no promise form: `reqCompletedOrders` streams `completedOrder` events and
+   * signals the end with `completedOrdersEnd`. So this collects until the
+   * terminator, then resolves.
+   *
+   * Two details that would leak or hang if changed:
+   *
+   * - **Listeners are removed in a `finally`-equivalent on every exit path** —
+   *   resolve, timeout, and error alike. `reqCompletedOrders` can be called
+   *   repeatedly (the manual reconcile does exactly that), and a listener left
+   *   attached would accumulate across calls and re-deliver an earlier run's
+   *   orders into a later run's array.
+   * - **`withTimeout` bounds it** for the reason every IB call here is bounded:
+   *   an unauthenticated Gateway accepts the socket and then says nothing, so
+   *   an unterminated stream would wait forever rather than fail.
+   *
+   * `apiOnly: false` asks for **all** completed orders, not only those this API
+   * client placed. An order cancelled by hand in TWS is precisely the case this
+   * exists to report, and `true` would filter out exactly that.
+   */
+  async getCompletedOrders(): Promise<CompletedOrder[]> {
+    return withTimeout(
+      new Promise<CompletedOrder[]>((resolve, reject) => {
+        const collected: CompletedOrder[] = [];
+
+        const onCompleted = (contract: IbContract, order: IbOrder, state: IbOrderState): void => {
+          const completed = toCompletedOrder(contract, order, state);
+
+          // Orders IB reports that carry no `orderRef` are not ones this engine
+          // placed — a manual TWS order, most often. Skipped rather than
+          // synthesized an id for: this history is joined to `Order` rows by
+          // `clientOrderId`, and inventing one would match nothing anyway.
+          if (completed) {
+            collected.push(completed);
+          }
+        };
+
+        const cleanup = (): void => {
+          this.eventApi.off(EventName.completedOrder, onCompleted);
+          this.eventApi.off(EventName.completedOrdersEnd, onEnd);
+        };
+
+        function onEnd(): void {
+          cleanup();
+          resolve(collected);
+        }
+
+        this.eventApi.on(EventName.completedOrder, onCompleted);
+        this.eventApi.on(EventName.completedOrdersEnd, onEnd);
+
+        try {
+          this.eventApi.reqCompletedOrders(false);
+        } catch (error) {
+          cleanup();
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      }),
+    );
   }
 
   async getPositions(): Promise<BrokerPosition[]> {
@@ -329,6 +537,11 @@ export class StoqeyIbSocket implements IbSocket {
     return () => this.disconnectHandlers.delete(handler);
   }
 
+  onDataError(handler: (event: DataErrorEvent) => void): () => void {
+    this.dataErrorHandlers.add(handler);
+    return () => this.dataErrorHandlers.delete(handler);
+  }
+
   /**
    * Routes IB's error stream to the right consumer.
    *
@@ -359,7 +572,7 @@ export class StoqeyIbSocket implements IbSocket {
     this.eventApi.on(
       EventName.execDetails,
       (_reqId: number, contract: IbContract, execution: IbExecution) => {
-        const clientOrderId = this.clientOrderIdFor(execution.orderId);
+        const clientOrderId = this.clientOrderIdFor(execution.orderId, execution.orderRef);
 
         if (!clientOrderId) {
           return;
@@ -385,6 +598,73 @@ export class StoqeyIbSocket implements IbSocket {
               parseIbTime(execution.time ?? '') ?? formatEt(DateTime.now().setZone(ET_ZONE)),
           }),
         );
+      },
+    );
+
+    // **IB's own view of an order's lifecycle.**
+    //
+    // Without this, the only statuses that ever existed were the synthetic ones
+    // `placeOrder` and `cancelOrder` emit from this process — so an order stayed
+    // `SUBMITTED` forever no matter what IB did with it, and a DAY order that
+    // expired overnight or a fill that happened at the exchange left the rung
+    // ledger describing a state the broker had long since left.
+    //
+    // Terminal non-fill statuses are what matter here: they are the only signal
+    // that a resting order went away *without* creating a position, and the rung
+    // must be released or that level is blocked for the life of the process.
+    // Fills are handled by `execDetails` instead — see below.
+    this.eventApi.on(
+      EventName.orderStatus,
+      (orderId: number, status: string, filled: number, remaining: number) => {
+        // No `orderRef` here — IB's `orderStatus` carries only the numeric id,
+        // so this path depends on the in-memory map and cannot attribute a
+        // status for an order placed by a previous process until
+        // `getOpenOrders` rebuilds that map during reconciliation. That is
+        // tolerable where the equivalent gap on `execDetails` was not: a lost
+        // terminal status leaves a rung marked `WORKING` for an order that no
+        // longer exists, which reconciliation detects and releases, whereas a
+        // lost fill leaves shares with no lot and no way to recover the fill
+        // price the exit target is derived from.
+        const clientOrderId = this.clientOrderIdFor(orderId);
+
+        if (!clientOrderId) {
+          return;
+        }
+
+        const mapped = toOrderStatus(status);
+
+        if (mapped === null) {
+          return;
+        }
+
+        // **A fill is reported here too, and is deliberately not emitted as one.**
+        //
+        // `orderStatus` carries no execution price — only cumulative quantities —
+        // so a lot opened from it would need the limit price as a stand-in for
+        // what the order actually traded at. That is wrong whenever IB improves
+        // the price, and wrong silently: the lot's take-profit target is a
+        // percentage of its own fill price, so a fabricated cost basis moves the
+        // exit to a level the position never justified. `execDetails` carries the
+        // real price and `execId`, and is the sole path that opens a lot.
+        //
+        // Emitting the status anyway would also race that path for the same fill.
+        if (mapped === OrderStatus.FILLED || mapped === OrderStatus.PARTIALLY_FILLED) {
+          return;
+        }
+
+        // A `Cancelled` with shares already filled is the partial-fill remainder
+        // being cancelled — by the engine itself, most often. The rung's lot is
+        // opened by `execDetails`; releasing the level here as though nothing
+        // traded would let a second order rest at a price already holding shares.
+        if (mapped === OrderStatus.CANCELLED && filled > 0 && remaining === 0) {
+          return;
+        }
+
+        this.emitStatus({
+          clientOrderId,
+          brokerOrderId: String(orderId),
+          status: mapped,
+        });
       },
     );
 
@@ -442,18 +722,9 @@ export class StoqeyIbSocket implements IbSocket {
     this.logger.debug(`IB notice ${code ?? 'n/a'}: ${message}`);
   }
 
-  private clientOrderIdFor(orderId: number | undefined): string | null {
-    if (orderId === undefined) {
-      return null;
-    }
-
-    for (const [clientOrderId, id] of this.orderIds) {
-      if (id === orderId) {
-        return clientOrderId;
-      }
-    }
-
-    return null;
+  /** See `resolveClientOrderId` — the rule lives in `ib-wire.ts` to stay covered. */
+  private clientOrderIdFor(orderId: number | undefined, orderRef?: string): string | null {
+    return resolveClientOrderId(this.orderIds, orderId, orderRef);
   }
 
   private async nextOrderId(): Promise<number> {
@@ -521,6 +792,35 @@ export class StoqeyIbSocket implements IbSocket {
  * fail-safe path above it can run: halt the symbols, surface the reason, keep
  * serving. Hanging is the one outcome that takes the dashboard down with it.
  */
+/**
+ * The same bound as `firstValue`, for the IB calls that already return a
+ * Promise rather than an Observable (`getAllOpenOrders`).
+ *
+ * A Promise from an unauthenticated Gateway hangs exactly as an Observable
+ * does — it is the socket that is silent, not the wrapper — so the timeout
+ * reasoning above applies unchanged. Separate function rather than overloading
+ * `firstValue` because the two take genuinely different inputs and conflating
+ * them would need a runtime type test.
+ */
+export function withTimeout<T>(promise: Promise<T>, timeoutMs = 10_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`IB did not respond within ${timeoutMs}ms — treating as unreachable`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
 export function firstValue<T>(observable: Observable<T>, timeoutMs = 10_000): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     // Held in a box rather than a bare binding: a cold Observable can emit

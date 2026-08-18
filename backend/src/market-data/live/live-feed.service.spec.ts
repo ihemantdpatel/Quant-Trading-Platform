@@ -28,10 +28,14 @@ function bar(timestamp: string, close = 40): Bar {
 class FakeSource implements LiveBarSource {
   private handler: ((bar: Bar) => void) | null = null;
   private stale = false;
+  private connectionHandler: ((connected: boolean) => void) | null = null;
   unsubscribed = 0;
+  /** How many times a bar subscription has been established. */
+  subscribeCount = 0;
 
   subscribeBars(_contract: unknown, _barSize: BarSize, handler: (bar: Bar) => void): () => void {
     this.handler = handler;
+    this.subscribeCount += 1;
 
     return () => {
       this.unsubscribed += 1;
@@ -43,8 +47,37 @@ class FakeSource implements LiveBarSource {
     return this.stale;
   }
 
+  onConnectionChange(handler: (connected: boolean) => void): () => void {
+    this.connectionHandler = handler;
+
+    return () => {
+      this.connectionHandler = null;
+    };
+  }
+
+  /**
+   * Models IB's daily logout: the socket drops and the subscription dies with
+   * it, silently — IB reports only a one-line subscription error.
+   */
+  dropConnection(): void {
+    this.handler = null;
+    this.connectionHandler?.(false);
+  }
+
+  reconnect(): void {
+    this.connectionHandler?.(true);
+  }
+
+  watchesConnection(): boolean {
+    return this.connectionHandler !== null;
+  }
+
   goStale(): void {
     this.stale = true;
+  }
+
+  goFresh(): void {
+    this.stale = false;
   }
 
   emit(b: Bar): void {
@@ -84,6 +117,21 @@ class RecordingConsumer implements BarConsumer {
 
   haltEntriesForFault(reason: string): void {
     this.halts.push(reason);
+  }
+
+  /** Bar timestamps as of each `persistState` call. */
+  readonly persistedAfter: string[] = [];
+  /** Set to make `persistState` reject once. */
+  failPersistNext: string | null = null;
+
+  async persistState(): Promise<void> {
+    if (this.failPersistNext) {
+      const message = this.failPersistNext;
+      this.failPersistNext = null;
+      throw new Error(message);
+    }
+
+    this.persistedAfter.push(this.seen[this.seen.length - 1]?.timestamp ?? 'none');
   }
 }
 
@@ -134,6 +182,82 @@ describe('LiveFeedService', () => {
       // A stalled queue would silently stop the engine while the socket still
       // looked healthy — the worst kind of failure here.
       expect(consumer.seen.map((b) => b.close)).toEqual([39]);
+    });
+  });
+
+  describe('ladder state is persisted per bar', () => {
+    it('persists after every bar, not once at the end', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      source.emit(bar('2025-01-02T09:45:00.000-05:00', 40));
+      source.emit(bar('2025-01-02T09:50:00.000-05:00', 39));
+      source.emit(bar('2025-01-02T09:55:00.000-05:00', 38));
+      await feed.drain();
+
+      // A live session is interrupted rather than finished, so there is no end
+      // to persist at. Without a write per bar a live-only session leaves the
+      // ladder tables empty and every daily report skips its rung check.
+      expect(consumer.persistedAfter).toEqual([
+        '2025-01-02T09:45:00.000-05:00',
+        '2025-01-02T09:50:00.000-05:00',
+        '2025-01-02T09:55:00.000-05:00',
+      ]);
+    });
+
+    it('persists even when the bar failed to process', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      consumer.failNext = 'transient';
+      source.emit(bar('2025-01-02T09:45:00.000-05:00', 40));
+      await feed.drain();
+
+      // The ladder may have opened a lot before throwing. Skipping the write
+      // would leave the database disagreeing with a position the broker
+      // already holds — the divergence reconciliation exists to prevent.
+      expect(consumer.seen).toHaveLength(0);
+      expect(consumer.persistedAfter).toHaveLength(1);
+    });
+
+    it('keeps processing bars after a failed write', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      consumer.failPersistNext = 'database unreachable';
+      source.emit(bar('2025-01-02T09:45:00.000-05:00', 40));
+      source.emit(bar('2025-01-02T09:50:00.000-05:00', 39));
+      await feed.drain();
+
+      // A write failure must not stall the queue behind it: the engine runs on
+      // in-memory state, and reconciliation catches a real divergence at the
+      // next restart. Losing the feed instead would be strictly worse.
+      expect(consumer.seen.map((b) => b.close)).toEqual([40, 39]);
+    });
+
+    it('works with a consumer that does not persist at all', async () => {
+      const source = new FakeSource();
+      // `persistState` is optional on the port — a fixture-driven consumer has
+      // no persistence and must not be broken by this.
+      const consumer: BarConsumer = {
+        seen: [] as Bar[],
+        processBar(b: Bar): Promise<void> {
+          (this.seen as Bar[]).push(b);
+          return Promise.resolve();
+        },
+        haltEntriesForFault: () => undefined,
+      } as BarConsumer & { seen: Bar[] };
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      source.emit(bar('2025-01-02T09:45:00.000-05:00', 40));
+      await expect(feed.drain()).resolves.toBeUndefined();
     });
   });
 
@@ -244,6 +368,138 @@ describe('LiveFeedService', () => {
       feed.onModuleDestroy();
 
       expect(source.unsubscribed).toBe(1);
+    });
+  });
+
+  /**
+   * The regression for a live PAPER incident: IB Gateway performed its daily
+   * scheduled logout, the adapter restored the socket, and the *bar
+   * subscription* was never re-established. The result was a broker reporting
+   * CONNECTED that delivered no bars for eleven hours — the failure mode that
+   * looks healthy from every angle except the data itself.
+   */
+  describe('resubscribing after a reconnect', () => {
+    it('re-establishes the bar subscription when the broker reconnects', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      expect(source.subscribeCount).toBe(1);
+
+      // IB's 04:00 logout: the subscription dies with the socket.
+      source.dropConnection();
+      expect(source.hasSubscriber()).toBe(false);
+
+      source.reconnect();
+
+      expect(source.subscribeCount).toBe(2);
+      expect(source.hasSubscriber()).toBe(true);
+
+      // The feed is genuinely working again, not merely re-registered.
+      source.emit(bar('2026-08-11T10:00:00.000-04:00'));
+      await feed.drain();
+
+      expect(consumer.seen).toHaveLength(1);
+    });
+
+    it('keeps delivering across repeated logout cycles', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+
+      // One cycle per trading day. A fix that only survives the first is not a
+      // fix — the daemon is meant to run for weeks.
+      for (let day = 0; day < 5; day += 1) {
+        source.dropConnection();
+        source.reconnect();
+        source.emit(bar(`2026-08-1${day}T10:00:00.000-04:00`));
+      }
+
+      await feed.drain();
+
+      expect(consumer.seen).toHaveLength(5);
+      expect(source.subscribeCount).toBe(6);
+    });
+
+    it('ignores a repeated CONNECTED without dropping in between', () => {
+      const source = new FakeSource();
+      const feed = new LiveFeedService(source, new RecordingConsumer());
+
+      feed.start(TQQQ);
+
+      // A reconnect that succeeds on a later attempt reports CONNECTED more
+      // than once. Re-subscribing per event would cost an IB request and
+      // another backfill window each time.
+      source.reconnect();
+      source.reconnect();
+
+      expect(source.subscribeCount).toBe(1);
+    });
+
+    it('re-arms the staleness halt so a second outage is still reported', () => {
+      jest.useFakeTimers();
+
+      try {
+        const source = new FakeSource();
+        const consumer = new RecordingConsumer();
+        const feed = new LiveFeedService(source, consumer, { watchdogIntervalMs: 1_000 });
+
+        feed.start(TQQQ);
+        feed.startWatchdog();
+
+        source.goStale();
+        jest.advanceTimersByTime(1_000);
+        expect(consumer.halts).toHaveLength(1);
+
+        // Recovery: bars flow again.
+        source.dropConnection();
+        source.reconnect();
+        source.goFresh();
+        jest.advanceTimersByTime(1_000);
+
+        // A second, genuinely new outage must raise its own halt. A latched
+        // flag would leave this one silent.
+        source.goStale();
+        jest.advanceTimersByTime(1_000);
+
+        expect(consumer.halts).toHaveLength(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('stops watching the connection once stopped', () => {
+      const source = new FakeSource();
+      const feed = new LiveFeedService(source, new RecordingConsumer());
+
+      feed.start(TQQQ);
+      expect(source.watchesConnection()).toBe(true);
+
+      feed.stop();
+      expect(source.watchesConnection()).toBe(false);
+
+      // A connection event arriving after teardown must not revive the feed.
+      source.reconnect();
+      expect(source.subscribeCount).toBe(1);
+    });
+
+    it('works with a source that has no connection notion', () => {
+      // Fixture replay and older test doubles do not implement the optional
+      // hook; they must keep working exactly as before.
+      const minimal: LiveBarSource = {
+        subscribeBars: () => () => undefined,
+        isDataStale: () => false,
+      };
+
+      const feed = new LiveFeedService(minimal, new RecordingConsumer());
+
+      expect(() => {
+        feed.start(TQQQ);
+        feed.stop();
+      }).not.toThrow();
     });
   });
 });

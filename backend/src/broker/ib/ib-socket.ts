@@ -35,6 +35,8 @@ import { Bar, BarSize } from '../../market-data/types';
 import {
   BrokerOrder,
   BrokerPosition,
+  CompletedOrder,
+  OpenOrder,
   AccountSummary,
   Fill,
   OrderAck,
@@ -115,6 +117,25 @@ export interface IbSocket {
   placeOrder(order: BrokerOrder): Promise<OrderAck>;
   cancelOrder(clientOrderId: string): Promise<OrderAck>;
 
+  /**
+   * Orders working at IB, unfilled. Backed by `reqOpenOrders`.
+   *
+   * Bounded by a timeout like every other IB call — an unauthenticated Gateway
+   * accepts the socket and then says nothing, so an unbounded wait here would
+   * hang the boot path (`first-value.spec.ts`).
+   */
+  getOpenOrders(): Promise<OpenOrder[]>;
+
+  /**
+   * Orders that reached a terminal state today, from IB's own history.
+   *
+   * Event-based rather than promise-based: `reqCompletedOrders` streams
+   * `completedOrder` events terminated by `completedOrdersEnd`, so the
+   * implementation collects until the terminator and is bounded by a timeout
+   * like every other IB call.
+   */
+  getCompletedOrders(): Promise<CompletedOrder[]>;
+
   getPositions(): Promise<BrokerPosition[]>;
   getAccountSummary(): Promise<AccountSummary>;
 
@@ -134,6 +155,29 @@ export interface IbSocket {
   onCommission(handler: (report: CommissionCorrection) => void): () => void;
 
   onDisconnect(handler: (event: DisconnectEvent) => void): () => void;
+
+  /**
+   * A market-data subscription error, reported rather than only logged.
+   *
+   * IB rejects an unentitled or malformed data request on the subscription's
+   * error channel and then simply delivers nothing. The socket stays connected
+   * and every field on `GET /status` keeps reading healthy, so the failure that
+   * matters most to an operator — no bars are arriving — was visible only as a
+   * single `warn` line in the container log.
+   *
+   * Optional so existing fakes and any future socket need not implement it;
+   * a socket that omits it behaves exactly as before.
+   */
+  onDataError?(handler: (event: DataErrorEvent) => void): () => void;
+}
+
+/** A market-data subscription error, in this codebase's vocabulary. */
+export interface DataErrorEvent {
+  /** The symbol whose subscription failed. */
+  symbol: string;
+  /** IB's numeric code where one exists — 354 is "not subscribed". */
+  code: number | null;
+  message: string;
 }
 
 /** A late-arriving commission, matched to its fill by `fillId` (IB's `execId`). */

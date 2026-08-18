@@ -37,11 +37,11 @@ import {
   StrategyState,
   TimeInForce,
 } from '../types';
-import { DipLadderConfig } from './config';
+import { DipLadderConfig, OrderPlacement } from './config';
 import { ExitIntent, selectExit } from './exits';
 import { evaluateBar } from './ladder';
 import { closeLot, Lot, LotStatus, openLot } from './lot';
-import { createRung, findRung, markHeld, reArm, Rung } from './rung';
+import { clearWorking, createRung, findRung, markHeld, markWorking, reArm, Rung } from './rung';
 import { isSessionOpenBar, sessionDateOf } from './session-window';
 import { EntryIntent, LadderPosition } from './types';
 
@@ -171,7 +171,18 @@ export class DipLadderStrategy implements Strategy {
     );
 
     if (decision.intent) {
-      this.applyEntry(decision.intent, data, bar.timestamp);
+      // In RESTING mode no lot is opened here. The order goes to the broker and
+      // waits; the lot is created only when a fill arrives, because until then
+      // there are no shares and an optimistically-opened lot would misreport the
+      // position to reconciliation for as long as the order sat unfilled.
+      //
+      // The rung is still recorded — as WORKING once the engine reports the
+      // order id — so `selectFireableRung` will not place a second order at the
+      // same level on the next bar.
+      if (this.config.orderPlacement === OrderPlacement.IMMEDIATE) {
+        this.applyEntry(decision.intent, data, bar.timestamp);
+      }
+
       intents.push(this.toEntryIntent(decision.intent));
     }
 
@@ -251,6 +262,93 @@ export class DipLadderStrategy implements Strategy {
     data.rungs = data.rungs.map((rung) =>
       rung.lotId === closed.id ? reArm(rung, at) : rung,
     ) as DipLadderStateData['rungs'];
+  }
+
+  /**
+   * Records that a limit order is now resting at `rungPrice`.
+   *
+   * Called by the engine after the broker acknowledges the order, not when the
+   * intent is created — a rung must not be marked `WORKING` for an order that
+   * was rejected or never reached IB, or the level would be blocked forever
+   * with nothing actually resting there.
+   *
+   * Creates the rung if the ladder has not established this level before, which
+   * is the ordinary case: in RESTING mode the rung's first appearance is when
+   * its order is placed, not when a lot fills.
+   */
+  static recordWorkingOrder(state: StrategyState, rungPrice: number, clientOrderId: string): void {
+    const data = ladderData(state);
+    const existing = findRung(data.rungs, rungPrice);
+
+    data.rungs = (
+      existing
+        ? data.rungs.map((rung) =>
+            rung.price === existing.price ? markWorking(rung, clientOrderId) : rung,
+          )
+        : [...data.rungs, markWorking(createRung(rungPrice), clientOrderId)]
+    ) as DipLadderStateData['rungs'];
+  }
+
+  /**
+   * Releases a resting order that went away without filling — cancelled,
+   * rejected, or expired at the close.
+   *
+   * The rung becomes fireable again. Without this a DAY order that expired
+   * overnight would leave its rung `WORKING` forever, and the ladder would
+   * never place another order at that level.
+   */
+  static clearWorkingOrder(state: StrategyState, clientOrderId: string): void {
+    const data = ladderData(state);
+
+    data.rungs = data.rungs.map((rung) =>
+      rung.workingOrderId === clientOrderId ? clearWorking(rung) : rung,
+    ) as DipLadderStateData['rungs'];
+  }
+
+  /**
+   * Opens a lot from a broker fill on a resting order.
+   *
+   * This is the RESTING-mode counterpart to `applyEntry`: the shares now exist,
+   * so the lot is created from the **actual** fill price and quantity rather
+   * than the rung's assumed values. The exit target follows from the real fill
+   * price, which is the rule that each lot exits at its own fill +5%
+   * (`PRD.md:129`).
+   *
+   * Returns the opened lot so the engine can persist it.
+   */
+  static openLotFromFill(
+    state: StrategyState,
+    config: DipLadderConfig,
+    fill: { rungPrice: number; price: number; quantity: number; at: string },
+  ): Lot {
+    const data = ladderData(state);
+
+    data.lotSequence += 1;
+
+    const lot = openLot({
+      id: `${config.symbol}-lot-${data.lotSequence}`,
+      rungPrice: fill.rungPrice,
+      fillPrice: fill.price,
+      quantity: fill.quantity,
+      openedAt: fill.at,
+      takeProfitPercent: config.takeProfitPercent,
+    });
+
+    data.lots.push(lot);
+
+    const existing = findRung(data.rungs, fill.rungPrice);
+
+    data.rungs = (
+      existing
+        ? data.rungs.map((rung) => (rung.price === existing.price ? markHeld(rung, lot.id) : rung))
+        : [...data.rungs, markHeld(createRung(fill.rungPrice), lot.id)]
+    ) as DipLadderStateData['rungs'];
+
+    if (data.firstEntryPrice === null) {
+      data.firstEntryPrice = lot.fillPrice;
+    }
+
+    return lot;
   }
 
   private applyEntry(entry: EntryIntent, data: DipLadderStateData, at: string): void {

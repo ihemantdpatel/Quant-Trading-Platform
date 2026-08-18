@@ -34,7 +34,7 @@ const API_URL = process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? 'http:
 
 export type ExecutionMode = 'SHADOW' | 'PAPER' | 'LIVE';
 export type LotStatus = 'HELD' | 'CLOSED';
-export type RungStatus = 'HELD' | 'RE_ARMED' | 'PENDING';
+export type RungStatus = 'HELD' | 'WORKING' | 'RE_ARMED' | 'PENDING';
 export type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'FAILED';
 export type OrderStatus = 'SUBMITTED' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
 
@@ -58,6 +58,8 @@ export interface Rung {
   price: number;
   status: RungStatus;
   lotId: string | null;
+  /** `clientOrderId` of the limit order resting at this price, or null. */
+  workingOrderId: string | null;
   completedCycles: number;
   lastExitAt: string | null;
   held: boolean;
@@ -130,6 +132,27 @@ export interface Status {
   strategies: { id: string; enabled: boolean }[];
   /** Null until the startup sequence has run. */
   reconciliation?: ReconciliationReport | null;
+  /**
+   * The post-close order reconciliation's last run. Null until it has fired.
+   *
+   * Optional so an older backend without the scheduled job renders unchanged
+   * rather than breaking the dashboard.
+   */
+  orderReconciliation?: OrderReconciliationReport | null;
+}
+
+/**
+ * The result of an orders-only reconciliation — the scheduled post-close job.
+ *
+ * Carries no `clean` or `haltedSymbols`: that run asserts nothing about
+ * positions, so it has no verdict to report about them.
+ */
+export interface OrderReconciliationReport {
+  ranAt: string;
+  symbols: string[];
+  /** False when the broker could not be asked; the ledger is then untouched. */
+  brokerReachable: boolean;
+  ordersUpdated: number;
 }
 
 /**

@@ -13,7 +13,9 @@
  */
 
 import { ExecutionMode } from '../config/execution-mode';
-import { MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
+import { OrderStatus } from '../broker/broker-adapter.interface';
+import { FillMode, MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
+import { equityContract } from '../domain/contract';
 import { EngineService } from '../engine/engine.service';
 import { StartupSequence } from '../engine/startup.sequence';
 import { ReplayService } from '../market-data/mock/replay.service';
@@ -65,6 +67,10 @@ function buildHarness(
   } = {},
 ) {
   const lots = options.lots ?? new InMemoryLotRepository();
+  // One instance shared with the engine below: a status the engine wrote and a
+  // correction reconciliation makes must land in the same ledger, or neither
+  // test can observe the other's effect.
+  const orders = new InMemoryOrderRepository();
   const rungs = options.rungs ?? new InMemoryRungRepository();
   const snapshots = options.snapshots ?? new InMemoryStrategyStateSnapshotRepository();
   const broker = options.broker ?? new MockBrokerAdapter();
@@ -89,6 +95,7 @@ function buildHarness(
     halts,
     broker,
     lots,
+    orders,
     rungs,
     snapshots,
   );
@@ -108,7 +115,7 @@ function buildHarness(
     ),
     broker,
     new InMemoryOrderIntentRepository(),
-    new InMemoryOrderRepository(),
+    orders,
     new InMemoryFillRepository(),
     lots,
     rungs,
@@ -121,8 +128,27 @@ function buildHarness(
   jest.spyOn(startup['logger'], 'log').mockImplementation(() => undefined);
   jest.spyOn(startup['logger'], 'error').mockImplementation(() => undefined);
 
-  return { lots, rungs, snapshots, broker, coordinator, halts, reconciliation, engine, startup };
+  return {
+    lots,
+    orders,
+    rungs,
+    snapshots,
+    broker,
+    coordinator,
+    halts,
+    reconciliation,
+    engine,
+    startup,
+  };
 }
+
+// Each `buildHarness` builds its own broker, so a spy cannot reach the next
+// test's adapter — but a spy left installed still outlives the test that made
+// it, and the logger spies here are on shared class prototypes. Restoring keeps
+// a mock from answering for a test that never asked for one.
+afterEach(() => {
+  jest.restoreAllMocks();
+});
 
 const NOW = '2025-01-20T09:25:00.000-05:00';
 
@@ -146,6 +172,7 @@ function rung(price: number, overrides: Partial<Rung> = {}): Rung {
     price,
     status: RungStatus.PENDING,
     lotId: null,
+    workingOrderId: null,
     completedCycles: 0,
     lastExitAt: null,
     ...overrides,
@@ -770,5 +797,355 @@ describe('Story 9: startup reconciliation', () => {
       expect(three.engine.ladderLots().map((l) => l.exitTarget)).toEqual([99.75, 94.76, 90.03]);
       expect(one.engine.ladderLots().map((l) => l.exitTarget)).toEqual([94.85]);
     });
+  });
+});
+
+describe('open-order reconciliation across a restart', () => {
+  /**
+   * The failure this exists to prevent: an order placed before a restart is
+   * still working at IB afterwards, and nothing in the database can confirm it
+   * survived. Adopting it is what stops the next bar placing a second order at
+   * the same price.
+   */
+  it('adopts a resting order the ladder has no record of', async () => {
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+
+    // Placed by a "previous process": at the broker, absent from the rung
+    // ledger this harness starts with.
+    await broker.submit({
+      clientOrderId: 'co-from-before-restart',
+      contract: equityContract('TQQQ'),
+      side: 'BUY',
+      quantity: 100,
+      orderType: 'LMT',
+      limitPrice: 95,
+      timeInForce: 'DAY',
+      timestamp: NOW,
+    });
+
+    const harness = buildHarness({ broker });
+    await harness.startup.run(NOW);
+
+    const rungs = harness.engine.ladderRungs();
+    const adopted = rungs.find((rung) => rung.price === 95);
+
+    expect(adopted).toBeDefined();
+    expect(adopted!.status).toBe(RungStatus.WORKING);
+    expect(adopted!.workingOrderId).toBe('co-from-before-restart');
+  });
+
+  it('releases a WORKING rung whose order is no longer at the broker', async () => {
+    // A DAY order that expired overnight. Left WORKING the level would be
+    // blocked forever and the ladder would silently stop laddering.
+    const rungs = new InMemoryRungRepository();
+    await rungs.saveAll(
+      [rung(95, { status: RungStatus.WORKING, workingOrderId: 'co-expired' })],
+      'TQQQ',
+    );
+
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+
+    const harness = buildHarness({ rungs, broker });
+    await harness.startup.run(NOW);
+
+    const restored = harness.engine.ladderRungs().find((r) => r.price === 95);
+    expect(restored!.status).not.toBe(RungStatus.WORKING);
+    expect(restored!.workingOrderId).toBeNull();
+  });
+
+  it('leaves the ledger untouched when open orders cannot be read', async () => {
+    // "Could not ask" is not "nothing is resting". Collapsing the two would
+    // release every WORKING rung and duplicate a live order on the next bar.
+    const rungs = new InMemoryRungRepository();
+    await rungs.saveAll(
+      [rung(95, { status: RungStatus.WORKING, workingOrderId: 'co-still-live' })],
+      'TQQQ',
+    );
+
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+    jest.spyOn(broker, 'getOpenOrders').mockRejectedValue(new Error('IB timed out'));
+
+    const harness = buildHarness({ rungs, broker });
+    jest.spyOn(harness.reconciliation['logger'], 'warn').mockImplementation(() => undefined);
+    await harness.startup.run(NOW);
+
+    const restored = harness.engine.ladderRungs().find((r) => r.price === 95);
+    expect(restored!.status).toBe(RungStatus.WORKING);
+    expect(restored!.workingOrderId).toBe('co-still-live');
+  });
+});
+
+/**
+ * Order-history reconciliation — the stale `Order` row.
+ *
+ * **The gap being closed.** A terminal status reaches the engine on
+ * `onOrderStatus`, which can only attribute it via an in-memory map populated
+ * at submission. An order placed before a restart and then cancelled in TWS
+ * produces a status this process cannot attribute, so it is dropped: the rung
+ * is released correctly by open-order reconciliation, but the `Order` row sits
+ * at `SUBMITTED` and the dashboard keeps showing a live order that no longer
+ * exists anywhere.
+ */
+describe('order-history reconciliation', () => {
+  const submittedOrder = (clientOrderId: string) => ({
+    clientOrderId,
+    strategyId: 'dip-ladder:TQQQ',
+    symbol: 'TQQQ',
+    side: 'BUY' as const,
+    quantity: 100,
+    orderType: 'LMT',
+    limitPrice: 95,
+    timeInForce: 'DAY',
+    status: OrderStatus.SUBMITTED,
+    brokerOrderId: 'ib-1',
+    submittedAt: '2025-01-19T10:00:00.000-05:00',
+    rejectReason: null,
+  });
+
+  it('corrects a SUBMITTED row the broker reports as cancelled', async () => {
+    const h = buildHarness();
+    await h.orders.save(submittedOrder('order-1') as never);
+
+    // The broker's history knows the outcome this process never saw.
+    jest.spyOn(h.broker, 'getCompletedOrders').mockResolvedValue([
+      {
+        clientOrderId: 'order-1',
+        brokerOrderId: 'ib-1',
+        symbol: 'TQQQ',
+        side: 'BUY',
+        quantity: 100,
+        filledQuantity: 0,
+        status: OrderStatus.CANCELLED,
+        reason: 'cancelled in TWS',
+      },
+    ]);
+
+    const report = await h.startup.run(NOW);
+
+    expect(report.reconciliation.ordersUpdated).toBe(1);
+
+    const corrected = await h.orders.findByClientOrderId('order-1');
+
+    expect(corrected?.status).toBe(OrderStatus.CANCELLED);
+    expect(corrected?.rejectReason).toBe('cancelled in TWS');
+  });
+
+  it('leaves a row that already reached a terminal state alone', async () => {
+    const h = buildHarness();
+    await h.orders.save({ ...submittedOrder('order-1'), status: OrderStatus.FILLED } as never);
+
+    jest.spyOn(h.broker, 'getCompletedOrders').mockResolvedValue([
+      {
+        clientOrderId: 'order-1',
+        brokerOrderId: 'ib-1',
+        symbol: 'TQQQ',
+        side: 'BUY',
+        quantity: 100,
+        filledQuantity: 100,
+        // A contradiction, and the engine's own live observation wins: it saw
+        // the execution, which is the more direct evidence.
+        status: OrderStatus.CANCELLED,
+        reason: null,
+      },
+    ]);
+
+    const report = await h.startup.run(NOW);
+
+    expect(report.reconciliation.ordersUpdated).toBe(0);
+    expect((await h.orders.findByClientOrderId('order-1'))?.status).toBe(OrderStatus.FILLED);
+  });
+
+  it('does not invent a row for an order the database never had', async () => {
+    const h = buildHarness();
+
+    // A manual TWS order against the same account. Reconciling records the
+    // engine owns must not put entries in the ledger it never decided to make.
+    jest.spyOn(h.broker, 'getCompletedOrders').mockResolvedValue([
+      {
+        clientOrderId: 'placed-by-hand',
+        brokerOrderId: 'ib-99',
+        symbol: 'TQQQ',
+        side: 'BUY',
+        quantity: 50,
+        filledQuantity: 50,
+        status: OrderStatus.FILLED,
+        reason: null,
+      },
+    ]);
+
+    const report = await h.startup.run(NOW);
+
+    expect(report.reconciliation.ordersUpdated).toBe(0);
+    expect(await h.orders.findByClientOrderId('placed-by-hand')).toBeNull();
+  });
+
+  it('still reconciles positions when the history query fails', async () => {
+    const h = buildHarness();
+    jest.spyOn(h.broker, 'getCompletedOrders').mockRejectedValue(new Error('IB did not respond'));
+    jest.spyOn(h.reconciliation['logger'], 'warn').mockImplementation(() => undefined);
+
+    const report = await h.startup.run(NOW);
+
+    // The history is diagnostic. The assertions that gate trading have already
+    // run, so a failure here must not turn a cosmetic staleness into a halt.
+    expect(report.reconciliation.clean).toBe(true);
+    expect(report.reconciliation.haltedSymbols).toEqual([]);
+    expect(report.reconciliation.ordersUpdated).toBe(0);
+  });
+
+  it('releases the rung from open orders even when history is unavailable', async () => {
+    // The independence that matters: rung release is decided by
+    // `getOpenOrders` alone, because a level is free when nothing is working
+    // at it — whether or not the history query succeeded.
+    const rungs = new InMemoryRungRepository();
+    await rungs.saveAll(
+      [rung(95, { status: RungStatus.WORKING, workingOrderId: 'gone-order' })],
+      'TQQQ',
+    );
+
+    const h = buildHarness({ rungs });
+    jest.spyOn(h.broker, 'getCompletedOrders').mockRejectedValue(new Error('IB did not respond'));
+    jest.spyOn(h.reconciliation['logger'], 'warn').mockImplementation(() => undefined);
+
+    await h.startup.run(NOW);
+
+    const restored = DipLadderStrategy.rungsOf(h.coordinator.getState('dip-ladder:TQQQ')!)!;
+
+    expect(restored.find((r) => r.price === 95)?.workingOrderId).toBeNull();
+  });
+});
+
+/**
+ * Orders-only reconciliation — what the post-close job runs.
+ *
+ * The property that matters most is what it does **not** do. It is the only
+ * reconciliation entry point that runs unattended, so a run that halted a
+ * symbol, or overwrote live state from the database, would take the ladder out
+ * of service with nobody watching.
+ */
+describe('orders-only reconciliation', () => {
+  it('releases a rung whose order is gone without asserting anything about positions', async () => {
+    const rungs = new InMemoryRungRepository();
+    await rungs.saveAll(
+      [rung(95, { status: RungStatus.WORKING, workingOrderId: 'expired-at-the-close' })],
+      'TQQQ',
+    );
+
+    const h = buildHarness({ rungs });
+    await h.startup.run(NOW);
+
+    // Re-block the level the way a DAY order does: the engine believes an order
+    // is working, the broker has already expired it.
+    const state = h.coordinator.getState('dip-ladder:TQQQ')!;
+    DipLadderStrategy.recordWorkingOrder(state, 95, 'expired-at-the-close');
+    h.coordinator.setState('dip-ladder:TQQQ', state);
+
+    const report = await h.reconciliation.reconcileOrders(NOW);
+
+    expect(report.brokerReachable).toBe(true);
+    expect(report.symbols).toEqual(['TQQQ']);
+
+    const after = DipLadderStrategy.rungsOf(h.coordinator.getState('dip-ladder:TQQQ')!)!;
+
+    expect(after.find((r) => r.price === 95)?.workingOrderId).toBeNull();
+  });
+
+  it('never halts a symbol, even when lots disagree with the broker', async () => {
+    // The decisive difference from `reconcileAll`. A lot sum that does not
+    // match is a genuine finding, but discovering it at 16:15 with nobody
+    // watching must not stop the ladder — that is a decision for an operator
+    // at a dashboard, which is what the manual control is for.
+    const lots = new InMemoryLotRepository();
+    await lots.saveAll([heldLot('TQQQ-lot-1')], 'TQQQ');
+
+    const h = buildHarness({ lots });
+    h.broker.seedPosition({ symbol: 'TQQQ', quantity: 999, averageCost: 95 });
+
+    await h.reconciliation.reconcileOrders(NOW);
+
+    expect(h.halts.haltedSymbols()).toEqual([]);
+  });
+
+  it('reports the broker as unreachable rather than emptying the ledger', async () => {
+    const h = buildHarness();
+    jest.spyOn(h.broker, 'getOpenOrders').mockRejectedValue(new Error('IB did not respond'));
+    jest.spyOn(h.reconciliation['logger'], 'error').mockImplementation(() => undefined);
+    jest.spyOn(h.reconciliation['logger'], 'warn').mockImplementation(() => undefined);
+
+    const report = await h.reconciliation.reconcileOrders(NOW);
+
+    // "Cannot ask" is not "nothing is resting". Collapsing the two would
+    // release every WORKING rung and duplicate live orders on the next bar.
+    expect(report.brokerReachable).toBe(false);
+    expect(h.halts.haltedSymbols()).toEqual([]);
+  });
+
+  it('corrects a stale Order row from the broker history', async () => {
+    const h = buildHarness();
+    await h.orders.save({
+      clientOrderId: 'order-1',
+      strategyId: 'dip-ladder:TQQQ',
+      symbol: 'TQQQ',
+      side: 'BUY',
+      quantity: 100,
+      orderType: 'LMT',
+      limitPrice: 95,
+      timeInForce: 'DAY',
+      status: OrderStatus.SUBMITTED,
+      brokerOrderId: 'ib-1',
+      submittedAt: '2025-01-19T10:00:00.000-05:00',
+      rejectReason: null,
+    } as never);
+
+    jest.spyOn(h.broker, 'getCompletedOrders').mockResolvedValue([
+      {
+        clientOrderId: 'order-1',
+        brokerOrderId: 'ib-1',
+        symbol: 'TQQQ',
+        side: 'BUY',
+        quantity: 100,
+        filledQuantity: 0,
+        status: OrderStatus.CANCELLED,
+        reason: 'expired at the close',
+      },
+    ]);
+
+    const report = await h.reconciliation.reconcileOrders(NOW);
+
+    expect(report.ordersUpdated).toBe(1);
+    expect((await h.orders.findByClientOrderId('order-1'))?.status).toBe(OrderStatus.CANCELLED);
+  });
+
+  it('does not restore lots from the database over live state', async () => {
+    // Mid-session the in-memory ladder is at least as current as the persisted
+    // copy. This job answers a question about orders, not composition.
+    const lots = new InMemoryLotRepository();
+    await lots.saveAll([heldLot('TQQQ-lot-1')], 'TQQQ');
+
+    const h = buildHarness({ lots });
+    h.broker.seedPosition({ symbol: 'TQQQ', quantity: 100, averageCost: 95 });
+    await h.startup.run(NOW);
+
+    // The live ladder moves on: the lot is gone from memory but still persisted.
+    const state = h.coordinator.getState('dip-ladder:TQQQ')!;
+    (state.data as { lots: unknown[] }).lots = [];
+    h.coordinator.setState('dip-ladder:TQQQ', state);
+
+    await h.reconciliation.reconcileOrders(NOW);
+
+    expect(DipLadderStrategy.lotsOf(h.coordinator.getState('dip-ladder:TQQQ')!)).toEqual([]);
+  });
+
+  it('is recorded so an operator can see it ran', async () => {
+    const h = buildHarness();
+
+    expect(h.reconciliation.lastOrderReconcile()).toBeNull();
+
+    await h.reconciliation.reconcileOrders(NOW);
+
+    expect(h.reconciliation.lastOrderReconcile()).toMatchObject({ ranAt: NOW });
   });
 });

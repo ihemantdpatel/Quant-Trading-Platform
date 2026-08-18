@@ -1,11 +1,15 @@
 import {
+  clearWorking,
   createRung,
   findRung,
   heldRungs,
+  highestFireableRung,
   isFireable,
   isHeldRung,
+  isWorkingRung,
   lowestRungPrice,
   markHeld,
+  markWorking,
   reArm,
   Rung,
   RungStatus,
@@ -13,6 +17,7 @@ import {
 } from './rung';
 
 const EXIT_BAR = '2025-01-03T11:00:00.000-05:00';
+const BAR = '2025-01-06T10:00:00.000-05:00';
 
 describe('createRung', () => {
   it('starts PENDING and empty', () => {
@@ -22,6 +27,7 @@ describe('createRung', () => {
       price: 95,
       status: RungStatus.PENDING,
       lotId: null,
+      workingOrderId: null,
       completedCycles: 0,
       lastExitAt: null,
     });
@@ -172,8 +178,6 @@ describe('selectFireableRung', () => {
     createRung(85.74),
   ];
 
-  const BAR = '2025-01-06T10:00:00.000-05:00';
-
   it('fires a re-armed rung the close has reached', () => {
     expect(selectFireableRung(rungs, 90, BAR)!.price).toBe(90.25);
   });
@@ -228,5 +232,97 @@ describe('selectFireableRung', () => {
     const justExited = [reArm(markHeld(createRung(95), 'lot-1'), EXIT_BAR)];
 
     expect(selectFireableRung(justExited, 90, BAR)!.price).toBe(95);
+  });
+});
+
+describe('resting orders on a rung', () => {
+  it('marks a rung WORKING without giving it a lot', () => {
+    // The state that did not exist before: occupied, but holding nothing. A
+    // fill is what turns it into a lot.
+    const working = markWorking(createRung(95), 'co-1');
+
+    expect(working.status).toBe(RungStatus.WORKING);
+    expect(working.workingOrderId).toBe('co-1');
+    expect(working.lotId).toBeNull();
+    expect(isWorkingRung(working)).toBe(true);
+  });
+
+  it('is not fireable while an order rests there', () => {
+    // The duplicate-order guard. `lotId` is null, so any test based on that
+    // alone would place a second order at this price on the next bar.
+    const working = markWorking(createRung(95), 'co-1');
+
+    expect(working.lotId).toBeNull();
+    expect(isFireable(working)).toBe(false);
+  });
+
+  it('clears back to PENDING when the order never filled', () => {
+    const released = clearWorking(markWorking(createRung(95), 'co-1'));
+
+    expect(released.status).toBe(RungStatus.PENDING);
+    expect(released.workingOrderId).toBeNull();
+    expect(isFireable(released)).toBe(true);
+  });
+
+  it('clears back to RE_ARMED when the rung had already cycled', () => {
+    // Preserves the distinction `completedCycles` records: a rung that has
+    // traded before is re-armed, not pending, even after a failed order.
+    const cycled = reArm(markHeld(createRung(95), 'lot-1'), EXIT_BAR);
+    const released = clearWorking(markWorking(cycled, 'co-2'));
+
+    expect(released.status).toBe(RungStatus.RE_ARMED);
+    expect(released.completedCycles).toBe(1);
+    expect(isFireable(released)).toBe(true);
+  });
+
+  it('drops the resting order id once the order fills', () => {
+    // A stale id would let a later cancel target an order the broker already
+    // completed.
+    const filled = markHeld(markWorking(createRung(95), 'co-1'), 'lot-1');
+
+    expect(filled.status).toBe(RungStatus.HELD);
+    expect(filled.workingOrderId).toBeNull();
+    expect(filled.lotId).toBe('lot-1');
+  });
+
+  it('excludes a working rung from selection even when price reached it', () => {
+    const working = [markWorking(createRung(95), 'co-1')];
+
+    expect(selectFireableRung(working, 90, BAR)).toBeNull();
+  });
+});
+
+describe('highestFireableRung', () => {
+  it('ignores price entirely', () => {
+    // The resting-order counterpart to `selectFireableRung`: an order is placed
+    // *above* the market and waits, so requiring the bar to have reached the
+    // level first would defeat the point.
+    const rungs = [createRung(95), createRung(90.25)];
+
+    expect(highestFireableRung(rungs, BAR)!.price).toBe(95);
+  });
+
+  it('skips rungs that already have an order resting', () => {
+    const rungs = [markWorking(createRung(95), 'co-1'), createRung(90.25)];
+
+    expect(highestFireableRung(rungs, BAR)!.price).toBe(90.25);
+  });
+
+  it('skips held rungs', () => {
+    const rungs = [markHeld(createRung(95), 'lot-1'), createRung(90.25)];
+
+    expect(highestFireableRung(rungs, BAR)!.price).toBe(90.25);
+  });
+
+  it('honours the same-bar re-fire guard', () => {
+    const rungs = [reArm(markHeld(createRung(95), 'lot-1'), BAR)];
+
+    expect(highestFireableRung(rungs, BAR)).toBeNull();
+  });
+
+  it('returns null when every rung is occupied', () => {
+    const rungs = [markWorking(createRung(95), 'co-1'), markHeld(createRung(90.25), 'lot-1')];
+
+    expect(highestFireableRung(rungs, BAR)).toBeNull();
   });
 });

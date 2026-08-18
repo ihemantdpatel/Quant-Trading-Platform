@@ -16,6 +16,7 @@
 import {
   Contract as IbContract,
   Order as IbOrder,
+  OrderState as IbOrderState,
   OptionType,
   OrderAction,
   OrderType as IbOrderType,
@@ -26,7 +27,7 @@ import { DateTime } from 'luxon';
 import { Contract, SecurityType } from '../../domain/contract';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
-import { BrokerOrder } from '../broker-adapter.interface';
+import { BrokerOrder, CompletedOrder, OrderStatus } from '../broker-adapter.interface';
 
 /** Our `Contract` → IB's. Exported for the payload assertions. */
 export function toIbContract(contract: Contract): IbContract {
@@ -68,7 +69,178 @@ export function toIbOrder(order: BrokerOrder): IbOrder {
     // Never route to a live account by omission. `false` is IB's default, but
     // stating it means a config mistake cannot turn a paper order live.
     transmit: true,
+    // **The engine's own id, carried on the order itself.**
+    //
+    // IB assigns numeric order ids per session; the map from those back to
+    // `clientOrderId` lives in process memory and dies with a restart. An order
+    // resting across that restart would then be unidentifiable — the engine
+    // could see *an* order at IB but not know which rung placed it, and would
+    // place a duplicate.
+    //
+    // `orderRef` is IB's free-text client tag and is returned with every open
+    // order and execution, so it survives the restart the in-memory map does
+    // not. This is what makes open-order reconciliation possible at all.
+    orderRef: order.clientOrderId,
   };
+}
+
+/**
+ * IB's execution → the engine's `clientOrderId`, or null when it is not ours.
+ *
+ * **`orderRef` wins over the id map because it is the only identifier that
+ * survives a restart.** The map is built in `placeOrder` and lives in process
+ * memory, so an execution for an order placed by a *previous* process finds it
+ * empty. The caller discards a null, silently — which is how a PAPER soak came
+ * to hold 272 shares with no lots: two resting orders filled while the process
+ * was down, IB replayed both executions on reconnect, and every one was
+ * dropped here. That `LOT_SUM_MISMATCH` is unrecoverable by construction, since
+ * a net position cannot be decomposed back into the per-lot fill prices each
+ * lot's exit target is a percentage of.
+ *
+ * `orderRef` carries `clientOrderId` on the order itself (`toIbOrder`) and IB
+ * returns it on every execution, so it holds across restarts and reconnects
+ * alike. The map stays as a fallback for orders placed before this was set.
+ *
+ * An execution with neither is not ours — a manual TWS order on the same
+ * account — and is still discarded, deliberately: adopting it would attach a
+ * lot to a position the ladder does not own.
+ *
+ * Lives here rather than in the socket for the same reason `LiveBarGate` does.
+ * The socket body is excluded from coverage as Gateway-dependent, and a
+ * correlation rule that decides whether a fill is recorded at all must not sit
+ * in unmeasured code.
+ */
+export function resolveClientOrderId(
+  orderIds: ReadonlyMap<string, number>,
+  orderId: number | undefined,
+  orderRef?: string,
+): string | null {
+  if (orderRef) {
+    return orderRef;
+  }
+
+  if (orderId === undefined) {
+    return null;
+  }
+
+  for (const [clientOrderId, id] of orderIds) {
+    if (id === orderId) {
+      return clientOrderId;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * IB's order-status string → ours, or null for a status that means nothing here.
+ *
+ * **Null is the important return value, not an oversight.** IB reports a long
+ * pre-submission lifecycle — `PendingSubmit`, `PreSubmitted`, `ApiPending` —
+ * and every one of those describes an order that is on its way to resting, not
+ * one that has stopped. `routeOrderStatus` releases the rung on a terminal
+ * status, so mapping any of these onto `CANCELLED` would free a level while the
+ * order was still live and let the next bar place a second order at that price.
+ * Unrecognized statuses return null for the same reason: the safe default is
+ * "no transition", never a guessed one.
+ *
+ * `Inactive` is deliberately absent. IB uses it both for an order rejected at
+ * submission *and* for one temporarily suspended outside trading hours, and the
+ * string alone does not distinguish them — releasing a rung for the second case
+ * would duplicate a live order. It is left to the error channel, which carries
+ * the code that does distinguish them.
+ */
+/**
+ * IB's `completedOrder` payload → a `CompletedOrder`, or `null` to skip it.
+ *
+ * **Null is the common and correct outcome**, not an error path. IB reports
+ * every completed order on the account, including ones placed by hand in TWS
+ * and ones from other clients. Those carry no `orderRef`, and `orderRef` is the
+ * only thing tying an IB order back to this engine's `clientOrderId` — so
+ * without it there is no `Order` row to update and nothing useful to say. They
+ * are skipped rather than given a synthesized id, which would match nothing
+ * downstream while looking like a real record.
+ *
+ * A status IB reports that is not terminal is also skipped. `reqCompletedOrders`
+ * should only ever return terminal orders, but trusting that and coercing an
+ * unexpected value into `CANCELLED` would mark an order dead on the strength of
+ * a string this code did not recognize.
+ *
+ * `PendingCancel` is deliberately **not** treated as cancelled: the cancel has
+ * been requested and not confirmed, and an order in that state can still fill.
+ */
+export function toCompletedOrder(
+  contract: IbContract,
+  order: IbOrder,
+  state: IbOrderState,
+): CompletedOrder | null {
+  const clientOrderId = order.orderRef;
+
+  if (!clientOrderId) {
+    return null;
+  }
+
+  const status = toTerminalStatus(state.status);
+
+  if (status === null) {
+    return null;
+  }
+
+  return {
+    clientOrderId,
+    brokerOrderId: order.orderId === undefined ? '' : String(order.orderId),
+    symbol: contract.symbol ?? '',
+    side: order.action === OrderAction.SELL ? 'SELL' : 'BUY',
+    quantity: order.totalQuantity ?? 0,
+    filledQuantity: order.filledQuantity ?? 0,
+    status,
+    // IB puts the human-readable cause here when it has one — an expiry notice,
+    // a rejection message. Absent for an ordinary user cancel.
+    reason: state.completedStatus ?? state.warningText ?? null,
+  };
+}
+
+/**
+ * The terminal subset of IB's order statuses.
+ *
+ * Separate from `toOrderStatus` because the two answer different questions.
+ * `toOrderStatus` maps a *live* status transition and therefore accepts
+ * `Submitted`; a completed order that claims to be `Submitted` is a
+ * contradiction, and admitting it would let a non-terminal status be written
+ * to an `Order` row from a source that cannot produce one.
+ */
+export function toTerminalStatus(
+  status: string | undefined,
+): OrderStatus.FILLED | OrderStatus.CANCELLED | OrderStatus.REJECTED | null {
+  switch (status) {
+    case 'Filled':
+      return OrderStatus.FILLED;
+    case 'Cancelled':
+    case 'ApiCancelled':
+      return OrderStatus.CANCELLED;
+    // IB's terminal state for an order it refused outright — an unentitled
+    // instrument, a margin refusal, a malformed payload.
+    case 'Inactive':
+      return OrderStatus.REJECTED;
+    default:
+      return null;
+  }
+}
+
+export function toOrderStatus(status: string | undefined): OrderStatus | null {
+  switch (status) {
+    case 'Filled':
+      return OrderStatus.FILLED;
+    case 'Submitted':
+      return OrderStatus.SUBMITTED;
+    // IB's two cancel spellings: `Cancelled` is the exchange's, `ApiCancelled`
+    // follows a client cancel request. Both mean the order is gone.
+    case 'Cancelled':
+    case 'ApiCancelled':
+      return OrderStatus.CANCELLED;
+    default:
+      return null;
+  }
 }
 
 /**

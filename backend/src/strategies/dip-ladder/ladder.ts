@@ -1,8 +1,8 @@
 import { Bar } from '../../market-data/types';
 import { resolveAnchor } from './anchor';
-import { DipLadderConfig } from './config';
+import { DipLadderConfig, OrderPlacement } from './config';
 import { evaluateInvalidation, InvalidationResult } from './invalidation';
-import { findRung, selectFireableRung } from './rung';
+import { findRung, highestFireableRung, selectFireableRung } from './rung';
 import { isWithinFiringWindow } from './session-window';
 import { nextRungPrice, roundToCents } from './spacing';
 import { EntryIntent, LadderPosition } from './types';
@@ -118,10 +118,21 @@ export function evaluateBar(
     };
   }
 
-  // An existing empty rung the bar has reached takes precedence over extending
-  // the ladder. This is what lets a re-armed rung fire again at its original
-  // price instead of being bypassed by a freshly computed level below it.
-  const existing = selectFireableRung(position.rungs, bar.close, bar.timestamp);
+  // An existing empty rung takes precedence over extending the ladder. This is
+  // what lets a re-armed rung fire again at its original price instead of being
+  // bypassed by a freshly computed level below it.
+  //
+  // **The reach test differs by placement mode, and that difference is the
+  // feature.** Under IMMEDIATE a rung is a candidate only once the bar has
+  // closed at or below it, because the order is created at that moment. Under
+  // RESTING the order is placed *before* price arrives — waiting for the bar to
+  // reach the level would forfeit exactly the intra-bar fill the resting order
+  // exists to capture, and would leave a released rung permanently unplaced
+  // whenever price sits above it.
+  const resting = config.orderPlacement === OrderPlacement.RESTING;
+  const existing = resting
+    ? highestFireableRung(position.rungs, bar.timestamp)
+    : selectFireableRung(position.rungs, bar.close, bar.timestamp);
 
   if (existing) {
     return buildEntry(existing.price, bar, position, config, `re-arm/pending rung`);
@@ -142,6 +153,24 @@ export function evaluateBar(
         detail: `rung ${rungPrice.toFixed(2)} already exists and holds a lot`,
       },
     };
+  }
+
+  // **The resting-order rule.** A limit order is placed *at* the rung and waits
+  // there, so the bar's close being above the rung is the normal case rather
+  // than a reason to decline — the order rests until price comes to it.
+  //
+  // This is what makes the ladder capture an intra-bar dip. Under the immediate
+  // rule below, a wick through the rung that recovered before the close fired
+  // nothing at all (`PRD.md:92`); with an order already resting, the exchange
+  // fills it on the way through.
+  if (config.orderPlacement === OrderPlacement.RESTING) {
+    return buildEntry(
+      rungPrice,
+      bar,
+      position,
+      config,
+      `${anchor.basis.toLowerCase()} anchor ${anchor.price.toFixed(2)}, resting limit`,
+    );
   }
 
   if (bar.close > rungPrice) {

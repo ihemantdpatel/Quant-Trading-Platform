@@ -15,28 +15,42 @@ const configured = buildRiskConfig({
 const CAPITAL_SET = { TQQQ: 40_000 };
 const CAPITAL_UNSET = { TQQQ: null };
 
-describe('SHADOW boots with both open items unresolved', () => {
-  it('permits SHADOW with capital and loss threshold unset', () => {
-    // This is what lets Stories 0–12 proceed before either decision is made.
+describe('SHADOW is retired and refused', () => {
+  /**
+   * SHADOW used to return early here, exempt from every check, because a mode
+   * that submits nothing cannot misuse an unset capital figure. That exemption
+   * is now the hazard: resting limit orders make a lot the consequence of a
+   * broker fill, so a SHADOW ladder records intents forever and never opens a
+   * lot — a position history the system would never actually produce.
+   *
+   * These tests exist to stop the exemption coming back by the side door.
+   */
+  it('refuses SHADOW even with everything configured', () => {
+    const result = evaluateStartupAssertions(ExecutionMode.SHADOW, configured, CAPITAL_SET);
+
+    expect(result.permitted).toBe(false);
+    expect(result.failures.join('\n')).toContain('retired');
+  });
+
+  it('refuses SHADOW with both open items unset', () => {
     const result = evaluateStartupAssertions(
       ExecutionMode.SHADOW,
       buildRiskConfig(),
       CAPITAL_UNSET,
     );
 
-    expect(result.permitted).toBe(true);
-    expect(result.failures).toEqual([]);
+    expect(result.permitted).toBe(false);
   });
 
-  it('permits SHADOW with no symbols configured at all', () => {
-    expect(evaluateStartupAssertions(ExecutionMode.SHADOW, buildRiskConfig(), {}).permitted).toBe(
-      true,
-    );
+  it('names the mode to set instead, rather than only refusing', () => {
+    // An operator hitting this needs the next action, not just a rejection.
+    const result = evaluateStartupAssertions(ExecutionMode.SHADOW, buildRiskConfig(), {});
+
+    expect(result.failures.join('\n')).toContain('EXECUTION_MODE=PAPER');
   });
 
   it('defaults symbolCapital to empty when the argument is omitted', () => {
-    expect(evaluateStartupAssertions(ExecutionMode.SHADOW, buildRiskConfig()).permitted).toBe(true);
-    // The same omission is a refusal in PAPER — an empty map is itself a failure.
+    // An empty map is itself a failure in a submitting mode.
     expect(evaluateStartupAssertions(ExecutionMode.PAPER, buildRiskConfig()).permitted).toBe(false);
   });
 });
@@ -132,8 +146,11 @@ describe('assertStartupSafe', () => {
     }
   });
 
-  it('does not throw in SHADOW with nothing configured', () => {
-    expect(() => assertStartupSafe(ExecutionMode.SHADOW, buildRiskConfig())).not.toThrow();
+  it('throws in SHADOW however it is configured', () => {
+    expect(() => assertStartupSafe(ExecutionMode.SHADOW, buildRiskConfig())).toThrow(/retired/);
+    expect(() => assertStartupSafe(ExecutionMode.SHADOW, configured, CAPITAL_SET)).toThrow(
+      /retired/,
+    );
   });
 
   it('does not throw once PAPER is properly configured', () => {

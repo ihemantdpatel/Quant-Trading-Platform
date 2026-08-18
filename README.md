@@ -6,16 +6,20 @@ browser. Everything runs on your own computer.
 
 > ### Read this first
 >
-> This system ships in **SHADOW** mode. It watches the market, decides what it _would_ buy and sell,
-> and writes those decisions down. **It does not send any order to any broker. No real money moves.**
+> This system runs in **PAPER** mode. If you connect it to Interactive Brokers, it **does send
+> orders** — to IB's _paper_ account, which uses simulated money. **No real money moves**, but the
+> orders are genuinely transmitted, they rest at the broker waiting to fill, and they stay there
+> after you shut the system down.
 >
-> This is enforced in several independent places in the code, not by a setting you could forget. The
-> strategy it runs buys **3x leveraged ETFs**, which move violently — turning real trading on is a
-> separate, deliberate step that is blocked by safety checks refusing to start without values a human
-> must decide first.
+> **The former SHADOW mode, which sent nothing at all, has been removed.** The system now refuses to
+> start if you set `EXECUTION_MODE=SHADOW`.
+>
+> What keeps real money out of it: the practice account (`IB_PORT=4002`) and `LIVE` mode being
+> blocked by startup checks. The strategy buys **3x leveraged ETFs**, which move violently.
 
-Nothing in this README can place a trade or spend money. You can run the whole thing without an
-Interactive Brokers account.
+**Out of the box, without an IB connection, nothing is sent anywhere** — with `IB_HOST` unset the
+system runs on bundled test data against a simulated broker. That is the default, and the quick
+start below stays entirely in it. You can run the whole thing without an Interactive Brokers account.
 
 ---
 
@@ -81,7 +85,7 @@ with no Interactive Brokers connection and no account of any kind.
 
 | Look at            | You want to see | If it's different                                                               |
 | ------------------ | --------------- | ------------------------------------------------------------------------------- |
-| **Execution mode** | `SHADOW`        | Stop and ask for help — this should never differ                                |
+| **Execution mode** | `PAPER`         | `LIVE` means real money — stop and ask for help                                 |
 | **Kill switch**    | `ARMED` (green) | `ENGAGED` just means paused; safe either way                                    |
 | **Broker**         | Green text      | Red means no live prices — expected without IB                                  |
 | **Alerts (top)**   | Nothing there   | See the [operating guide](docs/operating-guide.md#8-when-something-looks-wrong) |
@@ -154,8 +158,14 @@ Every decision travels this path, in this order, always:
             ↓
    The risk manager checks it against every safety rule          ← can approve, shrink, or refuse
             ↓
-   The broker would receive the order                            ← BLOCKED in SHADOW. Nothing is sent.
+   The broker receives the order                                 ← really sent, to the PAPER account
+            ↓
+   The order RESTS at IB until the price reaches it              ← may wait, or never fill
+            ↓
+   IB reports a FILL                                             ← only now is anything owned
 ```
+
+Without an IB connection the last three steps run against a built-in simulated broker instead.
 
 The strategy **cannot** reach the broker directly. It isn't merely discouraged — it's impossible in
 the code. Everything must pass the risk manager.
@@ -172,7 +182,10 @@ what to do when something looks wrong. **Read it before acting on anything you s
 **Not required.** Everything above works without it. Do this only when you want the system to watch
 real market prices.
 
-Even connected, **SHADOW mode still submits nothing** — the connection is read-only in practice.
+> **Connecting changes what this system does.** Once `IB_HOST` is set, it stops being an observer:
+> in `PAPER` it sends real orders to your IB **paper** account, and they rest at the broker until
+> filled or cancelled. No real money is involved — but check `IB_PORT` is **4002** (practice), not
+> 4001 (real), before you start it.
 
 **1.** Install and log into **IB Gateway** (or TWS) as a desktop app.
 
@@ -204,13 +217,13 @@ stays up throughout, which is deliberate: an outage is exactly when you need to 
 You only need this section if you created a `.env` file. Each of these works by **presence** — what
 matters is whether it's set at all.
 
-| Setting          | Unset (default)                     | Set                                             |
-| ---------------- | ----------------------------------- | ----------------------------------------------- |
-| `EXECUTION_MODE` | `SHADOW` — records, submits nothing | `PAPER`/`LIVE` are **blocked** by safety checks |
-| `IB_HOST`        | Built-in test data, no broker       | Connects to IB Gateway                          |
-| `DATABASE_URL`   | Memory only, lost on restart        | Saves to the database, survives restarts        |
-| `IB_PORT`        | `4002` — practice account           | `4001` is the **real-money** account            |
-| `API_URL`        | `http://localhost:3000`             | Where the dashboard finds the backend           |
+| Setting          | Unset (default)                    | Set                                                             |
+| ---------------- | ---------------------------------- | --------------------------------------------------------------- |
+| `EXECUTION_MODE` | `PAPER` — submits to IB paper acct | `LIVE` is **blocked** by safety checks; `SHADOW` is **removed** |
+| `IB_HOST`        | Built-in test data, no broker      | Connects to IB Gateway — **orders are really sent**             |
+| `DATABASE_URL`   | Memory only, lost on restart       | Saves to the database, survives restarts                        |
+| `IB_PORT`        | `4002` — practice account          | `4001` is the **real-money** account                            |
+| `API_URL`        | `http://localhost:3000`            | Where the dashboard finds the backend                           |
 
 `docker compose up` sets sensible values for all of these on its own. `.env.example` documents every
 setting in full.
@@ -226,13 +239,13 @@ npm ci                      # at the repo root first — the shared ESLint confi
 
 cd backend
 npm ci
-npm test                    # 1283 tests, no database required
+npm test                    # 1468 tests, no database required
 npm run lint
 npm run start:dev           # run the daemon directly, without Docker
 
 cd ../ui
 npm ci
-npm test                    # 82 dashboard component tests
+npm test                    # 119 dashboard component tests
 npm run dev
 ```
 
@@ -255,6 +268,7 @@ effect on a direct `npm start`. Either export the variables in your shell or put
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | **[Operating guide](docs/operating-guide.md)** | **Start here after installing.** Dictionary, dashboard walkthrough, troubleshooting, safety rules |
 | [Soak log](docs/soak-log.md)                   | The daily trial-week procedure and its record                                                     |
+| [Decisions](docs/decisions/)                   | Why the capital limits and loss threshold are the numbers they are                                |
 | [`.env.example`](.env.example)                 | Every setting, explained                                                                          |
 | [PRD](docs/PRD.md)                             | The full specification                                                                            |
 | [CLAUDE.md](CLAUDE.md)                         | Architecture and the invariants that constrain the code                                           |
@@ -262,5 +276,6 @@ effect on a direct `npm start`. Either export the variables in your shell or put
 
 ---
 
-**Current status:** SHADOW mode, no real orders. Real trading is gated behind a full trial week and
-behind capital limits nobody has set yet.
+**Current status:** PAPER mode. Connected to IB, it sends real orders to a **paper** (simulated
+money) account, where they rest at the broker until filled. Real-money trading (`LIVE`) is still
+blocked, gated behind a full trial week and a review of the capital limits in `docs/decisions/`.

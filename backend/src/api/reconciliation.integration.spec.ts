@@ -16,9 +16,19 @@ import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { AppModule } from '../app.module';
 import { BROKER_ADAPTER } from '../broker/broker-adapter.interface';
+import { OrderStatus } from '../broker/broker-adapter.interface';
 import { MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
+import { ReconciliationService } from '../reconciliation/reconciliation.service';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
-import { LOT_REPOSITORY, LotRepository } from '../repositories/repository.interfaces';
+import { CoordinatorService } from '../strategies/coordinator.service';
+import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
+import { RungStatus } from '../strategies/dip-ladder/rung';
+import {
+  LOT_REPOSITORY,
+  LotRepository,
+  ORDER_REPOSITORY,
+  OrderRepository,
+} from '../repositories/repository.interfaces';
 import { LotStatus } from '../strategies/dip-ladder/lot';
 
 jest.setTimeout(120_000);
@@ -28,6 +38,7 @@ describe('Story 9: reconciliation over HTTP', () => {
   let broker: MockBrokerAdapter;
   let halts: SymbolHaltService;
   let lots: LotRepository;
+  let coordinator: CoordinatorService;
 
   beforeEach(async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -38,9 +49,15 @@ describe('Story 9: reconciliation over HTTP', () => {
     broker = app.get<MockBrokerAdapter>(BROKER_ADAPTER);
     halts = app.get(SymbolHaltService);
     lots = app.get(LOT_REPOSITORY);
+    coordinator = app.get(CoordinatorService);
   });
 
   afterEach(async () => {
+    // Spies on the shared broker must not outlive the test that set them. A
+    // `getCompletedOrders` mock left in place would answer for whichever test
+    // ran next, which is the kind of leak that shows up as an unrelated suite
+    // failing intermittently rather than as a failure here.
+    jest.restoreAllMocks();
     await app.close();
   });
 
@@ -61,6 +78,138 @@ describe('Story 9: reconciliation over HTTP', () => {
 
       expect(response.body.symbols).toEqual([]);
       expect(response.body.reconciliation.clean).toBe(true);
+    });
+  });
+
+  /**
+   * The manual reconcile control (`POST /reconcile`).
+   *
+   * This is the operator's answer to an order cancelled outside the engine —
+   * in TWS, or by IB expiring a DAY order. The engine learns about such a
+   * cancel through `orderStatus`, but only for orders *this process* placed:
+   * the id map that attributes a status is in-memory, so after a restart the
+   * status is dropped and the rung stays `WORKING` at a level that has no
+   * order behind it. Before this endpoint the only repair was another restart.
+   */
+  describe('manual reconciliation', () => {
+    const ladderId = (): string =>
+      coordinator.snapshots().find((snapshot) => snapshot.id.startsWith('dip-ladder'))!.id;
+
+    it('releases a WORKING rung whose order is no longer at the broker', async () => {
+      const state = coordinator.getState(ladderId())!;
+
+      // A rung believing it has an order resting at IB. The broker holds no
+      // such order — precisely the divergence a TWS-side cancel leaves behind.
+      DipLadderStrategy.recordWorkingOrder(state, 100, 'order-that-no-longer-exists');
+      coordinator.setState(ladderId(), state);
+
+      expect(DipLadderStrategy.rungsOf(state)!.find((rung) => rung.price === 100)?.status).toBe(
+        RungStatus.WORKING,
+      );
+
+      await request(app.getHttpServer()).post('/reconcile').expect(200);
+
+      // Released, so the ladder can arm that level again rather than treating
+      // it as committed forever.
+      const after = DipLadderStrategy.rungsOf(coordinator.getState(ladderId())!)!;
+      const rung = after.find((candidate) => candidate.price === 100);
+
+      expect(rung?.status).not.toBe(RungStatus.WORKING);
+      expect(rung?.workingOrderId ?? null).toBeNull();
+    });
+
+    it('reports the run so the dashboard can show what it decided', async () => {
+      const response = await request(app.getHttpServer()).post('/reconcile').expect(200);
+
+      expect(response.body.clean).toBe(true);
+      expect(response.body.ranAt).toEqual(expect.any(String));
+      expect(response.body.haltedSymbols).toEqual([]);
+      expect(response.body.symbols).toEqual(
+        expect.arrayContaining([expect.objectContaining({ symbol: 'TQQQ', resumed: true })]),
+      );
+    });
+
+    it('places no order and sells nothing', async () => {
+      await request(app.getHttpServer()).post('/reconcile').expect(200);
+
+      // The whole reason this is safe to put behind a button: `reconcileAll`
+      // has no path to the submission side at all.
+      await request(app.getHttpServer()).get('/orders').expect(200).expect([]);
+      await request(app.getHttpServer()).get('/fills').expect(200).expect([]);
+    });
+
+    it('corrects a stale Order row from the broker history, visible on GET /orders', async () => {
+      // The end-to-end shape of the reported bug: an order the engine still
+      // believes is working, which the broker has already finished with. The
+      // engine cannot learn this on its own — the status it would need was
+      // dropped because the id map did not survive the restart.
+      const orders = app.get<OrderRepository>(ORDER_REPOSITORY);
+
+      await orders.save({
+        clientOrderId: 'stale-order',
+        strategyId: 'dip-ladder:TQQQ',
+        symbol: 'TQQQ',
+        side: 'BUY',
+        quantity: 100,
+        orderType: 'LMT',
+        limitPrice: 95,
+        timeInForce: 'DAY',
+        status: OrderStatus.SUBMITTED,
+        brokerOrderId: 'ib-1',
+        submittedAt: '2025-01-19T10:00:00.000-05:00',
+        rejectReason: null,
+      } as never);
+
+      jest.spyOn(broker, 'getCompletedOrders').mockResolvedValue([
+        {
+          clientOrderId: 'stale-order',
+          brokerOrderId: 'ib-1',
+          symbol: 'TQQQ',
+          side: 'BUY',
+          quantity: 100,
+          filledQuantity: 0,
+          status: OrderStatus.CANCELLED,
+          reason: 'cancelled in TWS',
+        },
+      ]);
+
+      const response = await request(app.getHttpServer()).post('/reconcile').expect(200);
+
+      expect(response.body.ordersUpdated).toBe(1);
+
+      // What the operator actually looks at.
+      const listed = await request(app.getHttpServer()).get('/orders').expect(200);
+      const row = listed.body.find(
+        (order: { clientOrderId: string }) => order.clientOrderId === 'stale-order',
+      );
+
+      expect(row.status).toBe(OrderStatus.CANCELLED);
+    });
+
+    it('reports the scheduled job’s last run on GET /status', async () => {
+      const reconciliation = app.get(ReconciliationService);
+
+      // Null before it fires: an operator must be able to tell "scheduled but
+      // not yet due" from "ran and found nothing".
+      let status = await request(app.getHttpServer()).get('/status').expect(200);
+      expect(status.body.orderReconciliation).toBeNull();
+
+      await reconciliation.reconcileOrders(new Date().toISOString());
+
+      status = await request(app.getHttpServer()).get('/status').expect(200);
+
+      expect(status.body.orderReconciliation).toMatchObject({
+        brokerReachable: true,
+        ordersUpdated: 0,
+      });
+    });
+
+    it('is repeatable — a second run on unchanged state changes nothing', async () => {
+      const first = await request(app.getHttpServer()).post('/reconcile').expect(200);
+      const second = await request(app.getHttpServer()).post('/reconcile').expect(200);
+
+      expect(second.body.clean).toBe(first.body.clean);
+      expect(second.body.haltedSymbols).toEqual(first.body.haltedSymbols);
     });
   });
 

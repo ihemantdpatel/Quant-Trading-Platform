@@ -478,6 +478,51 @@ describe('IBBrokerAdapter', () => {
       expect(adapter.isDataStale()).toBe(true);
     });
 
+    it('goes stale on a flapping socket that never delivered a bar', async () => {
+      const socket = new FakeIbSocket();
+      let clock = 0;
+      const adapter = buildAdapter(socket, { staleThresholdMs: 1_000, now: () => clock });
+      await adapter.connect();
+
+      // Subscribed from t=0 and never delivering. Observed against a live
+      // Gateway with no market-data entitlement: the socket dropped and
+      // recovered every ~13 minutes against a 15-minute threshold, and because
+      // each reconnect restarted the expectation clock the halt never fired.
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+
+      for (const at of [800, 1_600, 2_400]) {
+        clock = at;
+        socket.simulateSocketDrop();
+        await settle();
+      }
+
+      // Past the threshold measured from the *original* subscription. A feed
+      // that has never produced a bar must not have its deadline renewed by a
+      // reconnect, or silence is excused for as long as the socket keeps
+      // flapping — which is exactly when an operator needs to be told.
+      clock = 3_000;
+      expect(adapter.isDataStale()).toBe(true);
+    });
+
+    it('still forgives the first moments of a reconnect that had been delivering', async () => {
+      const socket = new FakeIbSocket();
+      let clock = 0;
+      const adapter = buildAdapter(socket, { staleThresholdMs: 1_000, now: () => clock });
+      await adapter.connect();
+
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+      socket.emitBar(bar('2025-01-02T10:00:00.000-05:00', 42));
+
+      // The complement of the test above, and the reason the reset cannot
+      // simply be deleted: a feed that *was* healthy gets its grace period.
+      clock = 5_000;
+      socket.simulateSocketDrop();
+      await settle();
+
+      clock = 5_500;
+      expect(adapter.isDataStale()).toBe(false);
+    });
+
     it('clears the expectation once a bar finally arrives', async () => {
       const socket = new FakeIbSocket();
       let clock = 0;
@@ -494,6 +539,74 @@ describe('IBBrokerAdapter', () => {
       clock = 1_600;
       socket.emitBar(bar('2025-01-02T10:00:00.000-05:00', 42));
       expect(adapter.isDataStale()).toBe(false);
+    });
+  });
+
+  describe('market-data errors are reported, not only logged', () => {
+    it('surfaces a rejected subscription with its IB code', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+
+      expect(adapter.dataErrorList()).toEqual([]);
+
+      socket.simulateDataError('TQQQ', 354, 'requested market data is not subscribed');
+
+      // The code is what tells an operator this is an entitlement problem
+      // rather than a transport one, so it must survive to `/status`.
+      expect(adapter.dataErrorList()).toEqual([
+        expect.objectContaining({
+          symbol: 'TQQQ',
+          code: 354,
+          message: 'requested market data is not subscribed',
+        }),
+      ]);
+    });
+
+    it('keeps only the newest error per symbol', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+
+      // IB repeats the rejection on every re-subscription attempt, so an
+      // appended list would grow for as long as the fault lasts.
+      socket.simulateDataError('TQQQ', 354, 'first');
+      socket.simulateDataError('TQQQ', 354, 'second');
+      socket.simulateDataError('TQQQ', 354, 'third');
+
+      expect(adapter.dataErrorList()).toHaveLength(1);
+      expect(adapter.dataErrorList()[0].message).toBe('third');
+    });
+
+    it('clears a symbol error once its bars resume', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+
+      socket.simulateDataError('TQQQ', 354, 'not subscribed');
+      expect(adapter.dataErrorList()).toHaveLength(1);
+
+      // A bar is proof the subscription recovered. Leaving the error would
+      // describe a feed that is now working as broken.
+      socket.emitBar(bar('2025-01-02T10:00:00.000-05:00', 42));
+      expect(adapter.dataErrorList()).toEqual([]);
+    });
+
+    it('does not halt entries — reporting only', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+
+      socket.simulateDataError('TQQQ', 2104, 'market data farm connection is OK');
+
+      // IB uses this channel for benign notices too. The staleness watchdog is
+      // what acts, on the evidence that matters — bars stopped arriving.
+      expect(adapter.isConnected()).toBe(true);
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.CONNECTED);
     });
   });
 

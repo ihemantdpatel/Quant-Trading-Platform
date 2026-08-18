@@ -17,6 +17,7 @@ function rung(overrides: Partial<Rung> = {}): Rung {
     price: 95,
     status: 'PENDING',
     lotId: null,
+    workingOrderId: null,
     completedCycles: 0,
     lastExitAt: null,
     held: false,
@@ -41,6 +42,50 @@ describe('LadderView', () => {
     expect(within(screen.getByTestId('rung-95')).getByText('Held')).toBeInTheDocument();
     expect(within(screen.getByTestId('rung-90.25')).getByText('Re-armed')).toBeInTheDocument();
     expect(within(screen.getByTestId('rung-85.5')).getByText('Pending')).toBeInTheDocument();
+  });
+
+  /*
+    A working rung is empty but carries a live order. Labelling it "Pending"
+    would tell an operator the level is merely armed while capital is already
+    committed there, so the label and the resting order's id are both asserted.
+  */
+  it('shows a rung with a resting order as working, with its order id', () => {
+    render(
+      <LadderView
+        rungs={[
+          rung({ price: 95, status: 'WORKING', workingOrderId: 'co-7', fireable: false }),
+          rung({ price: 90.25, status: 'PENDING' }),
+        ]}
+        mark={96}
+      />,
+    );
+
+    const working = screen.getByTestId('rung-95');
+
+    expect(within(working).getByText('Working')).toBeInTheDocument();
+    expect(within(working).getByText('co-7')).toBeInTheDocument();
+    expect(within(screen.getByTestId('rung-90.25')).getByText('Pending')).toBeInTheDocument();
+  });
+
+  /*
+    Working rungs hold no lot, so they must not count against the 5-held limit —
+    but they are still reported, because an operator reading "1/5 rungs held"
+    with three orders resting would understate what the ladder has committed.
+  */
+  it('reports working rungs separately from the held count', () => {
+    render(
+      <LadderView
+        rungs={[
+          rung({ price: 95, status: 'HELD', lotId: 'TQQQ-lot-1', held: true, fireable: false }),
+          rung({ price: 90.25, status: 'WORKING', workingOrderId: 'co-2', fireable: false }),
+          rung({ price: 85.5, status: 'WORKING', workingOrderId: 'co-3', fireable: false }),
+        ]}
+        mark={null}
+      />,
+    );
+
+    expect(screen.getByText(/1\/5 rungs held/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 working/i)).toBeInTheDocument();
   });
 
   it('orders rungs highest price first', () => {

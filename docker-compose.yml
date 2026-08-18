@@ -95,7 +95,13 @@ services:
       MYSQL_USER: ${MYSQL_USER:-ib}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-ib_password}
     ports:
-      - '3306:3306'
+      # Published on 3307 by default: 3306 is commonly taken by a MySQL already
+      # installed on the host, and the silent failure mode there is the bad one
+      # — the container starts, the port bind succeeds or not, and a host-side
+      # DATABASE_URL on 3306 quietly talks to the *other* database. Override
+      # with MYSQL_HOST_PORT. Container-to-container traffic is unaffected:
+      # the backend reaches `mysql:3306` on the compose network.
+      - '${MYSQL_HOST_PORT:-3307}:3306'
     healthcheck:
       # `mysqladmin ping` answers before the server is ready for connections on
       # first boot, while the init scripts still run. Selecting from the target

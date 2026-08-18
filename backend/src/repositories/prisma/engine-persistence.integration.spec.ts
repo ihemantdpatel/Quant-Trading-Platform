@@ -90,6 +90,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
     );
 
     const lots = new PrismaLotRepository(service);
+    const orders = new PrismaOrderRepository(service);
     const rungs = new PrismaRungRepository(service);
 
     const engine = new EngineService(
@@ -98,7 +99,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
       riskManager,
       broker,
       new PrismaOrderIntentRepository(service),
-      new PrismaOrderRepository(service),
+      orders,
       new PrismaFillRepository(service),
       lots,
       rungs,
@@ -111,7 +112,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
     // enforces — a second instance would let a halted symbol keep trading.
     const startup = new StartupSequence(
       coordinator,
-      new ReconciliationService(coordinator, halts, broker, lots, rungs, snapshots),
+      new ReconciliationService(coordinator, halts, broker, lots, orders, rungs, snapshots),
       broker,
     );
 

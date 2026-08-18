@@ -86,6 +86,7 @@ describe('Execution page', () => {
             price: 95,
             status: 'HELD',
             lotId: 'TQQQ-lot-1',
+            workingOrderId: null,
             completedCycles: 0,
             lastExitAt: null,
             held: true,

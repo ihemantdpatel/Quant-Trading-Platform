@@ -97,6 +97,16 @@ export interface LadderPosition {
 export interface LadderRung {
   price: number;
   lotId: string | null;
+  /**
+   * `clientOrderId` of an order resting at this level, or null.
+   *
+   * Optional so callers predating resting orders — the replay harness and the
+   * ladder's own tests — satisfy this view unchanged; absent reads as "no
+   * resting order". Where it *is* set, the entry path must treat the rung as
+   * occupied even though `lotId` is still null, which is the one thing
+   * `lotId`-as-held/empty-flag cannot express on its own.
+   */
+  workingOrderId?: string | null;
   /** Bar timestamp of the most recent exit here, or null if never exited. */
   lastExitAt: string | null;
 }

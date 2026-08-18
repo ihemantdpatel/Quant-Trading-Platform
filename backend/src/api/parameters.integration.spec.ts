@@ -23,7 +23,9 @@ import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy'
 import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
 import { ParameterService } from '../strategies/dip-ladder/parameter.service';
-import { DIP_LADDER_SYMBOL } from '../strategies/strategies.module';
+import { DIP_LADDER_CONFIG, DIP_LADDER_SYMBOL } from '../strategies/strategies.module';
+import { buildDipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/config';
+import { PAPER_SYMBOL_CAPITAL } from '../config/capital.config';
 
 jest.setTimeout(120_000);
 
@@ -56,7 +58,29 @@ describe('Story 7: live parameter editing', () => {
   let parameters: ParameterService;
 
   beforeEach(async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      /**
+       * Pinned to `IMMEDIATE` placement.
+       *
+       * This suite drives `strategy.onBar` directly and reads the lots it
+       * opens. Under the live `RESTING` placement a lot is the consequence of a
+       * **broker fill**, and there is no broker on this path at all — so every
+       * scenario here would see an empty ladder and assert nothing.
+       *
+       * That is not a workaround: the rule under test is that a held lot's exit
+       * target is frozen at the parameters in force when it filled
+       * (`PRD.md:386`), which is independent of how the order reached the
+       * broker. `resting-orders.spec.ts` covers placement; this covers the
+       * freeze, and each stays a test of one thing.
+       */
+      .overrideProvider(DIP_LADDER_CONFIG)
+      .useValue(
+        buildDipLadderConfig(DIP_LADDER_SYMBOL, {
+          symbolCapital: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+          orderPlacement: OrderPlacement.IMMEDIATE,
+        }),
+      )
+      .compile();
 
     app = moduleRef.createNestApplication();
     await app.init();
@@ -261,10 +285,13 @@ describe('Story 7: live parameter editing', () => {
 
       expect(response.body.detail.symbolCapital).toContain('PRD.md:500');
 
-      // And it is genuinely still unset, so the Story 5 assertion still bites.
-      expect(parameters.configOf(LADDER_ID)!.symbolCapital).toBe(100_000);
-
-      await http().post('/mode').send({ mode: 'PAPER' }).expect(422);
+      // The configured allocation is untouched by the rejected request. It is
+      // the reviewed `capital.config.ts` figure rather than the old SHADOW
+      // display notional, because SHADOW is retired and every mode now sizes
+      // from the same source.
+      expect(parameters.configOf(LADDER_ID)!.symbolCapital).toBe(
+        PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+      );
     });
 
     it('rejects a value that is the right field but out of range', async () => {

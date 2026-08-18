@@ -32,6 +32,8 @@ import {
   BrokerOrder,
   ConnectionState,
   Fill,
+  OpenOrder,
+  OrderAck,
   OrderStatus,
 } from '../broker/broker-adapter.interface';
 import { ExecutionMode } from '../config/execution-mode';
@@ -40,6 +42,7 @@ import { Bar } from '../market-data/types';
 import { AccountSnapshot, RiskManagerService } from '../risk/risk-manager.service';
 import { RiskIntent, RiskOutcome } from '../risk/types';
 import { CoordinatorService } from '../strategies/coordinator.service';
+import { DipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/config';
 import {
   DIP_LADDER_ID_PREFIX,
   DipLadderStrategy,
@@ -85,6 +88,40 @@ export interface EngineAlert {
   timestamp: string;
 }
 
+/**
+ * A resting entry order this engine is waiting on, keyed by `clientOrderId`.
+ *
+ * `rungPrice` is the reason this exists: a fill carries only broker vocabulary
+ * and nothing identifying which rung placed the order, so the link between the
+ * two is kept here between placement and fill.
+ */
+interface WorkingOrder {
+  strategyId: string;
+  rungPrice: number;
+  quantity: number;
+  symbol: string;
+}
+
+/**
+ * What the broker says is already resting, resolved once per bar.
+ *
+ * `UNAVAILABLE` is a distinct state rather than an empty set on purpose: "the
+ * broker could not be asked" and "nothing is resting" lead to opposite actions,
+ * and collapsing them would place an order at a level that may already hold one.
+ * The same distinction `getOpenOrders()` throwing carries in reconciliation.
+ */
+type RestingOrderSnapshot =
+  { status: 'OK'; limitPrices: Set<number> } | { status: 'UNAVAILABLE'; reason: string };
+
+/**
+ * Rounds to cents, so a price from the broker and one from the ladder compare
+ * equal. Both are cent-denominated already; this only removes the float noise
+ * that would make `73.91 !== 73.910000000000004` and defeat the whole check.
+ */
+function roundPrice(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 @Injectable()
 export class EngineService {
   private readonly logger = new Logger(EngineService.name);
@@ -99,6 +136,21 @@ export class EngineService {
   private clientOrderSequence = 0;
   private lastBarTimestamp: string | null = null;
 
+  /**
+   * Orders currently resting at the broker, keyed by `clientOrderId`.
+   *
+   * Needed because a fill arrives carrying only broker vocabulary — symbol,
+   * price, quantity — and nothing that identifies which rung placed it. The
+   * ladder's `rungPrice` is the missing link, and this is where it is kept
+   * between placement and fill.
+   *
+   * In-memory, and deliberately not the source of truth: the durable record is
+   * `Rung.workingOrderId`, which survives a restart. This map is rebuilt from
+   * the rung ledger during reconciliation, so a crash between placement and
+   * fill does not orphan the order.
+   */
+  private readonly workingOrders = new Map<string, WorkingOrder>();
+
   constructor(
     private readonly replay: ReplayService,
     private readonly coordinator: CoordinatorService,
@@ -109,7 +161,7 @@ export class EngineService {
     @Inject(FILL_REPOSITORY) private readonly fills: FillRepository,
     @Inject(LOT_REPOSITORY) private readonly lots: LotRepository,
     @Inject(RUNG_REPOSITORY) private readonly rungs: RungRepository,
-    private readonly mode: ExecutionMode = ExecutionMode.SHADOW,
+    private readonly mode: ExecutionMode = ExecutionMode.PAPER,
     /**
      * Story 9's per-symbol halts. Optional so the many tests that construct an
      * engine directly need not supply one; absent, no symbol is halted, which
@@ -130,6 +182,25 @@ export class EngineService {
       if (health.state === ConnectionState.FAILED) {
         this.haltEntries(`broker connection failed: ${health.lastError ?? 'unknown'}`);
       }
+    });
+
+    // **Subscribed once, for the life of the process.**
+    //
+    // `submitOrder` also subscribes for the duration of a single `submit()`
+    // call, which suffices only while every order fills immediately. A resting
+    // limit order fills minutes or hours later, long after that subscription
+    // was torn down in its `finally` — so without this router the fill would
+    // arrive with no listener, the lot would never open, and the ladder would
+    // believe a level it actually owns is still empty.
+    this.broker.onFill((fill) => {
+      void this.routeFill(fill);
+    });
+
+    // Cancellations, rejections, and DAY expiries all arrive here. A rung whose
+    // order went away without filling must be released, or the level stays
+    // blocked forever and the ladder never places another order there.
+    this.broker.onOrderStatus((ack) => {
+      void this.routeOrderStatus(ack);
     });
   }
 
@@ -226,6 +297,10 @@ export class EngineService {
     // (`risk-manager.service.ts:107`).
     const decisions = this.riskManager.evaluateBatch(intents.map(toRiskIntent), account);
 
+    // Resolved lazily on the first resting entry this bar, then reused. A bar
+    // that places nothing must not pay an IB round trip.
+    let restingSnapshot: RestingOrderSnapshot | null = null;
+
     for (let i = 0; i < decisions.length; i += 1) {
       const decision = decisions[i];
       const intent = intents[i];
@@ -262,9 +337,48 @@ export class EngineService {
         continue;
       }
 
+      // **Duplicate guard: ask the broker what is already resting.**
+      //
+      // `workingOrders` is in-memory and can disagree with IB — a crash between
+      // placement and persistence, an order adopted by reconciliation, a fill
+      // router that has not yet run. Placing a second order at a price that
+      // already holds one is the failure that costs real money, because both
+      // can fill. Resolved once per bar and reused across its intents, so a bar
+      // firing several rungs pays one round trip rather than one per rung.
+      if (this.isRestingEntry(intent)) {
+        const resting = await this.restingOrdersThisBar(restingSnapshot);
+        restingSnapshot = resting;
+
+        if (resting.status === 'UNAVAILABLE') {
+          // "Cannot ask" is not "nothing is resting" — the same rule that stops
+          // reconciliation releasing every WORKING rung when `getOpenOrders`
+          // throws. Skipping costs one rung this bar; assuming the level is
+          // clear risks a duplicate order at a price that already has one. The
+          // next bar retries, so a transient hiccup self-heals.
+          this.logger.warn(
+            `skipping entry at ${intent.limitPrice.toFixed(2)} — cannot read open orders: ${resting.reason}`,
+          );
+          continue;
+        }
+
+        if (resting.limitPrices.has(roundPrice(intent.limitPrice))) {
+          this.logger.debug(
+            `skipping entry at ${intent.limitPrice.toFixed(2)} — an order already rests there`,
+          );
+          continue;
+        }
+      }
+
       const submission = await this.submitOrder(intent, decision.approvedQuantity, recordId);
       outcome.submitted += submission.submitted ? 1 : 0;
       outcome.fills += submission.fills;
+
+      // The order just placed is now resting too. Recording it keeps a later
+      // intent on this same bar from stacking a second order at that price
+      // without re-querying IB.
+      if (submission.submitted && restingSnapshot?.status === 'OK') {
+        restingSnapshot.limitPrices.add(roundPrice(intent.limitPrice));
+      }
     }
 
     outcome.halted = this.entryHalt !== null;
@@ -313,14 +427,49 @@ export class EngineService {
     });
     await this.intents.markSubmitted(recordId, clientOrderId);
 
-    let fills = 0;
-    const unsubscribe = this.broker.onFill((fill) => {
-      if (fill.clientOrderId === clientOrderId) {
-        fills += 1;
-        void this.fills.save(fill);
-        void this.applyFill(fill, intent);
+    // A resting order is registered *before* submission so a fill arriving
+    // between the broker's ack and this bookkeeping still finds its rung. The
+    // router ignores ids it does not know, and an order that fails to submit is
+    // unregistered below, so registering early cannot leave a phantom.
+    const resting = this.isRestingEntry(intent);
+
+    if (resting) {
+      this.workingOrders.set(clientOrderId, {
+        strategyId: intent.strategyId,
+        rungPrice: intent.limitPrice,
+        quantity,
+        symbol: intent.contract.symbol,
+      });
+
+      // **The rung is marked WORKING before `submit()`, not after.**
+      //
+      // A marketable limit order can fill *during* the submit call — the mock
+      // broker does exactly this, and IB will too when price is already through
+      // the level. Marking afterwards would let the fill arrive first, find no
+      // rung to attach its lot to, and then be overwritten by a WORKING mark
+      // for an order that had already completed.
+      //
+      // Rejection and submission failure both undo this below, so a rung is
+      // never left blocked for an order that does not exist.
+      const state = this.coordinator.getState(intent.strategyId);
+
+      if (state) {
+        DipLadderStrategy.recordWorkingOrder(state, intent.limitPrice, clientOrderId);
       }
-    });
+    }
+
+    let fills = 0;
+    const unsubscribe = resting
+      ? // A resting order's fills belong to the persistent router, which lives
+        // beyond this call. Subscribing here as well would open the lot twice.
+        (): void => undefined
+      : this.broker.onFill((fill) => {
+          if (fill.clientOrderId === clientOrderId) {
+            fills += 1;
+            void this.fills.save(fill);
+            void this.applyFill(fill, intent);
+          }
+        });
 
     try {
       const ack = await this.broker.submit(order);
@@ -328,12 +477,17 @@ export class EngineService {
       await this.orders.updateStatus(clientOrderId, ack.status, ack.rejectReason);
 
       if (ack.status === OrderStatus.REJECTED) {
+        // Nothing is resting, so release the rung the pre-submit mark blocked.
+        this.releaseRestingOrder(clientOrderId, intent.strategyId, resting);
+
         this.raiseAlert(
           'WARNING',
           'ORDER_REJECTED',
           `broker rejected ${clientOrderId}: ${ack.rejectReason ?? 'no reason given'}`,
           intent.timestamp,
         );
+
+        return { submitted: true, fills };
       }
 
       return { submitted: true, fills };
@@ -342,6 +496,11 @@ export class EngineService {
       const detail = error instanceof Error ? error.message : String(error);
       this.haltEntries(`order submission failed: ${detail}`, intent.timestamp);
       await this.orders.updateStatus(clientOrderId, OrderStatus.CANCELLED, detail);
+
+      // The order never reached the broker, so nothing is resting — drop the
+      // registration and unblock the rung rather than leaving a level reserved
+      // for an order that does not exist.
+      this.releaseRestingOrder(clientOrderId, intent.strategyId, resting);
 
       return { submitted: false, fills };
     } finally {
@@ -397,6 +556,355 @@ export class EngineService {
     if (lot) {
       lot.exitPrice = fill.price;
     }
+  }
+
+  /**
+   * The prices at which orders are already resting at the broker, this bar.
+   *
+   * Fetched once and reused: the answer cannot change between two intents on
+   * the same bar in any way this engine could act on, and a round trip per rung
+   * would put IB's latency on the critical path five times over.
+   *
+   * A failure is returned rather than thrown so the caller can decline the
+   * entry without halting — an unreadable broker is a reason to place nothing
+   * this bar, not a technical fault that stops the session.
+   */
+  private async restingOrdersThisBar(
+    cached: RestingOrderSnapshot | null,
+  ): Promise<RestingOrderSnapshot> {
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const open = await this.broker.getOpenOrders();
+
+      return {
+        status: 'OK',
+        // Buys only: a resting sell is an exit against a lot the ladder already
+        // holds, and it sits at a take-profit target that has nothing to do with
+        // whether an entry rung is free. Matching one would block a legitimate
+        // entry at a coincidentally equal price.
+        limitPrices: new Set(
+          open.filter((order) => order.side === 'BUY').map((order) => roundPrice(order.limitPrice)),
+        ),
+      };
+    } catch (error) {
+      return {
+        status: 'UNAVAILABLE',
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Rebuilds the working-order registry from orders the broker actually holds.
+   *
+   * Called by reconciliation at startup. The registry is in-memory and empty
+   * after a restart, so without this a fill on an order placed *before* the
+   * restart would arrive with no rung to attach it to — the shares would exist
+   * at the broker and the ladder would never open a lot for them.
+   */
+  adoptWorkingOrders(strategyId: string, symbol: string, orders: OpenOrder[]): void {
+    for (const order of orders) {
+      this.workingOrders.set(order.clientOrderId, {
+        strategyId,
+        rungPrice: order.limitPrice,
+        // The *outstanding* quantity, not the original: a partially-filled
+        // order that survives a restart has only its remainder still working,
+        // and the partial-fill rule must compare against what can still fill.
+        quantity: order.quantity - order.filledQuantity,
+        symbol,
+      });
+    }
+  }
+
+  /**
+   * Rebuilds one working-order entry from durable records when the in-memory
+   * map has no answer.
+   *
+   * **The map is not the source of truth, and this is the case that proves it.**
+   * `adoptWorkingOrders` repopulates it at startup from `getOpenOrders()` — but
+   * an order that filled *while the process was down* is no longer an open
+   * order, so it is absent from that list. The fill then arrives on IB's
+   * execution replay, finds nothing in the map, and `routeFill` drops it: the
+   * shares exist at the broker and no lot is ever opened for them. The next
+   * reconciliation compares zero lots against a real position and halts the
+   * symbol, which is how a recoverable gap became an operator's problem.
+   *
+   * The durable record is sufficient to close it. `Order` carries the strategy,
+   * symbol, and limit price; `Rung.workingOrderId` ties that order to the level
+   * that placed it. The rung is consulted rather than trusting the order alone,
+   * because `rungPrice` is what the lot must be keyed to and only the ladder
+   * knows it — the order's limit price is the placement price, which is the
+   * same value but arrived at from the side that owns the fact.
+   *
+   * Deliberately narrow: BUY entries only, and only for an order the ladder
+   * still has a `WORKING` rung for. A SELL, or an order no rung claims, is not
+   * something this engine placed as an entry, and inventing a rung for it would
+   * attach a lot to a level the ladder never chose.
+   */
+  private async recoverWorkingOrder(clientOrderId: string): Promise<WorkingOrder | null> {
+    const order = await this.orders.findByClientOrderId(clientOrderId);
+
+    if (!order || order.side !== 'BUY') {
+      return null;
+    }
+
+    const state = this.coordinator.getState(order.strategyId);
+
+    if (!state) {
+      return null;
+    }
+
+    const rung = DipLadderStrategy.rungsOf(state).find(
+      (candidate) => candidate.workingOrderId === clientOrderId,
+    );
+
+    if (!rung) {
+      return null;
+    }
+
+    const recovered: WorkingOrder = {
+      strategyId: order.strategyId,
+      rungPrice: rung.price,
+      quantity: order.quantity,
+      symbol: order.symbol,
+    };
+
+    // Registered so the rest of the fill path — and a partial fill's cancel —
+    // behave exactly as they would for an order placed in this process.
+    this.workingOrders.set(clientOrderId, recovered);
+
+    this.logger.warn(
+      `recovered working order ${clientOrderId} for rung ${rung.price.toFixed(2)} from persisted ` +
+        'state — the fill arrived with no in-memory record, which happens when an order fills ' +
+        'while the daemon is down and IB replays the execution on reconnect',
+    );
+
+    return recovered;
+  }
+
+  /**
+   * Undoes a pre-submit resting-order reservation.
+   *
+   * Used when the order turns out not to exist — rejected, or never reached the
+   * broker. Skips a rung the fill router has already turned into a lot: an
+   * order that filled during `submit()` is no longer working, and clearing it
+   * would reopen a level that now holds shares.
+   */
+  private releaseRestingOrder(clientOrderId: string, strategyId: string, resting: boolean): void {
+    this.workingOrders.delete(clientOrderId);
+
+    if (!resting) {
+      return;
+    }
+
+    const state = this.coordinator.getState(strategyId);
+
+    if (state) {
+      DipLadderStrategy.clearWorkingOrder(state, clientOrderId);
+    }
+  }
+
+  /**
+   * True when this intent is a ladder entry that should rest at the broker.
+   *
+   * Buys only: an exit is a sell against a lot the ladder already holds, and
+   * the rung bookkeeping here has nothing to say about it.
+   */
+  private isRestingEntry(intent: OrderIntent): boolean {
+    if (intent.side !== 'BUY') {
+      return false;
+    }
+
+    return this.ladderConfigFor(intent.strategyId)?.orderPlacement === OrderPlacement.RESTING;
+  }
+
+  /**
+   * Routes a fill on a **resting** order back into ladder state.
+   *
+   * Only handles orders this engine placed and is still tracking. Fills for
+   * immediately-submitted orders are correlated by `submitOrder`'s own
+   * subscription and are ignored here, so the two paths cannot both open a lot
+   * for the same fill.
+   *
+   * **Partial fills: the remainder is cancelled and a lot is opened for the
+   * shares that actually filled.** A resting order that fills 40 of 100 shares
+   * and then sits is a position the ladder is carrying without having decided
+   * to; cancelling makes the rung's exposure final and knowable, and the lot's
+   * exit target is computed from the real fill price for the real quantity.
+   * The cost is a smaller position than the rung intended, which is the safe
+   * direction.
+   *
+   * **A fill already recorded is ignored.** IB replays the day's executions to
+   * every subscribing client, so a reconnect — including the routine daily
+   * logout — re-delivers fills this engine has already turned into lots. The
+   * working-order map is no defence: reconciliation repopulates it at startup
+   * so a pre-restart order can still find its rung, which is exactly when the
+   * replay arrives. Persisted `fillId` is the only durable evidence, and
+   * without the check one execution would open a second lot and double a
+   * position the broker holds once.
+   */
+  private async routeFill(fill: Fill): Promise<void> {
+    const working =
+      this.workingOrders.get(fill.clientOrderId) ??
+      (await this.recoverWorkingOrder(fill.clientOrderId));
+
+    if (!working) {
+      return;
+    }
+
+    if (await this.fills.findByFillId(fill.fillId)) {
+      this.logger.debug(`ignoring already-recorded fill ${fill.fillId}`);
+      return;
+    }
+
+    const state = this.coordinator.getState(working.strategyId);
+
+    if (!state) {
+      return;
+    }
+
+    await this.fills.save(fill);
+
+    const partial = fill.quantity < working.quantity;
+
+    // Cancel before opening the lot: if the cancel throws, the entry halt it
+    // raises should happen while the ladder still reflects a working order,
+    // not after it has been marked filled.
+    if (partial) {
+      await this.cancelRemainder(fill.clientOrderId, working, fill.quantity);
+    }
+
+    const config = this.ladderConfigFor(working.strategyId);
+
+    if (!config) {
+      return;
+    }
+
+    const lot = DipLadderStrategy.openLotFromFill(state, config, {
+      rungPrice: working.rungPrice,
+      price: fill.price,
+      quantity: fill.quantity,
+      at: fill.timestamp,
+    });
+
+    this.workingOrders.delete(fill.clientOrderId);
+
+    await this.orders.updateStatus(
+      fill.clientOrderId,
+      partial ? OrderStatus.PARTIALLY_FILLED : OrderStatus.FILLED,
+    );
+
+    this.logger.log(
+      `rung ${working.rungPrice.toFixed(2)} filled ${fill.quantity}${
+        partial ? ` of ${working.quantity} (remainder cancelled)` : ''
+      } @ ${fill.price.toFixed(2)} — lot ${lot.id} exits at ${lot.exitTarget.toFixed(2)}`,
+    );
+
+    await this.persistLadderState();
+  }
+
+  /**
+   * Cancels the unfilled remainder of a partially-filled resting order.
+   *
+   * A failure here is a technical fault, not a rejection: the remainder may
+   * still be working at the broker, and the ladder would then hold a rung whose
+   * true exposure it cannot state. Halting new entries is the correct response —
+   * positions are untouched, as everywhere else.
+   */
+  private async cancelRemainder(
+    clientOrderId: string,
+    working: { rungPrice: number; quantity: number },
+    filled: number,
+  ): Promise<void> {
+    try {
+      await this.broker.cancel(clientOrderId);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+
+      this.haltEntries(
+        `failed to cancel the remainder of ${clientOrderId} (${filled}/${working.quantity} filled ` +
+          `at rung ${working.rungPrice.toFixed(2)}): ${detail}`,
+      );
+    }
+  }
+
+  /**
+   * Releases a rung whose resting order went away without filling.
+   *
+   * Cancelled, rejected, and DAY-expired orders all surface here. The rung must
+   * become fireable again — a `WORKING` rung whose order no longer exists would
+   * block that level permanently.
+   */
+  private async routeOrderStatus(ack: OrderAck): Promise<void> {
+    const working = this.workingOrders.get(ack.clientOrderId);
+
+    if (!working) {
+      return;
+    }
+
+    if (ack.status !== OrderStatus.CANCELLED && ack.status !== OrderStatus.REJECTED) {
+      return;
+    }
+
+    const state = this.coordinator.getState(working.strategyId);
+
+    if (state) {
+      DipLadderStrategy.clearWorkingOrder(state, ack.clientOrderId);
+    }
+
+    this.workingOrders.delete(ack.clientOrderId);
+
+    await this.orders.updateStatus(ack.clientOrderId, ack.status, ack.rejectReason);
+
+    if (ack.status === OrderStatus.REJECTED) {
+      this.raiseAlert(
+        'WARNING',
+        'RESTING_ORDER_REJECTED',
+        `broker rejected resting order ${ack.clientOrderId} at rung ` +
+          `${working.rungPrice.toFixed(2)}: ${ack.rejectReason ?? 'no reason given'}`,
+        this.lastBarTimestamp ?? working.symbol,
+      );
+    }
+
+    await this.persistLadderState();
+  }
+
+  /**
+   * The ladder config for a strategy id, or null when the id is not a ladder.
+   *
+   * Read from the live strategy instance rather than a copy, so a runtime
+   * parameter edit is reflected — `ParameterService` mutates the same object
+   * in place, which is what freezes a held lot's target while letting future
+   * rungs use the new values.
+   */
+  private ladderConfigFor(strategyId: string): DipLadderConfig | null {
+    if (!strategyId.startsWith(DIP_LADDER_ID_PREFIX)) {
+      return null;
+    }
+
+    const strategy = this.coordinator.getStrategy(strategyId);
+
+    return strategy instanceof DipLadderStrategy ? strategy.parameters : null;
+  }
+
+  /**
+   * Writes ladder state after a live bar (`BarConsumer.persistState`).
+   *
+   * The replay path persists once at the end of `replayFixture`, which suits a
+   * batch that completes. A live session is interrupted rather than finished,
+   * so the same write has to happen per bar or a live-only session leaves the
+   * `Lot`, `Rung`, and `StrategyStateSnapshot` tables empty — a restart then
+   * restores nothing and every daily report skips its rung check.
+   *
+   * A thin delegate rather than making `persistLadderState` public: the replay
+   * path's single end-of-run write is a different guarantee from this one, and
+   * keeping the names distinct stops the two being conflated later.
+   */
+  async persistState(): Promise<void> {
+    await this.persistLadderState();
   }
 
   /**
@@ -558,6 +1066,11 @@ export class EngineService {
     this.entryHalt = null;
     this.alerts.length = 0;
     this.clientOrderSequence = 0;
+    // Resting-order tracking goes with the orders it refers to. Left behind, a
+    // stale entry would let a fill from a previous replay open a lot in the
+    // next one — and `clientOrderSequence` restarts from zero, so the ids
+    // genuinely would collide.
+    this.workingOrders.clear();
     await this.intents.clear();
     await this.orders.clear();
     await this.fills.clear();
