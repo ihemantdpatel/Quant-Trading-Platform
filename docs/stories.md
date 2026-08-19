@@ -3,6 +3,25 @@
 Vertical slices derived from `PRD.md`. Each story crosses every layer it touches and ends in
 something observable — a passing scenario suite, an HTTP response, a browser view, a soak result.
 
+> ## Where this stands
+>
+> **Stories 0–13 are built. Story 14 (the `PAPER` soak) is next and has not started.**
+>
+> Two things diverged from this plan and are marked inline rather than edited away, so the reasoning
+> stays auditable:
+>
+> - **Story 12's `SHADOW` soak was superseded before its week ran.** Its instrumentation shipped and
+>   now serves Story 14. The mode it tested no longer exists.
+> - **Story 13 grew well beyond its scope.** It retired `SHADOW`, moved entries onto resting limit
+>   orders, and added open-order reconciliation — none of which were planned here. Its
+>   "What changed from the plan" subsection is the record.
+>
+> **Two debts block Story 15 (`LIVE`)**: the capital figures have no backtest behind them, and
+> account equity is a hand-converted FX snapshot. Both are listed in Story 15's scope.
+>
+> Earlier stories still describe `SHADOW` as current. That is deliberate — they are the record of
+> what was built at the time, and Story 13 is where the change is documented.
+
 ## Principles
 
 1. **Mock-data-first.** The system is built and made deployable against mock data with zero external
@@ -14,7 +33,12 @@ something observable — a passing scenario suite, an HTTP response, a browser v
    (`PRD.md` §2). The contract suite enforces this.
 4. **The risk manager is the only path to the broker** (`PRD.md` §3). No story may introduce a
    strategy→broker code path.
-5. **`SHADOW` is the default mode** until Story 13. Nothing is submitted anywhere before then.
+5. ~~**`SHADOW` is the default mode** until Story 13. Nothing is submitted anywhere before then.~~
+   **Superseded at Story 13.** `SHADOW` held through Stories 0–12 and did its job. Story 13 retired
+   it: resting limit orders make a lot the consequence of a **broker fill**, so a mode that submits
+   nothing would record intents forever and never open a lot — a different and misleading behaviour
+   rather than a quieter one. `PAPER` is the default from Story 13 on, and `SHADOW` is **refused at
+   startup**. See Story 13's "What changed from the plan".
 
 ## Deliberate departures from `PRD.md`
 
@@ -32,6 +56,16 @@ something observable — a passing scenario suite, an HTTP response, a browser v
   costs real money. Enforced in CI from Story 0.
 - **The two `PRD.md:500` open items stay open until Story 13.** Story 5 builds the assertion that
   refuses `PAPER`/`LIVE` without them; Story 13 sets the values, once a backtest exists to inform them.
+  **Done at Story 13 — but the values were operator-chosen, not backtest-derived.** That deviation is
+  recorded in `docs/decisions/` and must be closed before Story 15.
+- **Order placement is `RESTING`, not bar-close, in the live engine** (Story 13). The `IMMEDIATE`
+  bar-close rule (`PRD.md:92`) remains the config default so the committed fixtures keep testing the
+  rule their expected intents were computed under. A dip that wicks through a rung intra-bar and
+  recovers fired nothing under the original rule — the ladder bought the close, not the dip.
+- **Account currency must match instrument currency, or boot is refused.** Found at Story 13: the
+  paper account reports `NetLiquidation` in CAD while TQQQ trades in USD, and the global cap compares
+  notional against equity directly. Refusal rather than FX conversion — a stale rate mis-sizes every
+  order silently, which is worse than not booting.
 - **PAPER→LIVE gate is cycle-based, not calendar-based.** At least one complete lot cycle
   (fire → target → exit → re-arm → fire) on paper before LIVE.
 - **LIVE opens at 25% of nominal** for two weeks, then steps up.
@@ -52,8 +86,8 @@ something observable — a passing scenario suite, an HTTP response, a browser v
 | 9 | Reconciliation & recovery | Lot-sum assertion; injected mismatch halts symbol | 8 |
 | 10 | IB adapter + pacing cache | Compose gains IB Gateway; live bars in `SHADOW` | 9 |
 | 11 | Backtester | 2022 drawdown examined explicitly | 10 |
-| 12 | SHADOW soak | One full week, zero reconciliation errors | 10 |
-| 13 | PAPER enablement | Capital + loss threshold set; first paper order round-trips | 11, 12 |
+| 12 | ~~SHADOW soak~~ **superseded** | Instrumentation built and kept; the week itself never ran — the mode was retired first | 10 |
+| 13 | PAPER enablement + resting orders | Capital + loss threshold set; `SHADOW` retired; entries rest at IB | 11 |
 | 14 | PAPER soak + fix loop | ≥1 complete lot cycle; kill switch verified live | 13 |
 | 15 | LIVE enablement | Explicit flag; 25% nominal for two weeks | 14 |
 | 16 | Phase 4 handoff | Grid / Wheel / LEAPs on the proven engine | 15 |
@@ -337,6 +371,8 @@ order submission that bypasses it.
   is unset (`PRD.md:505`) — no silent default
 - Execution modes `SHADOW` (default) / `PAPER` / `LIVE`; in `SHADOW`, intents are logged with full
   order payloads and nothing is submitted
+  — *`SHADOW` was retired at Story 13 and is now refused by this same assertion; `PAPER` is the
+  default. The assertion and the guard are unchanged.*
 - `RiskEvent` emitted for **every** rejection, resize, halt, and kill-switch activation
 
 **Out of scope**
@@ -673,10 +709,26 @@ window; the 2022 scenario is reported explicitly and reviewed before proceeding.
 
 ---
 
-## Story 12 — SHADOW soak
+## Story 12 — SHADOW soak — **SUPERSEDED**
 
-**Goal:** Prove the engine generates correct intents against live market data for a full week with
-zero reconciliation errors.
+> **Status: the instrumentation shipped and is still in use; the soak week itself never ran.**
+>
+> `DailyReportService`, the anomaly codes, and `docs/soak-log.md` were all built and are now the
+> backbone of the **Story 14 `PAPER` soak** instead. What was abandoned is the *`SHADOW` week* — the
+> mode was retired at Story 13 before the week was completed, so there is no state in which this
+> story's exit criterion can now be met as written.
+>
+> **Why it could not simply be finished first.** The exit criterion is "correct intents with zero
+> reconciliation errors", but in `SHADOW` the database legitimately diverges from the broker — the
+> ladder records intents that were never submitted, so a restart with a held ladder *always* halted on
+> the lot-sum assertion. The soak was therefore proving reconciliation against a divergence that only
+> existed because of the mode. The `PAPER` soak tests the real thing.
+>
+> **Read this story for the report's design rationale**, which still holds. Read Story 14 for the
+> procedure that is actually run.
+
+**Goal:** ~~Prove the engine generates correct intents against live market data for a full week with
+zero reconciliation errors.~~ Superseded by Story 14.
 
 **Depends on:** Story 10
 **PRD refs:** Phase 1 exit criterion (`PRD.md:468`), §12 (`PRD.md:486`)
@@ -700,16 +752,41 @@ zero reconciliation errors.
 - operational: at least one deliberate mid-session restart per week, verifying reconciliation
 - integration: daily report content asserted against a fixture session
 
-**Exit criterion (`PRD.md:468`):** shadow mode runs a **full week** generating correct intents with
-**zero reconciliation errors**. Any week containing an unexplained anomaly restarts the clock.
+**Exit criterion (`PRD.md:468`):** ~~shadow mode runs a **full week** generating correct intents with
+**zero reconciliation errors**. Any week containing an unexplained anomaly restarts the clock.~~
+
+**Not met, and now unmeetable — carried to Story 14.** The "full week, zero unexplained anomalies,
+one anomaly restarts the clock" rule survives intact; only the mode it runs in changed.
+
+**What was built here and is still live:**
+
+- `DailyReportService` and `GET /reports/daily?date=` — reads *persisted evidence* rather than
+  counting as bars arrive, because the soak includes deliberate mid-session restarts and an in-memory
+  counter would under-report exactly the sessions under scrutiny.
+- The rung check as an **independent recomputation**, not a readback of the ladder's own rung list —
+  which would be a test that cannot fail.
+- **A skip is not a pass** (`RUNG_VERIFICATION_SKIPPED`): "could not check" must never read as
+  "checked and fine".
+- `docs/soak-log.md`, since revised for `PAPER`.
+
+**Changed at Story 13**, once the report had to describe a mode that submits:
+
+- `SUBMISSION_IN_SHADOW` → `RETIRED_MODE`. The old code asserted nothing was ever submitted, which is
+  no longer a property this system has.
+- `outsideFiringWindow` counts **entries only** — the window governs firing, not exiting, so a lot
+  taking profit in the opening auction was raising a false anomaly against a rule the engine was
+  honouring.
+- The anchor is recomputed **per intent**, not once per session, since it depends on what is held at
+  that moment. A single session-wide anchor reported every entry after the first as a false mismatch.
 
 ---
 
-## Story 13 — PAPER enablement
+## Story 13 — PAPER enablement — **BUILT, wider than planned**
 
 **Goal:** Close the two open PRD items and submit the first real order to the IB paper account.
 
-**Depends on:** Stories 11, 12
+**Depends on:** ~~Stories 11, 12~~ Story 11. **Story 12's soak week was not completed** — see that
+story and "What changed from the plan" below.
 **PRD refs:** Open Items (`PRD.md:500`), §3 breaker tension (`PRD.md:252`)
 
 **In scope**
@@ -725,6 +802,34 @@ zero reconciliation errors.
   (`PRD.md:460`)
 - Switch mode to `PAPER`; first order round-trips submission → fill → persistence
 
+**Added during the story** — each forced by something found while making `PAPER` real:
+- **Retire `SHADOW`** and make `PAPER` the default; refuse `SHADOW` at startup
+- **Resting limit orders** (`OrderPlacement.RESTING`), `RungStatus.WORKING`, and the fill router
+- **Open-order reconciliation** — `BrokerAdapter.getOpenOrders()`, so a restart cannot duplicate an
+  order resting at IB
+- **`assertSingleCurrency`** — the CAD account vs. USD instrument mismatch
+- **`LiveBarGate`** — separating IB's historical backfill from live bars
+- **Live-feed re-subscription** after IB Gateway's daily logout
+- **Market-data error reporting** on `GET /status` (`broker.dataErrors`)
+- **Per-bar state persistence** on the live path (`BarConsumer.persistState`)
+
+**Added after the first resting orders went unattended** — every one of these follows from a single
+fact found in practice: a terminal order status can only be attributed to a rung by the process that
+placed the order, so anything that happened across a restart was invisible to the engine.
+- **`BrokerAdapter.getCompletedOrders()`** and order-history reconciliation — an `Order` row stayed
+  `SUBMITTED` forever after an order was cancelled in TWS, so `GET /orders` showed a live order that
+  existed nowhere. Reporting only; it never releases a rung.
+- **`POST /reconcile` and the dashboard's Reconcile button** — reconciliation ran only at boot, so
+  the only way to clear a `WORKING` rung whose order was gone was to restart the daemon mid-session.
+- **`PostCloseReconcileService`** — DAY orders expire at the close, and the next session otherwise
+  opened carrying them as permanently blocked levels. Orders only, never positions: a halt raised at
+  16:15 unattended is the failure mode a scheduled job must not have.
+- **`EngineService.recoverWorkingOrder`** — a fill arriving while the daemon was down had no
+  in-memory working-order record and was dropped entirely, leaving shares at the broker with no lot
+  and a symbol halted on the next boot.
+- **`npm run recover:lots`** — the operator repair for a position *already* stranded that way. A
+  script rather than a reconciliation path, because reconciliation must have no repair path.
+
 **Out of scope**
 - `LIVE` → Story 15
 
@@ -732,6 +837,12 @@ zero reconciliation errors.
 - `backend/src/config/capital.config.ts` — the now-set values
 - `docs/decisions/daily-loss-threshold.md` — the decision and its reasoning
 - `docs/decisions/capital-allocation.md`
+- `backend/src/broker/ib/live-bar-gate.ts`
+- `backend/src/engine/resting-orders.spec.ts`
+- `backend/prisma/migrations/20260814000000_rung_working_order/`
+- `backend/src/reconciliation/post-close-reconcile.service.ts`
+- `backend/src/cli/recover-lots.ts`
+- `ui/app/components/ReconcileButton.tsx`
 
 **Tests**
 - integration: startup assertion passes with values set, still fails when either is removed
@@ -743,6 +854,48 @@ zero reconciliation errors.
 **Exit criterion:** `PAPER` mode active; a real paper order round-trips to a persisted fill; both open
 items closed with written reasoning.
 
+**Status:** the code is built and the suite is green (1383 tests / 71 suites). **The operational half
+is not signed off** — the first real paper order round-tripping against live IB is Story 14's opening
+act, and the two figures still need backtest evidence before Story 15.
+
+### What changed from the plan
+
+**1. `SHADOW` was retired rather than left as a safer option.** Not planned here. Resting orders make
+a lot the consequence of a broker fill, and `SHADOW` submits nothing — so a shadow ladder would record
+intents forever and never open a lot. That is not a quieter version of live behaviour but a different
+and misleading one, and a mode reporting something the system would never do is worse than no mode.
+It is **refused at boot**, not silently redirected to `PAPER`: quietly upgrading a mode that submits
+nothing into one that submits real orders is exactly the implicit escalation the startup assertions
+exist to prevent. The enum member survives so historic `ParameterChange` and `RiskEvent` rows parse.
+
+**2. Entries now rest at the broker.** The bar-close rule (`PRD.md:92`) only creates an order once a
+bar has *closed* at or below a rung, so a dip that touches the level intra-bar and recovers fires
+nothing — the ladder buys the close, not the dip. Since the levels are chosen in advance, waiting for
+confirmation only forfeits fills. This is the change that pulled in `WORKING`, the persistent fill
+router, and open-order reconciliation: orders now outlive the process that placed them.
+
+**3. The capital figures were operator-chosen, not backtest-derived.** This story specifies "informed
+by Story 11 backtests"; no backtest was run. They were derived from the account balance and the cap
+arithmetic. **They are defensible as *safe* — a full ladder fits the global cap with headroom — but
+are not claimed to be optimal**, nor validated against the 2022 ~80% drawdown at `PRD.md:470`.
+Recorded in both decision documents rather than left implicit. **Story 15 must close this.**
+
+**4. A currency error was found and only partly fixed.** The paper account reports `NetLiquidation`
+in **CAD**; TQQQ trades in **USD**; the risk layer converts nothing. A USD notional was being capped
+against a CAD figure, permitting ~1.39× more exposure than intended — masked because a stale-low
+equity figure tightened the cap while the missing conversion loosened it. Two errors partly
+cancelling is not a control. Resolved by expressing every figure in USD and converting the balance
+**once, by hand**, which makes the arithmetic sound but leaves `PAPER_ACCOUNT_EQUITY` carrying FX
+staleness on top of balance staleness. **Live FX conversion remains open and is mandatory before
+`LIVE`.**
+
+**5. A live-data hazard surfaced that no fixture could have caught.** IB's
+`getHistoricalDataUpdates` is backfill-then-stream and re-emits the in-progress bar as it forms.
+Treating every emission as a closed bar **walked a live ladder down five rungs in sixteen seconds
+against stale prices** — which, in `PAPER`, went straight at the submission path. `LiveBarGate` is
+the fix. Related: a bar subscription does not survive the socket it was made on, so IB Gateway's
+daily logout silently ended the feed for the life of the process until re-subscription was added.
+
 ---
 
 ## Story 14 — PAPER soak and fix loop
@@ -753,30 +906,54 @@ executed against a real broker.
 **Depends on:** Story 13
 **PRD refs:** §12 (`PRD.md:486`), rollout decisions above
 
+> **This story now absorbs Story 12's soak week**, which was superseded before it ran. The daily
+> report, the anomaly codes, and `docs/soak-log.md` all carry over — as does the rule that **one
+> unexplained anomaly restarts the clock**. What changed is the mode they run in, and two daily
+> checks that now mean the **opposite** of what they meant under `SHADOW`:
+>
+> | Check | Under `SHADOW` | Under `PAPER` |
+> |---|---|---|
+> | `intents.submitted` | Had to be **0** every day; anything else stopped the soak | Expected **non-zero**; a zero on a day the ladder fired needs investigating |
+> | Lot-sum halt on restart | **Routine** — the DB legitimately diverged from an empty broker position | **A genuine finding.** Every lot now follows a real fill, so the two should agree |
+
 **In scope**
 - Continuous `PAPER` operation, minimum four weeks
 - **Gate: at least one complete lot cycle** — fire → target → exit → re-arm → fire — executed against
   the real paper broker. A ladder that has only fired and held has never exercised the exit, re-arm,
   or FIFO code paths; that is half the system.
+- **First order round-trip** — submission → resting at IB → fill → persistence. Carried from Story
+  13, whose code is built but whose operational half is unverified.
 - Kill switch verified **under live conditions**, not just in tests
 - Every reconciliation halt investigated to root cause
 - Iterate: gather feedback → fix bugs → redeploy → continue. Fixes carry regression tests.
 - Compare live paper behavior against Story 11 backtest expectations; investigate divergence
+- **Resting-order verification, new at Story 13** — orders now outlive the process, so:
+  - `GET /orders` reconciled against IB's own order window
+  - **no duplicated order at any rung across a restart** — the specific failure open-order
+    reconciliation exists to prevent
+  - a rung released after its DAY order expires overnight, and re-placed the next session
+  - a partial fill: remainder cancelled, lot opened for the shares that actually filled
+- **Verify the `RESTING` rule earns its change** — that intra-bar dips are captured which the
+  bar-close rule would have missed. This is the observable justification for the departure from
+  `PRD.md:92`, and it has only been reasoned about, never measured.
 
 **Out of scope**
 - Parameter tuning beyond correcting outright defects — strategy changes need their own decision
 
 **Files**
+- `docs/soak-log.md` — revised for `PAPER`; the running record
 - `docs/paper-soak-log.md` — cycle records, anomalies, fixes, regression test refs
 
 **Tests**
 - operational: ≥1 complete lot cycle recorded with realized P&L matching hand calculation
 - operational: kill switch activated live, halting submission within one evaluation cycle
-- operational: at least one mid-session restart with successful reconciliation
+- operational: at least one mid-session restart with successful reconciliation **and no duplicated
+  resting order**
 - regression: every bug found produces a failing test first, then the fix
 
 **Exit criterion:** four weeks minimum **and** ≥1 complete lot cycle executed, **and** zero unexplained
-reconciliation halts, **and** kill switch verified live.
+reconciliation halts, **and** kill switch verified live, **and** no duplicated order across any
+restart.
 
 ---
 
@@ -787,7 +964,27 @@ reconciliation halts, **and** kill switch verified live.
 **Depends on:** Story 14
 **PRD refs:** §3 live guard (`PRD.md:259`), §1 risk acknowledgement (`PRD.md:35`)
 
+> **Two debts from Story 13 are mandatory blockers here.** Both are acceptable on paper, where a
+> loose cap costs a simulated loss, and neither is acceptable where it costs real money.
+>
+> 1. **The capital figures have no backtest behind them.** `PAPER_SYMBOL_CAPITAL.TQQQ` (40,000) and
+>    `dailyLossThreshold` (5,000) were operator-chosen from cap arithmetic, not derived from Story 11
+>    backtests as Story 13 specified. They are safe but unvalidated — in particular, never tested
+>    against the 2022 ~80% drawdown named at `PRD.md:470`.
+> 2. **Account equity is a hand-converted FX snapshot.** `PAPER_ACCOUNT_EQUITY` (175,000 USD) was
+>    converted by hand from 248,973.68 CAD at USD.CAD 1.3874 on 2026-08-14. It carries **two** kinds
+>    of staleness — the balance and the rate — and a sustained CAD rally silently loosens the cap. The
+>    ~2.5% buffer covers ordinary daily movement, not a trend.
+>
+> See `docs/decisions/capital-allocation.md` and `docs/decisions/daily-loss-threshold.md`.
+
 **In scope**
+- **Close the Story 13 debts above, before any live order:**
+  - Run the backtester over cached TQQQ history including 2022; either confirm both figures or
+    replace them, updating both decision documents with the evidence
+  - Replace the hand-converted equity with a **live `USD.CAD` rate from IB** (`IDEALPRO`), treated as
+    market data with its own staleness watchdog, where an unavailable or stale rate **blocks new
+    entries** rather than falling back to a cached value of unknown age
 - Explicit live flag set; startup assertion verified to reject its absence
 - **First two weeks at 25% of nominal per-symbol allocation**, then step up. Going from paper to full
   nominal means the first real drawdown is also the first real position — on a 3x leveraged ETF,
@@ -795,22 +992,27 @@ reconciliation halts, **and** kill switch verified live.
 - Reduced-size period monitored daily; kill switch verified on the live account
 - Step-up to full nominal is an explicit, recorded decision, not automatic
 - Re-read `PRD.md` §1 before any parameter change (`PRD.md:18`)
+- **Re-confirm `IB_PORT`.** With `SHADOW` gone, this setting is the last thing separating simulated
+  from real money, and Story 15 is where it deliberately changes.
 
 **Out of scope**
 - New strategies → Story 16
 
 **Files**
 - `backend/src/config/live.config.ts` — flag + size multiplier with the step-up schedule
+- `backend/src/config/capital.config.ts` — the revisited, backtest-backed figures
 - `docs/decisions/live-cutover.md`
 
 **Tests**
 - integration: live-account guard rejects startup when the flag is absent (`PRD.md:493`)
 - integration: size multiplier applied — orders at 25% of nominal during the reduced period
 - integration: step-up requires an explicit config change; it cannot happen on a timer alone
+- integration: a stale or unavailable FX rate blocks new entries and never falls back to a cached rate
 - operational: kill switch verified on the live account
 
-**Exit criterion:** live trading active at 25% nominal, guard verified, kill switch verified live, and
-the step-up decision recorded after two clean weeks.
+**Exit criterion:** live trading active at 25% nominal, guard verified, kill switch verified live,
+**both Story 13 debts closed with written evidence**, and the step-up decision recorded after two
+clean weeks.
 
 ---
 
@@ -827,7 +1029,12 @@ the step-up decision recorded after two clean weeks.
 - `WheelStrategy` — cash-secured puts transitioning to covered calls on assignment
 - `LeapsStrategy` — timed or threshold-based multi-month positioning
 - Each passes the Story 2 contract suite before any live wiring
-- Each goes through the same `SHADOW` → `PAPER` → `LIVE` progression as the dip ladder
+- Each goes through the same **`PAPER` → `LIVE`** progression as the dip ladder. **`SHADOW` is no
+  longer available as the first rung of that ladder** (retired at Story 13), so a new strategy's
+  first exposure to a broker is a paper account rather than a mode that submits nothing. Its
+  substitute is the pre-broker evidence the dip ladder also had: the contract suite, fixture replay,
+  and a Story 11 backtest — all of which run with no broker at all. A strategy reaching `PAPER`
+  **disabled** and being enabled deliberately is the equivalent gate.
 - Sentiment provider revisited **only if a paid feed is acquired**; when it lands it is a **veto
   filter, not an entry trigger** (`PRD.md:196`)
 
@@ -847,8 +1054,9 @@ the step-up decision recorded after two clean weeks.
   correlation-goes-to-1 case at `PRD.md:243`
 - integration: options `Contract` round-trips through persistence and order payload generation
 
-**Exit criterion:** each strategy independently completes `SHADOW` → `PAPER` → `LIVE` with the same
-gates the dip ladder passed.
+**Exit criterion:** each strategy independently completes `PAPER` → `LIVE` with the same gates the
+dip ladder passed — contract suite, backtest, paper soak with ≥1 complete cycle, then reduced-size
+live.
 
 ---
 
@@ -868,6 +1076,6 @@ Every `PRD.md` section maps to at least one story:
 | §8 Backtesting | 11 |
 | §9 Testing | every story (per-story test lists) |
 | §10 Containerization | 0, 8, 10 |
-| §11 Roadmap | 12, 13, 14, 15, 16 |
-| §12 Verification | 0, 5, 9, 10, 12, 13, 15 |
-| Open Items | 5 (assertion), 13 (values) |
+| §11 Roadmap | ~~12~~, 13, 14, 15, 16 — Story 12 superseded by 14 |
+| §12 Verification | 0, 5, 9, 10, ~~12~~ → 14, 13, 15 |
+| Open Items | 5 (assertion), 13 (values set, **not backtest-validated**), 15 (must revisit) |

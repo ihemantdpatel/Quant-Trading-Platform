@@ -79,6 +79,62 @@ export interface Fill {
 }
 
 /**
+ * An order working at the broker, unfilled.
+ *
+ * Carries `clientOrderId` because that is the only field the engine can match
+ * against its own records — IB's `brokerOrderId` is assigned by IB and is not
+ * what the rung ledger stores. `filledQuantity` distinguishes a partially
+ * filled resting order from an untouched one, which reconciliation must treat
+ * differently: the former already has shares the ladder may not know about.
+ */
+export interface OpenOrder {
+  clientOrderId: string;
+  brokerOrderId: string;
+  symbol: string;
+  side: OrderSide;
+  quantity: number;
+  /** Shares already filled on this order. 0 for an untouched resting order. */
+  filledQuantity: number;
+  limitPrice: number;
+}
+
+/**
+ * An order that has reached a **terminal state** at the broker — filled,
+ * cancelled, or expired.
+ *
+ * The complement to `OpenOrder`, and the distinction is the whole point.
+ * `getOpenOrders` answers "what is still working", so an order that went away
+ * is simply *absent* from it. Absence is enough to release a rung — the ladder
+ * only needs to know the level is free — but it cannot say whether the order
+ * expired at the close, was cancelled by hand in TWS, or was rejected, and it
+ * carries no time. So the `Order` row stayed `SUBMITTED` forever while the rung
+ * moved on, and the dashboard kept showing a live-looking order that no longer
+ * existed anywhere.
+ *
+ * `status` is deliberately narrowed to the terminal set rather than reusing the
+ * full `OrderStatus`: a completed order is by definition not `SUBMITTED`, and
+ * allowing that value would let a caller write a non-terminal status from a
+ * source that cannot produce one.
+ */
+export interface CompletedOrder {
+  clientOrderId: string;
+  brokerOrderId: string;
+  symbol: string;
+  side: OrderSide;
+  quantity: number;
+  filledQuantity: number;
+  status: OrderStatus.FILLED | OrderStatus.CANCELLED | OrderStatus.REJECTED;
+  /**
+   * The broker's own explanation, when it gave one.
+   *
+   * Null rather than a manufactured string: "cancelled" with no reason is an
+   * honest report, whereas inventing "cancelled by user" would assert a cause
+   * nobody established.
+   */
+  reason: string | null;
+}
+
+/**
  * A broker position: **net quantity and average cost, nothing more.**
  *
  * Deliberately impoverished, because this is genuinely all IB reports. Three
@@ -135,6 +191,43 @@ export interface BrokerAdapter {
   submit(order: BrokerOrder): Promise<OrderAck>;
 
   cancel(clientOrderId: string): Promise<OrderAck>;
+
+  /**
+   * Orders currently working at the broker, unfilled.
+   *
+   * **The restart-safety primitive for resting orders.** An order placed before
+   * a restart is still live at the broker afterwards, and nothing in the
+   * database can confirm it survived — only the broker knows. Without this the
+   * engine would place a second order at the same rung on every boot, and the
+   * duplicates would fill together.
+   *
+   * The same authority split as `getPositions`: the broker is authoritative on
+   * *what exists*, the database on *what it means* (which rung placed it). An
+   * unreachable broker must throw rather than return `[]` — "no open orders"
+   * and "cannot tell" lead to opposite decisions, and only one of them is safe.
+   */
+  getOpenOrders(): Promise<OpenOrder[]>;
+
+  /**
+   * Orders that reached a terminal state at the broker, for the current day.
+   *
+   * **Why the engine cannot answer this from its own records.** A terminal
+   * status arrives on `onOrderStatus`, which can only attribute it to an order
+   * whose broker id this process holds in memory — and that map is populated by
+   * `submit`. An order placed before a restart, then cancelled in TWS, produces
+   * a status this process cannot attribute and silently drops. Only the broker
+   * retains the outcome.
+   *
+   * Reporting only. Nothing here releases a rung or opens a lot: `getOpenOrders`
+   * remains the authority on which levels are free, because a level is free when
+   * no order is working at it — a fact that stands whether or not the history
+   * query succeeds.
+   *
+   * Throws when the broker cannot answer, for the same reason as
+   * `getOpenOrders`: an empty history and an unanswered query are different
+   * facts and must not collapse into one.
+   */
+  getCompletedOrders(): Promise<CompletedOrder[]>;
 
   getPositions(): Promise<BrokerPosition[]>;
   getAccountSummary(): Promise<AccountSummary>;

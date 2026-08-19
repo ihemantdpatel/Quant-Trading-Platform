@@ -59,10 +59,10 @@ describe('AppConfigModule', () => {
     return result!;
   }
 
-  it('boots with EXECUTION_MODE defaulted to SHADOW when unset', async () => {
+  it('boots with EXECUTION_MODE defaulted to PAPER when unset', async () => {
     const config = await bootConfigModule();
 
-    expect(config.executionMode).toBe(ExecutionMode.SHADOW);
+    expect(config.executionMode).toBe(ExecutionMode.PAPER);
   });
 
   it('refuses to boot when EXECUTION_MODE is invalid', async () => {

@@ -9,20 +9,29 @@
  * configured allocation and publishes it under a neutral token that
  * `RiskModule` resolves optionally.
  *
- * The value is `null` until Story 13, producing `{ TQQQ: null }` — the exact
- * state the startup assertion refuses for PAPER/LIVE. That is more useful than
- * an empty map, which would also fail but report "no symbols configured"
- * rather than naming the symbol whose allocation is missing.
+ * Story 13 set the allocation (`capital.config.ts`), so every mode reports the
+ * real figure. The SHADOW branch that used to report `{ TQQQ: null }` went with
+ * SHADOW itself (`execution-mode.ts`).
+ *
+ * `null` is still the value for a symbol with no configured allocation — rather
+ * than an empty map — because both fail the startup assertion but only this one
+ * names the symbol whose allocation is missing.
  */
 
 import { Global, Module } from '@nestjs/common';
-import { SYMBOL_CAPITAL_SOURCE } from '../risk/risk.module';
+import { INSTRUMENT_CURRENCY_SOURCE, SYMBOL_CAPITAL_SOURCE } from '../risk/risk.module';
 import { SymbolCapital } from '../risk/startup-assertions';
-import { DIP_LADDER_SYMBOL, StrategiesModule } from '../strategies/strategies.module';
+import {
+  DIP_LADDER_CURRENCY,
+  DIP_LADDER_SYMBOL,
+  StrategiesModule,
+} from '../strategies/strategies.module';
+import { PAPER_SYMBOL_CAPITAL } from './capital.config';
+import { AppConfigModule } from './config.module';
 
 @Global()
 @Module({
-  imports: [StrategiesModule],
+  imports: [StrategiesModule, AppConfigModule],
   providers: [
     {
       /**
@@ -37,12 +46,30 @@ import { DIP_LADDER_SYMBOL, StrategiesModule } from '../strategies/strategies.mo
        * ladder may have a number to size a shadow display with, and the risk
        * layer still correctly sees no allocation decision has been made.
        *
-       * Story 13 sets a real figure and updates this to report it.
+       * Story 13 supplies the real figure from `capital.config.ts` — still not
+       * from the ladder's own `symbolCapital`, for the same reason: the two must
+       * not be able to satisfy each other.
        */
       provide: SYMBOL_CAPITAL_SOURCE,
-      useFactory: (): SymbolCapital => ({ [DIP_LADDER_SYMBOL]: null }),
+      useFactory: (): SymbolCapital => ({
+        [DIP_LADDER_SYMBOL]: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL] ?? null,
+      }),
+    },
+    {
+      /**
+       * The currency of each instrument the ladder trades, for the startup
+       * currency check.
+       *
+       * Published from here for the same reason as the allocation above: this
+       * module is the one place the strategy and risk layers may meet. The
+       * ladder trades a single equity symbol, and `equityContract` defaults to
+       * USD, so this is USD — which deliberately *disagrees* with the CAD paper
+       * account and is exactly what the check reports.
+       */
+      provide: INSTRUMENT_CURRENCY_SOURCE,
+      useFactory: (): string[] => [DIP_LADDER_CURRENCY],
     },
   ],
-  exports: [SYMBOL_CAPITAL_SOURCE],
+  exports: [SYMBOL_CAPITAL_SOURCE, INSTRUMENT_CURRENCY_SOURCE],
 })
 export class CapitalModule {}

@@ -71,6 +71,7 @@ export function rungFixture(price: number, overrides: Partial<Rung> = {}): Rung 
     price,
     status: RungStatus.PENDING,
     lotId: null,
+    workingOrderId: null,
     completedCycles: 0,
     lastExitAt: null,
     ...overrides,
@@ -353,6 +354,21 @@ export function runRungRepositoryContract(create: RepositoryFactory<RungReposito
       expect(restored.lotId).toBe('TQQQ-lot-7');
     });
 
+    it('preserves a working rung’s resting order id', async () => {
+      // The id is how a restart matches an order still open at IB back to the
+      // rung that placed it. Losing it across the round trip would make the
+      // ladder place a duplicate order at the same level on the next boot.
+      await repo.saveAll(
+        [rungFixture(95, { status: RungStatus.WORKING, workingOrderId: 'co-42' })],
+        'TQQQ',
+      );
+
+      const [restored] = await repo.findBySymbol('TQQQ');
+      expect(restored.status).toBe(RungStatus.WORKING);
+      expect(restored.workingOrderId).toBe('co-42');
+      expect(restored.lotId).toBeNull();
+    });
+
     it('stores a copy', async () => {
       const rungs = [rungFixture(95)];
       await repo.saveAll(rungs, 'TQQQ');
@@ -532,6 +548,30 @@ export function runFillRepositoryContract(create: RepositoryFactory<FillReposito
       await repo.save({ ...fillFixture('co-1', 'f1'), commission: 1.25 });
 
       expect((await repo.findAll())[0].commission).toBe(1.25);
+    });
+
+    // The fill router's replay guard: IB re-delivers the day's executions on
+    // every reconnect, and this lookup is what distinguishes a new fill from
+    // one already processed.
+    it('finds a fill by its own id, and returns null for an unknown one', async () => {
+      await repo.save(fillFixture('co-1', 'f1'));
+
+      const found = await repo.findByFillId('f1');
+
+      expect(found?.fillId).toBe('f1');
+      expect(found?.clientOrderId).toBe('co-1');
+      expect(await repo.findByFillId('never-seen')).toBeNull();
+    });
+
+    // `save` upserts on `fillId`, so a replayed execution must not become a
+    // second row — otherwise the guard above would still hold while the fill
+    // count, and any P&L derived from it, silently doubled.
+    it('re-saving the same fillId updates rather than duplicates', async () => {
+      await repo.save(fillFixture('co-1', 'f1'));
+      await repo.save({ ...fillFixture('co-1', 'f1'), price: 74.5 });
+
+      expect(await repo.findAll()).toHaveLength(1);
+      expect((await repo.findByFillId('f1'))?.price).toBe(74.5);
     });
 
     it('clear empties the store', async () => {

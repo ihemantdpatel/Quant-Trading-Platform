@@ -51,6 +51,8 @@ import {
   ConnectionHealth,
   ConnectionState,
   Fill,
+  CompletedOrder,
+  OpenOrder,
   OrderAck,
   OrderStatus,
 } from '../broker-adapter.interface';
@@ -289,6 +291,27 @@ export class SimulatedBrokerAdapter implements BrokerAdapter {
     this.emitStatus(ack);
 
     return ack;
+  }
+
+  /**
+   * Always empty: this adapter fills or rejects every order within `submit`,
+   * so no order is ever left working.
+   *
+   * That is a property of the simulation rather than a stub — a backtest has no
+   * restart to reconcile across, and modelling a resting queue here would
+   * invent state the replay harness never observes.
+   */
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    return [];
+  }
+
+  /**
+   * Always empty: the backtest broker fills or rejects within the call, so no
+   * order ever reaches a terminal state the caller did not already observe as
+   * the return value.
+   */
+  async getCompletedOrders(): Promise<CompletedOrder[]> {
+    return [];
   }
 
   async getPositions(): Promise<BrokerPosition[]> {

@@ -22,6 +22,31 @@ export enum SpacingMode {
   ATR = 'ATR',
 }
 
+export enum OrderPlacement {
+  /**
+   * An order is created only once a bar closes at or below the rung price
+   * (`PRD.md:92`). The original rule, and the one every committed fixture's
+   * expectations were computed under.
+   *
+   * Its cost is that a rung touched by an intra-bar wick that recovers before
+   * the close fires nothing at all — the ladder buys the *close*, not the dip.
+   */
+  IMMEDIATE = 'IMMEDIATE',
+  /**
+   * A limit order rests at the rung price continuously, so the exchange fills
+   * it whenever price reaches the level — including on an intra-bar wick the
+   * bar-close rule would miss.
+   *
+   * This is what a dip ladder is supposed to do: the levels are chosen in
+   * advance, so waiting for a bar to confirm what the order would already have
+   * captured only forfeits fills. It is **not** the default because it changes
+   * what reaches the broker: orders rest unattended, across restarts, and must
+   * be reconciled against IB's open orders on boot or a restart duplicates
+   * them.
+   */
+  RESTING = 'RESTING',
+}
+
 export enum ExitMode {
   /**
    * Each lot exits at its own target from its own fill price. The default, and
@@ -52,6 +77,15 @@ export interface DipLadderConfig {
   takeProfitPercent: number;
   /** Per-lot (default) or blended average-cost exits. */
   exitMode: ExitMode;
+  /**
+   * Whether entries rest at the broker as limit orders or are created on a bar
+   * close that has already reached the rung.
+   *
+   * Defaults to `IMMEDIATE` so the committed fixtures keep testing the rule
+   * their expected intents were computed under. The live engine selects
+   * `RESTING`; see `strategies.module.ts`.
+   */
+  orderPlacement: OrderPlacement;
   /** Fraction of symbol capital per rung. 0.25 = 25%. */
   sizePerRung: number;
   /**
@@ -82,6 +116,7 @@ export const DEFAULT_DIP_LADDER_CONFIG: Omit<DipLadderConfig, 'symbol'> = {
   atrPeriod: 14,
   takeProfitPercent: 0.05,
   exitMode: ExitMode.PER_LOT,
+  orderPlacement: OrderPlacement.IMMEDIATE,
   sizePerRung: 0.25,
   escalationFactor: 1,
   maxConcurrentRungs: 5,

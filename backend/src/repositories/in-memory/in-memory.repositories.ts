@@ -116,6 +116,18 @@ export class InMemoryFillRepository implements FillRepository {
   private readonly fills: Fill[] = [];
 
   async save(fill: Fill): Promise<void> {
+    // Upsert on `fillId`, matching the Prisma implementation, where it is the
+    // primary key (`schema.prisma:127`). IB replays executions on reconnect, so
+    // the same fill is genuinely saved more than once — appending would double
+    // the fill count and any P&L derived from it, and the two implementations
+    // would disagree about a fact the fill router depends on.
+    const existing = this.fills.findIndex((candidate) => candidate.fillId === fill.fillId);
+
+    if (existing >= 0) {
+      this.fills[existing] = copy(fill);
+      return;
+    }
+
     this.fills.push(copy(fill));
   }
 
@@ -125,6 +137,12 @@ export class InMemoryFillRepository implements FillRepository {
 
   async findByClientOrderId(clientOrderId: string): Promise<Fill[]> {
     return copy(this.fills.filter((fill) => fill.clientOrderId === clientOrderId));
+  }
+
+  async findByFillId(fillId: string): Promise<Fill | null> {
+    const found = this.fills.find((fill) => fill.fillId === fillId);
+
+    return found ? copy(found) : null;
   }
 
   async clear(): Promise<void> {

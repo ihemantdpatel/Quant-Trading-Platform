@@ -44,9 +44,17 @@ import {
   ConnectionHealth,
   ConnectionState,
   Fill,
+  CompletedOrder,
+  OpenOrder,
   OrderAck,
 } from '../broker-adapter.interface';
-import { CommissionCorrection, DisconnectEvent, DisconnectReason, IbSocket } from './ib-socket';
+import {
+  CommissionCorrection,
+  DataErrorEvent,
+  DisconnectEvent,
+  DisconnectReason,
+  IbSocket,
+} from './ib-socket';
 import { PacingConfig, PacingQueue, PacingStats, historicalRequestKey } from './pacing-queue';
 import {
   DEFAULT_STALE_THRESHOLD_MS,
@@ -119,6 +127,15 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   private lastBarAtMs: number | null = null;
 
   /**
+   * The most recent market-data error per symbol, for `GET /status`.
+   *
+   * Keyed by symbol rather than appended, because IB repeats a rejection on
+   * every re-subscription attempt: an unbounded list would grow for as long as
+   * the fault lasts, and the newest one is the only one an operator acts on.
+   */
+  private readonly dataErrors = new Map<string, DataErrorEvent & { at: string }>();
+
+  /**
    * Epoch ms from which bars were expected but none has yet arrived.
    *
    * Set when a subscription opens and re-set on a reconnect, so "connected but
@@ -150,6 +167,27 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
     this.socket.onCommission((report) =>
       this.commissionHandlers.forEach((handler) => handler(report)),
     );
+
+    // Optional on the port, so a socket that does not report data errors keeps
+    // its existing behaviour rather than failing to construct.
+    this.socket.onDataError?.((event) => this.recordDataError(event));
+  }
+
+  /**
+   * Records a market-data error for `GET /status`.
+   *
+   * Reporting only — this deliberately does **not** halt entries. IB uses this
+   * channel for benign notices as well as real rejections, and a halt that can
+   * fire on an informational message would be cleared by hand often enough to
+   * train an operator to clear it without reading it. The staleness watchdog
+   * remains the mechanism that acts, on the evidence that actually matters:
+   * bars stopped arriving. This makes the *cause* visible next to that effect.
+   */
+  private recordDataError(event: DataErrorEvent): void {
+    this.dataErrors.set(event.symbol, {
+      ...event,
+      at: new Date(this.now()).toISOString(),
+    });
   }
 
   async connect(): Promise<void> {
@@ -327,6 +365,11 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
     return this.socket.subscribeBars(contract, barSize, (bar) => {
       this.lastBarAtMs = this.now();
       this.dataExpectedSinceMs = null;
+
+      // A bar is proof the subscription recovered, so a stale rejection must
+      // not linger on `/status` describing a feed that is now working.
+      this.dataErrors.delete(bar.symbol);
+
       handler(bar);
     });
   }
@@ -352,6 +395,11 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
     return this.lastBarAtMs;
   }
 
+  /** The most recent market-data error per symbol, newest state only. */
+  dataErrorList(): Array<DataErrorEvent & { at: string }> {
+    return [...this.dataErrors.values()];
+  }
+
   async submit(order: BrokerOrder): Promise<OrderAck> {
     if (!this.isConnected()) {
       // A technical fault, not a rejection. The engine halts new entries and
@@ -370,6 +418,26 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
     }
 
     return this.socket.cancelOrder(clientOrderId);
+  }
+
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    if (!this.isConnected()) {
+      // Throws rather than returning empty: reconciliation must be able to tell
+      // "IB reports nothing working" from "IB could not be asked".
+      throw new Error('IB not connected — cannot list open orders');
+    }
+
+    return this.socket.getOpenOrders();
+  }
+
+  async getCompletedOrders(): Promise<CompletedOrder[]> {
+    if (!this.isConnected()) {
+      // Same distinction as `getOpenOrders`: an empty history and an
+      // unanswerable query must not look alike to the caller.
+      throw new Error('IB not connected — cannot list completed orders');
+    }
+
+    return this.socket.getCompletedOrders();
   }
 
   async getPositions(): Promise<BrokerPosition[]> {
@@ -455,12 +523,23 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
         // Staleness is measured from the last bar *received*; a fresh session
         // has not delivered one yet, and keeping the old timestamp would trip
         // the stale check immediately on a reconnect that actually worked.
+        const hadDelivered = this.lastBarAtMs !== null;
         this.lastBarAtMs = null;
 
-        // But the clock has to keep running from here, or a reconnect that
-        // resumes the socket without resuming the feed becomes permanently
-        // invisible — a null last-bar would read as startup indefinitely.
-        this.dataExpectedSinceMs = this.now();
+        // The clock has to keep running from here, or a reconnect that resumes
+        // the socket without resuming the feed becomes permanently invisible —
+        // a null last-bar would read as startup indefinitely.
+        //
+        // But it restarts **only for a feed that had actually delivered**. A
+        // socket that never produced a bar keeps its original expectation
+        // point, because otherwise a socket flapping faster than the threshold
+        // resets the deadline on every reconnect and the stale halt is deferred
+        // forever — the exact "connected, never delivered, indefinitely" case
+        // this timestamp exists to catch. Observed as a feed that reconnected
+        // every ~13 minutes against a 15-minute threshold and never tripped.
+        if (hadDelivered || this.dataExpectedSinceMs === null) {
+          this.dataExpectedSinceMs = this.now();
+        }
 
         // The new session can be lost as silently as the old one was.
         this.startLivenessProbe();

@@ -38,12 +38,36 @@ export interface BarConsumer {
   processBar(bar: Bar): Promise<unknown>;
   /** Halts new entries on a technical fault. Never sells anything. */
   haltEntriesForFault(reason: string): void;
+  /**
+   * Writes ladder state after a bar has been processed.
+   *
+   * `replayFixture` persists once at the end of a replay, which is right for a
+   * batch that either completes or is re-run. A live session has no end to
+   * persist at: it is interrupted, not finished, and the soak deliberately
+   * includes mid-session restarts. Without a write per bar the `Lot`, `Rung`,
+   * and `StrategyStateSnapshot` tables stay empty for a live-only session, so
+   * a restart restores nothing and `DailyReportService` skips its rung check
+   * every day — and a skip is not a pass.
+   *
+   * Optional so a consumer with no persistence (the fixture-driven tests, any
+   * future non-engine consumer) is unaffected.
+   */
+  persistState?(): Promise<void>;
 }
 
 /** The subset of a broker this service needs — kept narrow so it stays fakeable. */
 export interface LiveBarSource {
   subscribeBars(contract: Contract, barSize: BarSize, handler: (bar: Bar) => void): () => void;
   isDataStale(): boolean;
+  /**
+   * Notifies when the broker's connection state changes, so the feed can
+   * re-subscribe after a reconnect. See `LiveFeedService.start`.
+   *
+   * Optional: a source with no notion of connection health (a fixture, a test
+   * double that only emits bars) simply never resubscribes, which is the
+   * behaviour those callers already had.
+   */
+  onConnectionChange?(handler: (connected: boolean) => void): () => void;
 }
 
 export interface LiveFeedConfig {
@@ -69,6 +93,10 @@ export class LiveFeedService implements OnModuleDestroy {
   private processed = 0;
   private staleHaltRaised = false;
 
+  /** True while a bar subscription is believed live. Gates re-subscribing. */
+  private subscribed = false;
+  private unwatchConnection: (() => void) | null = null;
+
   constructor(
     private readonly source: LiveBarSource,
     private readonly consumer: BarConsumer,
@@ -81,14 +109,80 @@ export class LiveFeedService implements OnModuleDestroy {
    * Subscribes to a symbol and starts feeding the engine.
    *
    * 5-minute bars: the cadence the ladder evaluates on (`stories.md:226`).
+   *
+   * ## The subscription is re-established on every reconnect
+   *
+   * **A bar subscription does not survive the socket it was made on.** IB
+   * Gateway logs itself out daily (`TWS_COLD_RESTART`), and on the way back the
+   * adapter's reconnect policy restores the *socket* — but the subscription
+   * made against the old one is gone, and IB reports it only as a one-line
+   * `Failed to request live updates (disconnected)`.
+   *
+   * Without re-subscribing, the first logout permanently ends the feed for the
+   * life of the process: connected broker, no bars, indefinitely. The staleness
+   * watchdog catches it — that is what it is for — but a halt that can only be
+   * cleared by restarting the daemon every morning is not a working feed.
+   *
+   * Re-subscribing is safe because the socket's `LiveBarGate` is per
+   * subscription: the fresh backfill IB replays is absorbed rather than
+   * forwarded, so a reconnect cannot walk the ladder down a stale window.
    */
   start(contract: Contract, barSize: BarSize = BarSize.FIVE_MIN): void {
+    this.subscribe(contract, barSize);
+
+    // A source with no connection notion never resubscribes — see the port.
+    const unwatch = this.source.onConnectionChange?.((connected) => {
+      if (connected) {
+        this.resubscribe(contract, barSize);
+        return;
+      }
+
+      // The subscription died with the socket, whether or not IB said so.
+      // Marking it dead here is what lets the next CONNECTED re-subscribe;
+      // without it the guard in `resubscribe` would suppress the recovery.
+      this.subscribed = false;
+    });
+
+    if (unwatch) {
+      this.unwatchConnection = unwatch;
+    }
+
+    this.logger.log(`live feed started for ${contract.symbol} ${barSize}`);
+  }
+
+  /**
+   * Tears down the stale subscription and makes a fresh one.
+   *
+   * Ignored while a subscription is already live for this contract: the adapter
+   * can report `CONNECTED` more than once for a single recovery (a reconnect
+   * that succeeds on attempt 2 emits per attempt), and each redundant
+   * re-subscribe would cost an IB request and another backfill window.
+   */
+  private resubscribe(contract: Contract, barSize: BarSize): void {
+    if (this.subscribed) {
+      return;
+    }
+
+    this.logger.log(
+      `broker reconnected — re-subscribing ${contract.symbol} ${barSize}; ` +
+        'the bar subscription did not survive the previous socket',
+    );
+
+    this.subscribe(contract, barSize);
+
+    // The feed is live again, so a stale halt may legitimately be raised anew
+    // if it goes quiet a second time. Without this the watchdog stays latched
+    // and the *next* outage would pass unreported.
+    this.staleHaltRaised = false;
+  }
+
+  private subscribe(contract: Contract, barSize: BarSize): void {
     const unsubscribe = this.source.subscribeBars(contract, barSize, (bar) => {
       this.enqueue(bar);
     });
 
     this.unsubscribes.push(unsubscribe);
-    this.logger.log(`live feed started for ${contract.symbol} ${barSize}`);
+    this.subscribed = true;
   }
 
   /** Starts the staleness watchdog. Separate from `start` so tests can drive it. */
@@ -149,6 +243,23 @@ export class LiveFeedService implements OnModuleDestroy {
             error instanceof Error ? error.message : String(error)
           }`,
         );
+      })
+      // Persistence runs *after* the catch above, so state is written even for
+      // a bar whose processing failed: the ladder may have opened a lot before
+      // throwing, and losing that write would leave the database disagreeing
+      // with a position the broker already holds.
+      //
+      // Its own catch, because a failed write must not be reported as a failed
+      // bar — and must not stall the queue behind it. The engine keeps running
+      // on in-memory state; reconciliation is what catches a persistent
+      // divergence on the next restart.
+      .then(() => this.consumer.persistState?.())
+      .catch((error: unknown) => {
+        this.logger.error(
+          `failed to persist ladder state after ${bar.symbol} ${bar.timestamp}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       });
   }
 
@@ -162,8 +273,14 @@ export class LiveFeedService implements OnModuleDestroy {
   }
 
   stop(): void {
+    // Before the unsubscribes: a connection event arriving mid-teardown would
+    // otherwise re-subscribe a feed that is being shut down.
+    this.unwatchConnection?.();
+    this.unwatchConnection = null;
+
     this.unsubscribes.forEach((unsubscribe) => unsubscribe());
     this.unsubscribes.length = 0;
+    this.subscribed = false;
 
     if (this.watchdog) {
       clearInterval(this.watchdog);

@@ -277,6 +277,14 @@ export class PrismaFillRepository implements FillRepository {
     return rows.map(toFill);
   }
 
+  async findByFillId(fillId: string): Promise<Fill | null> {
+    // `fillId` is the primary key (`schema.prisma:127`), so this is a point
+    // lookup — it sits on the fill path and runs once per execution IB reports.
+    const row = await this.prisma.fill.findUnique({ where: { fillId } });
+
+    return row ? toFill(row) : null;
+  }
+
   async clear(): Promise<void> {
     await this.prisma.fill.deleteMany();
   }
@@ -441,6 +449,7 @@ export class PrismaRungRepository implements RungRepository {
         const data = {
           status: rung.status,
           lotId: rung.lotId,
+          workingOrderId: rung.workingOrderId,
           completedCycles: rung.completedCycles,
           lastExitAt: rung.lastExitAt,
         };
@@ -482,6 +491,7 @@ function toRung(row: {
   price: Prisma.Decimal;
   status: string;
   lotId: string | null;
+  workingOrderId: string | null;
   completedCycles: number;
   lastExitAt: string | null;
 }): Rung {
@@ -489,6 +499,7 @@ function toRung(row: {
     price: toNumber(row.price),
     status: row.status as RungStatus,
     lotId: row.lotId,
+    workingOrderId: row.workingOrderId,
     completedCycles: row.completedCycles,
     lastExitAt: row.lastExitAt,
   };

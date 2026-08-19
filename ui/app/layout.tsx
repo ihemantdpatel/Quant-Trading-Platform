@@ -20,6 +20,7 @@ import './globals.css';
 import { AlertBanner } from './components/AlertBanner';
 import { AutoRefresh } from './components/AutoRefresh';
 import { KillSwitch } from './components/KillSwitch';
+import { ReconcileButton } from './components/ReconcileButton';
 import { Tabs } from './components/Tabs';
 import { loadStatus } from './lib/api';
 
@@ -54,6 +55,8 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             reason={killSwitch?.reason ?? null}
             changedAt={killSwitch?.changedAt ?? null}
           />
+
+          <ReconcileButton lastRun={status?.orderReconciliation ?? null} />
 
           <Tabs />
 

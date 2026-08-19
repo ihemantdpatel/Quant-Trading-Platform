@@ -14,7 +14,13 @@
 import { Inject, Module, OnModuleInit } from '@nestjs/common';
 import { AppConfigModule } from '../config/config.module';
 import { AppConfigService } from '../config/app-config.service';
-import { ExecutionMode } from '../config/execution-mode';
+import {
+  PAPER_ACCOUNT_EQUITY,
+  PAPER_DAILY_LOSS_BASIS,
+  PAPER_ACCOUNT_CURRENCY,
+  PAPER_DAILY_LOSS_THRESHOLD,
+  PAPER_SYMBOL_CAPITAL,
+} from '../config/capital.config';
 import { KillSwitchService } from './kill-switch.service';
 import { RiskManagerService } from './risk-manager.service';
 import { buildRiskConfig, RiskConfig } from './risk.config';
@@ -24,6 +30,7 @@ import { assertStartupSafe, SymbolCapital } from './startup-assertions';
 export const RISK_CONFIG = Symbol('RISK_CONFIG');
 export const RISK_EVENT_SINK = Symbol('RISK_EVENT_SINK');
 export const SYMBOL_CAPITAL = Symbol('SYMBOL_CAPITAL');
+export const INSTRUMENT_CURRENCIES = Symbol('INSTRUMENT_CURRENCIES');
 
 /**
  * Optional token a higher layer binds to supply per-symbol capital.
@@ -33,6 +40,16 @@ export const SYMBOL_CAPITAL = Symbol('SYMBOL_CAPITAL');
  * pushes that down here. Unbound, per-symbol capital is empty.
  */
 export const SYMBOL_CAPITAL_SOURCE = Symbol('SYMBOL_CAPITAL_SOURCE');
+
+/**
+ * Optional token supplying the currency of each traded instrument, for the same
+ * reason and by the same route as `SYMBOL_CAPITAL_SOURCE`: the risk layer must
+ * not import a strategy to learn what it trades.
+ *
+ * Unbound, the currency check asserts nothing — which keeps every existing test
+ * that constructs a `RiskModule` unaffected.
+ */
+export const INSTRUMENT_CURRENCY_SOURCE = Symbol('INSTRUMENT_CURRENCY_SOURCE');
 
 /**
  * Nominal account equity used **only** in `SHADOW`, matching the mock broker's
@@ -46,23 +63,32 @@ export const SHADOW_NOMINAL_EQUITY = 100_000;
   providers: [
     {
       /**
-       * `dailyLossThreshold` stays deliberately unset until Story 13.
+       * Story 13's capital decisions (`capital.config.ts`,
+       * `docs/decisions/capital-allocation.md`).
        *
-       * `accountEquity` is different in kind: it is not an open PRD item but a
-       * figure the *broker* reports, and the global 60% cap is meaningless
-       * against zero — every intent would be rejected, so a SHADOW replay would
-       * verify nothing. In SHADOW it takes a nominal value matching the mock
-       * broker's equity; in PAPER/LIVE it stays zero here and the startup
-       * assertion refuses to boot until a real figure is wired from the broker
-       * (`startup-assertions.ts:109`).
+       * The per-mode split is gone with SHADOW (`execution-mode.ts`). Every
+       * mode now takes the real figures, which means the loss threshold and the
+       * capital limits are always enforced rather than skipped in the one mode
+       * that used to be exempt.
+       *
+       * The guard has not become decoration: `capital.config.spec.ts` still
+       * asserts that removing either value refuses PAPER, so reverting
+       * `capital.config.ts` fails the boot exactly as it did before.
+       *
+       * `accountEquity` is static by necessity: this factory is synchronous and
+       * `RiskModule.onModuleInit` asserts on its result, while the broker's
+       * equity is async and arrives only after a connection the HTTP server
+       * must never wait on. See the note in `capital.config.ts`.
        */
       provide: RISK_CONFIG,
-      useFactory: (appConfig: AppConfigService): RiskConfig =>
+      useFactory: (): RiskConfig =>
         buildRiskConfig({
-          accountEquity:
-            appConfig.executionMode === ExecutionMode.SHADOW ? SHADOW_NOMINAL_EQUITY : 0,
+          accountEquity: PAPER_ACCOUNT_EQUITY,
+          accountCurrency: PAPER_ACCOUNT_CURRENCY,
+          dailyLossThreshold: PAPER_DAILY_LOSS_THRESHOLD,
+          dailyLossBasis: PAPER_DAILY_LOSS_BASIS,
+          perSymbolLimits: PAPER_SYMBOL_CAPITAL,
         }),
-      inject: [AppConfigService],
     },
     {
       /**
@@ -95,6 +121,11 @@ export const SHADOW_NOMINAL_EQUITY = 100_000;
       inject: [{ token: SYMBOL_CAPITAL_SOURCE, optional: true }],
     },
     {
+      provide: INSTRUMENT_CURRENCIES,
+      useFactory: (source?: string[]): string[] => source ?? [],
+      inject: [{ token: INSTRUMENT_CURRENCY_SOURCE, optional: true }],
+    },
+    {
       provide: KillSwitchService,
       useFactory: (sink: RiskEventSink) => new KillSwitchService(sink),
       inject: [RISK_EVENT_SINK],
@@ -117,9 +148,15 @@ export class RiskModule implements OnModuleInit {
     private readonly appConfig: AppConfigService,
     @Inject(RISK_CONFIG) private readonly riskConfig: RiskConfig,
     @Inject(SYMBOL_CAPITAL) private readonly symbolCapital: SymbolCapital,
+    @Inject(INSTRUMENT_CURRENCIES) private readonly instrumentCurrencies: string[],
   ) {}
 
   onModuleInit(): void {
-    assertStartupSafe(this.appConfig.executionMode, this.riskConfig, this.symbolCapital);
+    assertStartupSafe(
+      this.appConfig.executionMode,
+      this.riskConfig,
+      this.symbolCapital,
+      this.instrumentCurrencies,
+    );
   }
 }

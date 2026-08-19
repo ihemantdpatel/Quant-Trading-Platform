@@ -181,6 +181,70 @@ export async function runReplay(fixture: string): Promise<ActionResult> {
   };
 }
 
+/**
+ * Re-runs startup reconciliation against the broker on demand.
+ *
+ * **The repair for state the engine could not learn about on its own.** An
+ * order cancelled in TWS, or a DAY order IB expired overnight, leaves a rung
+ * marked `WORKING` with nothing behind it whenever the status arrived while
+ * this process was not the one that placed the order. Reconciliation already
+ * resolves exactly that; until now it ran only at boot, so the fix was a
+ * daemon restart mid-session.
+ *
+ * **This runs the full sequence and can therefore halt a symbol.** The lot-sum
+ * assertion is part of it, so a ladder whose lots genuinely disagree with the
+ * broker's position will stop trading as a result of pressing this — which is
+ * the correct outcome, but not a silent one. The message says so, and the
+ * halts it raises appear in the alert banner above.
+ *
+ * Nothing here can place an order or close a position; `reconcileAll` has no
+ * path to either.
+ */
+export async function reconcileNow(): Promise<ActionResult> {
+  const result = await post<{
+    clean: boolean;
+    haltedSymbols: string[];
+    symbols: { symbol: string }[];
+    ordersUpdated: number;
+  }>('/reconcile', {});
+
+  revalidatePath('/', 'layout');
+
+  if (!result.ok) {
+    const { message, failures } = describe(result.error);
+    return { ok: false, message, failures };
+  }
+
+  const halted = result.data?.haltedSymbols ?? [];
+  const corrected = result.data?.ordersUpdated ?? 0;
+
+  // Reported even alongside a halt: an order row corrected from the broker's
+  // history is the visible half of the fix an operator pressed this for, and
+  // silence about it reads as nothing having happened.
+  const orderNote =
+    corrected > 0 ? ` ${corrected} stale order row(s) corrected from broker history.` : '';
+
+  // A halt is reported as the failure it is rather than as a successful run,
+  // so an operator never reads "reconciled" over a symbol that just stopped
+  // trading.
+  if (halted.length > 0) {
+    return {
+      ok: false,
+      message:
+        `Reconciled — ${halted.length} symbol(s) HALTED and will not trade until released.` +
+        orderNote,
+      failures: halted,
+    };
+  }
+
+  return {
+    ok: true,
+    message:
+      `Reconciled ${result.data?.symbols?.length ?? 0} symbol(s) against the broker — clean.` +
+      orderNote,
+  };
+}
+
 export async function resetEngine(): Promise<ActionResult> {
   const result = await post('/engine/reset', {});
 

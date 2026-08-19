@@ -1,4 +1,10 @@
-import { buildDipLadderConfig, DEFAULT_DIP_LADDER_CONFIG, ExitMode, SpacingMode } from './config';
+import {
+  buildDipLadderConfig,
+  DEFAULT_DIP_LADDER_CONFIG,
+  ExitMode,
+  OrderPlacement,
+  SpacingMode,
+} from './config';
 
 describe('dip ladder config', () => {
   describe('defaults', () => {
@@ -13,6 +19,9 @@ describe('dip ladder config', () => {
         atrPeriod: 14,
         takeProfitPercent: 0.05,
         exitMode: ExitMode.PER_LOT,
+        // Defaults to the bar-close rule the fixtures' expected intents were
+        // computed under. The live engine selects RESTING explicitly.
+        orderPlacement: OrderPlacement.IMMEDIATE,
         sizePerRung: 0.25,
         escalationFactor: 1,
         maxConcurrentRungs: 5,

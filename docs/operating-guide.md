@@ -11,24 +11,30 @@ You do not need to understand the code to operate this system. You do need to un
 vocabulary, because the words are precise and two that sound similar often mean very different
 things.
 
-> ### The single most important fact
+> ### The single most important fact — THIS HAS CHANGED
 >
-> This system is currently in **SHADOW** mode. It watches the market, decides what it _would_ buy
-> and sell, and writes those decisions down. **It does not send any order to any broker. No real
-> money moves.** This is deliberate and is enforced in several independent places in the code.
+> This system is now in **PAPER** mode, and it **does send orders to Interactive Brokers.** They go
+> to a _paper_ account — IB's simulated-money account — so **no real money moves.** But orders are
+> genuinely transmitted, they sit at the broker waiting to be filled, and they stay there when you
+> shut the system down.
 >
-> Nothing in this guide will change that. Turning real trading on is a separate, deliberate project
-> step ("Story 13") that has not happened yet and is blocked by safety checks that refuse to start
-> the system without values a human must decide first.
+> **The old "SHADOW" mode, which sent nothing at all, has been removed.** If you have operated this
+> system before, the safety net you were relying on is gone. The system will now refuse to start if
+> you set `EXECUTION_MODE=SHADOW`.
+>
+> What still protects you: the account is a paper account, real-money `LIVE` mode remains blocked,
+> and there are caps, a loss breaker, a kill switch, and a reconciliation check on every restart.
+> What no longer protects you: the mode itself.
 
 ---
 
 ## If you only remember three things
 
-1. **Nothing here trades real money.** The system is in SHADOW mode — it writes down decisions and
-   sends nothing to any broker.
+1. **No real money — but real orders.** The system trades a _paper_ (simulated-money) account at IB.
+   Orders really are sent and really do rest at the broker; the money is not real.
 2. **When in doubt, hit the kill switch, then stop the system.** Both are instant, reversible, and
-   neither one sells anything.
+   neither one sells anything. But see §4: **stopping the system does not cancel orders already
+   resting at the broker.**
 3. **"Halt" never means "sold."** A halt stops future activity and leaves everything you hold
    exactly as it is.
 
@@ -82,8 +88,17 @@ They are started together with one command. See [Starting and stopping](#4-start
             ↓
    The risk manager checks it against every safety rule          ← can approve, shrink, or refuse
             ↓
-   The broker would receive the order                            ← BLOCKED in SHADOW mode. Nothing is sent.
+   The broker receives the order                                 ← REALLY SENT (paper account)
+            ↓
+   The order RESTS at IB, waiting for the price to reach $50     ← may wait minutes, hours, or never
+            ↓
+   IB reports a FILL                                             ← only now do you own anything
 ```
+
+**The last two steps are new and they change how you read the dashboard.** The system no longer buys
+the moment it decides to. It places an order at a price and waits for the market to come to it. So
+"the system decided to buy" and "the system owns shares" are now separated by an unpredictable gap —
+possibly the whole day, possibly forever if the price never gets there.
 
 The important structural fact: **the strategy cannot reach the broker directly.** It is not merely
 discouraged — it is impossible in the code. Everything must pass the risk manager. This is why the
@@ -120,24 +135,26 @@ only uses words already defined above it.
 
 These are the ones that cause misunderstandings. Read them carefully.
 
-| Term               | What it means **here**                                                                                                                                                                       |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Intent**         | A decision the strategy made — "I would like to buy". It is **not** an order and **not** a trade. In SHADOW mode, intents are all that ever happen. Think of it as a written recommendation. |
-| **Execution mode** | Which of three behaviours the system is in: SHADOW, PAPER, or LIVE. See below.                                                                                                               |
-| **SHADOW**         | **Current mode.** Decisions are recorded; nothing is sent to the broker. No money moves.                                                                                                     |
-| **PAPER**          | Orders go to IB's practice account using fake money. Realistic, but not real. **Not enabled yet.**                                                                                           |
-| **LIVE**           | Real orders, real money. **Not enabled yet.**                                                                                                                                                |
-| **Halt**           | Trading has been stopped. Crucially, a halt **never sells anything**. It stops future activity and leaves what you hold exactly as it is.                                                    |
-| **Entry halt**     | A halt that stops **buying** but still allows **selling** (so profits can still be taken).                                                                                                   |
-| **Symbol halt**    | A stricter halt on one symbol that stops **both** buying and selling. Used when the system is not certain what it owns.                                                                      |
-| **Kill switch**    | A big manual "stop" you control. Blocks all new order submission immediately. Does not sell.                                                                                                 |
-| **Reconciliation** | The startup check where the system compares its own records against what the broker says you actually own. See §2.4 — this is the most important safety concept here.                        |
-| **Storage**        | Whether the system is writing to the database (`DURABLE`, survives restarts) or just memory (`IN_MEMORY`, everything lost when it stops).                                                    |
-| **Strategy**       | A set of trading rules. Only one is active: the "dip ladder".                                                                                                                                |
-| **Backtest**       | Replaying past market data to see how the strategy _would_ have performed. Never touches a broker.                                                                                           |
-| **Fixture**        | A small, fixed, pre-recorded set of fake price data used for testing. Deterministic — always produces the same result.                                                                       |
-| **Soak**           | A trial run: leaving the system running in SHADOW for a full week to prove it behaves correctly before anything real is considered.                                                          |
-| **Anomaly**        | Something the daily report flagged as unexpected. Not automatically a disaster, but every one must be explained.                                                                             |
+| Term               | What it means **here**                                                                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Intent**         | A decision the strategy made — "I would like to buy". It is **not** an order and **not** a trade. It is the record of the decision; an order is what gets sent because of it.              |
+| **Execution mode** | Which behaviour the system is in: PAPER or LIVE. (SHADOW was a third; it has been removed.) See below.                                                                                     |
+| **PAPER**          | **Current mode.** Orders go to IB's practice account using fake money. Realistic, but not real money.                                                                                      |
+| **SHADOW**         | **Removed.** Formerly: decisions recorded, nothing sent. The system now **refuses to start** if set to SHADOW. You may still see the word on old records and in historic daily reports.    |
+| **LIVE**           | Real orders, real money. **Not enabled.** Still blocked.                                                                                                                                   |
+| **Resting order**  | An order sitting at the broker, waiting for the price to reach it. It is live exposure: it can fill at any moment without the system deciding anything further. **It survives a restart.** |
+| **Working**        | The dashboard's word for a rung that has a resting order at it. The level is committed but you do not own shares there **yet**.                                                            |
+| **Halt**           | Trading has been stopped. Crucially, a halt **never sells anything**. It stops future activity and leaves what you hold exactly as it is.                                                  |
+| **Entry halt**     | A halt that stops **buying** but still allows **selling** (so profits can still be taken).                                                                                                 |
+| **Symbol halt**    | A stricter halt on one symbol that stops **both** buying and selling. Used when the system is not certain what it owns.                                                                    |
+| **Kill switch**    | A big manual "stop" you control. Blocks all new order submission immediately. Does not sell.                                                                                               |
+| **Reconciliation** | The startup check where the system compares its own records against what the broker says you actually own. See §2.4 — this is the most important safety concept here.                      |
+| **Storage**        | Whether the system is writing to the database (`DURABLE`, survives restarts) or just memory (`IN_MEMORY`, everything lost when it stops).                                                  |
+| **Strategy**       | A set of trading rules. Only one is active: the "dip ladder".                                                                                                                              |
+| **Backtest**       | Replaying past market data to see how the strategy _would_ have performed. Never touches a broker.                                                                                         |
+| **Fixture**        | A small, fixed, pre-recorded set of fake price data used for testing. Deterministic — always produces the same result.                                                                     |
+| **Soak**           | A trial run: leaving the system running for a full trading week to prove it behaves correctly before anything real is considered. Now run in PAPER, against the practice account.          |
+| **Anomaly**        | Something the daily report flagged as unexpected. Not automatically a disaster, but every one must be explained.                                                                           |
 
 ### 2.3 Dip-ladder vocabulary
 
@@ -178,9 +195,26 @@ broker said 25, any attempt to fix it automatically would be a guess about which
 guessing wrong means selling the wrong lot at the wrong price on an investment that moves 3x. So it
 stops and asks a human. **Your positions are safe during a halt.** They are held, never sold.
 
-> **Expected in SHADOW:** because SHADOW never actually buys anything, the database records lots the
-> broker has never heard of. So restarting while the ladder holds lots **will** halt on this check.
-> This is the system working correctly, not a bug.
+> **This expectation has flipped.** Under the old SHADOW mode nothing was ever really bought, so the
+> database recorded lots the broker had never heard of and restarting with held lots **always**
+> halted here — routine, and something you were told to expect and move past.
+>
+> **In PAPER, every lot comes from a real fill, so the two should now agree.** A halt on this check is
+> a genuine finding. Do not wave it through. Investigate it before releasing.
+
+**Restarting also checks orders left resting at the broker**, which is a second thing that can now
+diverge. The system asks IB which orders are still working and compares that against its own record:
+
+- **Its record says an order is resting, IB says it is not** — the order expired at the close or was
+  cancelled by hand in TWS. The system frees that rung so it can be used again.
+- **IB has an order the system does not know about** — the order reached IB just as the system
+  crashed. It adopts it, so it knows the level is taken. Without this it would place a _second_ order
+  at the same price and both would fill.
+
+**It never cancels an order it cannot explain** — it reports it. An order you placed yourself by hand
+is not something the system will quietly delete. And if IB cannot be reached at all, it changes
+nothing and leaves its records as they are, because "I could not ask" is not the same as "there is
+nothing there".
 
 ### 2.5 Status words you'll see
 
@@ -290,7 +324,7 @@ curl localhost:3000/health
 | ------------ | ---- | ------------------------------------------------------------------------------------------------------- |
 | `ui`         | 3001 | The dashboard you look at                                                                               |
 | `backend`    | 3000 | The brain                                                                                               |
-| `mysql`      | 3306 | The database                                                                                            |
+| `mysql`      | 3307 | The database (3307 on the host to avoid a local MySQL on 3306; `MYSQL_HOST_PORT` overrides)             |
 | `ib-gateway` | —    | Optional. Only starts with `--profile ib-gateway`; normally you run IB Gateway as a desktop app instead |
 
 ### Settings
@@ -302,11 +336,15 @@ Interactive Brokers" section.
 
 The settings worth recognising:
 
-- `EXECUTION_MODE` — **`SHADOW` is the line that keeps this system from trading.** Do not change it.
+- `EXECUTION_MODE` — `PAPER` is the current and only working value. `LIVE` means real money and is
+  blocked by safety checks. `SHADOW` is removed and the system will refuse to start. **Do not
+  change this setting.**
+- `IB_PORT` — **4002 = practice account, 4001 = real account.** It is set to 4002 on purpose. Now
+  that orders are genuinely sent, **this is the setting that decides whether money is real.** Treat
+  it with more care than any other line in the file.
 - `DATABASE_URL` — present means the database is in use (`DURABLE`). Absent means memory only.
 - `IB_HOST` — present means connect to real IB. **Absent means run on test data**, which is the
   default and the safe starting point.
-- `IB_PORT` — **4002 = practice account, 4001 = real account.** It is set to 4002 on purpose.
 
 ---
 
@@ -329,22 +367,50 @@ Always visible, even if everything else fails to load.
 
 ### Status bar
 
-| Field                | How to read it                                                                                                                                               |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Broker**           | Green = connected. Red = not. Shows which broker and its state.                                                                                              |
-| **Open positions**   | What you hold. "flat" = nothing.                                                                                                                             |
-| **Deployed at cost** | Total spent on lots currently held.                                                                                                                          |
-| **Realized P&L**     | Profit actually banked from closed lots. Green = up.                                                                                                         |
-| **Account equity**   | Shows **"not set"** — deliberately. The figure it would be measured against is the unset Story 13 value. A blank is honest; an invented number would not be. |
+| Field                | How to read it                                                                                                                                                                                       |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Broker**           | Green = connected. Red = not. Shows which broker and its state.                                                                                                                                      |
+| **Open positions**   | What you hold. "flat" = nothing.                                                                                                                                                                     |
+| **Deployed at cost** | Total spent on lots currently held.                                                                                                                                                                  |
+| **Realized P&L**     | Profit actually banked from closed lots. Green = up.                                                                                                                                                 |
+| **Account equity**   | Still displays **"not set"** on the dashboard. The figure _is_ now set in the code (USD 175,000, see §9), but this panel has not been updated to read it. Cosmetic — the cap is enforced regardless. |
 
 ### Mode / Engine controls / Strategies
 
-Current execution mode (expect `SHADOW`), replay controls for test data, and the list of strategies.
+Current execution mode (expect `PAPER`), replay controls for test data, and the list of strategies.
 Expect only `dip-ladder` enabled; grid, wheel, and leaps are intentionally off.
+
+### Reconcile button (top right, in the header)
+
+**New.** Re-checks the system's records against the broker, on demand. It sits in the header rather
+than with the engine controls because those are hidden whenever a real broker is connected — and this
+button is least useful against test data and most useful against a live Gateway.
+
+It asks you to confirm first, and that step is not ceremony. See
+[§6](#reconcile-when-the-dashboard-and-tws-disagree) before pressing it.
+
+Under the button, when the scheduled evening job has run, you'll see when it last ran and what it
+found. "Not yet run" means scheduled but not yet due — not "ran and found nothing".
+
+### Pending orders
+
+**New, and the first panel to read.** It lists orders resting at the broker _right now_ — what is
+live, as opposed to what happened earlier. Each row shows the side, the shares still outstanding, the
+price it is waiting at, and **Working** or **Partial**.
+
+This is deliberately separate from the activity log below it. The log is capped and scrolls, so a
+resting order placed early in a busy day would scroll out of sight — and that is precisely the order
+you most need to see. This panel is not capped, because the ladder itself limits it to at most five.
+
+An empty list means nothing is waiting at the broker. It does **not** mean nothing is held — held
+shares appear in the lot table.
 
 ### Ladder view and lot table
 
-- **Ladder view** — the rungs, their prices, and which are waiting, held, or re-armed.
+- **Ladder view** — the rungs, their prices, and which are waiting, working, held, or re-armed.
+  **"Working" (amber) is the new one and the one to understand**: an order is resting at that price
+  and may fill at any moment. It is not "held" — you own nothing there yet — but it is not idle
+  either, because capital is already committed to it. The header counts working rungs separately.
 - **Lot table** — every purchase individually: what it cost, its frozen exit target, and its
   profit/loss. Each row is one lot with its own target. This is the strategy made visible.
 
@@ -354,8 +420,10 @@ Lets you change strategy settings while running. See the warning in [§6](#6-the
 
 ### Activity log
 
-The running history: orders, fills, and every risk decision. In SHADOW, an entry here is a _record
-of a decision_, not evidence that anything was sent.
+The running history: orders, fills, and every risk decision. **These entries are now evidence that
+something really was sent** to the paper account — which was not true under the old SHADOW mode,
+where they were only records of decisions. For what is live right now rather than what already
+happened, read the Pending orders panel above.
 
 ---
 
@@ -367,17 +435,23 @@ of a decision_, not evidence that anything was sent.
 
 - **What it does:** blocks all new order submission immediately.
 - **What it does NOT do:** it does not sell anything and does not close positions.
+- **What it also does NOT do — important now:** it does **not** cancel orders already resting at the
+  broker. Those stay at IB and can still fill. The kill switch stops _new_ orders being placed.
 - **To use:** optionally type a reason, click **Engage kill switch**.
 - **To undo:** click **Release**.
 
-There is no penalty for engaging it unnecessarily. In SHADOW it is belt-and-braces, since nothing is
-being submitted anyway.
+There is no penalty for engaging it unnecessarily.
+
+> **If you need to stop a resting order from filling, the kill switch is not enough** — and neither
+> is stopping the system, which also leaves them at IB. Cancel the order in IB's own software (TWS
+> or the Gateway's order window). This is deliberate: the system will not cancel orders it cannot
+> explain, and that restraint cuts both ways.
 
 ### Mode switch — do not touch
 
-Leave on `SHADOW`. Attempts to select PAPER or LIVE will be **refused by the backend**, which lists
-the specific missing safety values. That refusal is the system working. Do not attempt to work
-around it.
+Leave on `PAPER`. Selecting `LIVE` will be **refused by the backend**, which lists the specific
+safety values it is missing. Selecting `SHADOW` will also be refused — that mode has been removed.
+Those refusals are the system working. Do not attempt to work around them.
 
 ### Parameter editor — careful, but safer than it looks
 
@@ -396,6 +470,42 @@ A halted symbol stays halted until a human releases it. Only do this once you un
 halted and have confirmed the underlying disagreement is resolved. Releasing a halt without
 resolving the cause reintroduces exactly the risk the halt existed to prevent.
 
+### Reconcile — when the dashboard and TWS disagree
+
+**Press this when a rung shows "Working" but no such order exists in TWS.** That happens when you
+cancel an order by hand, or when an order that was placed before the last restart went away without
+this system being able to attribute the news to a rung. The level stays blocked until reconciliation
+clears it, and before this button existed the only fix was restarting the daemon mid-session.
+
+It also corrects order rows that still read as live when the broker says they are finished — so
+the activity log stops showing an order that no longer exists anywhere.
+
+**Two things to know before pressing it:**
+
+1. **It can halt a symbol.** It re-runs the full check, including the position comparison. If your
+   recorded lots genuinely disagree with the broker's position, that symbol stops trading. That is
+   the correct outcome — but it is not a silent one, so do not press this expecting a harmless
+   refresh.
+2. **It reloads lots and rungs from the database over what is in memory.** Normally identical. The
+   exception is a symbol that is already halted, where saving is deliberately suppressed.
+
+It cannot place an order, cancel one, or sell anything. There is no path from this button to a trade.
+
+### The evening reconciliation — automatic, nothing to do
+
+**Fifteen minutes after the 16:00 ET close, the system reconciles orders by itself.** Day orders
+expire at the close, and without this the next morning would open with those expired orders still
+recorded as blocked levels.
+
+This runs only when the system is connected to IB. On built-in test data there is nothing for it to
+check, so you will not see it there.
+
+It checks **orders only, never positions** — deliberately. A position check can halt a symbol, and a
+halt raised at 16:15 with nobody watching would leave you with a dead ladder discovered the next
+morning. If the broker happens to be unreachable, this job changes nothing and tries again tomorrow.
+
+You'll see its result under the Reconcile button. There is nothing to do unless it reports a problem.
+
 ### Engine reset — test data only
 
 Clears engine state. It deliberately does **not** clear the parameter audit trail, and does **not**
@@ -405,7 +515,7 @@ release symbol halts.
 
 ## 7. The daily routine
 
-While the system is in its SHADOW trial week, do this at or after **16:00 ET** each trading day.
+While the system is in its PAPER trial week, do this at or after **16:00 ET** each trading day.
 
 **1. Pull the day's report:**
 
@@ -415,13 +525,17 @@ curl "localhost:3000/reports/daily?date=$(date +%F)" | jq
 
 **2. Check the fields, in this order of importance:**
 
-| Field                      | What you want             | If not                                                                                  |
-| -------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
-| `intents.submitted`        | **0** — always, in SHADOW | **Stop immediately.** Anything else means the core guarantee has been broken. Escalate. |
-| `clean`                    | `true`                    | Read `anomalies`; log every one                                                         |
-| `storage`                  | `DURABLE`                 | The day's record may be incomplete                                                      |
-| `rungVerification.skipped` | `false`                   | A skip is **not** a pass — that day cannot count                                        |
-| `reconciliation.clean`     | `true`                    | Expected `false` in SHADOW if the ladder holds lots — see §2.4                          |
+| Field                      | What you want                 | If not                                                                              |
+| -------------------------- | ----------------------------- | ----------------------------------------------------------------------------------- |
+| `clean`                    | `true`                        | Read `anomalies`; log every one                                                     |
+| `reconciliation.clean`     | `true`                        | **Now a real finding.** This used to be expected-false; in PAPER it should be true. |
+| `intents.submitted`        | **non-zero on an active day** | Zero on a day the ladder fired means orders are not reaching IB — investigate.      |
+| `storage`                  | `DURABLE`                     | The day's record may be incomplete                                                  |
+| `rungVerification.skipped` | `false`                       | A skip is **not** a pass — that day cannot count                                    |
+
+> **`intents.submitted` has reversed meaning.** Under SHADOW it had to be **0** every single day, and
+> anything else was the worst thing the report could say. In PAPER, submission is the expected
+> behaviour and a _zero_ on a day the ladder fired is the thing worth investigating.
 
 **3. Record the day in `docs/soak-log.md`** — including clean days. A clean day is evidence and
 belongs in the record.
@@ -439,20 +553,50 @@ record for this process.
 **The universal first answer: engage the kill switch.** It is free, instant, reversible, and never
 sells anything. Then work out what happened.
 
-| What you see             | What it means                                                               | What to do                                                                                                      |
-| ------------------------ | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `BACKEND_UNREACHABLE`    | The dashboard can't reach the brain. The brain may still be running fine.   | Check the Terminal window is still open. Panels below may be stale — don't trust them.                          |
-| `BROKER_DISCONNECTED`    | Lost the connection to IB.                                                  | Check IB Gateway is open **and logged in**. It retries automatically. Positions are untouched.                  |
-| `ENTRY_HALT`             | Buying stopped; selling still allowed.                                      | Read the reason on the banner. Positions are held, not sold.                                                    |
-| Symbol halt              | That symbol trades in **neither** direction. Usually reconciliation (§2.4). | Investigate before releasing. **Expected in SHADOW after restarting with held lots.**                           |
-| Broker state `FAILED`    | Retries exhausted.                                                          | Needs a human. New buys halted; nothing sold.                                                                   |
-| `dataStale: true`        | Still connected but prices stopped arriving.                                | Treat seriously — everything _looks_ fine while decisions run on old prices. New buys are halted automatically. |
-| Storage says `IN_MEMORY` | Nothing is being saved.                                                     | Stop and get help before running a session you need a record of.                                                |
-| `SUBMISSION_IN_SHADOW`   | An intent was recorded as submitted while in SHADOW.                        | **Most serious thing here.** Engage kill switch, stop the system, escalate.                                     |
+| What you see                                                      | What it means                                                                                          | What to do                                                                                                             |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `BACKEND_UNREACHABLE`                                             | The dashboard can't reach the brain. The brain may still be running fine.                              | Check the Terminal window is still open. Panels below may be stale — don't trust them.                                 |
+| `BROKER_DISCONNECTED`                                             | Lost the connection to IB.                                                                             | Check IB Gateway is open **and logged in**. It retries automatically. Positions are untouched.                         |
+| `ENTRY_HALT`                                                      | Buying stopped; selling still allowed.                                                                 | Read the reason on the banner. Positions are held, not sold.                                                           |
+| Symbol halt                                                       | That symbol trades in **neither** direction. Usually reconciliation (§2.4).                            | Investigate before releasing. **No longer routine** — in PAPER this should not normally happen.                        |
+| Broker state `FAILED`                                             | Retries exhausted.                                                                                     | Needs a human. New buys halted; nothing sold.                                                                          |
+| `dataStale: true`                                                 | Still connected but prices stopped arriving.                                                           | Treat seriously — everything _looks_ fine while decisions run on old prices. New buys are halted automatically.        |
+| `broker.dataErrors` set                                           | IB rejected the price subscription — often a missing market-data entitlement.                          | This is usually _why_ `dataStale` is true. Check the subscription on your IB account.                                  |
+| Storage says `IN_MEMORY`                                          | Nothing is being saved.                                                                                | Stop and get help before running a session you need a record of.                                                       |
+| `RETIRED_MODE`                                                    | A report says the session ran in SHADOW, which no longer exists.                                       | If the report is for an **old** date, it is history and fine. For **today**, the mode config is wrong — escalate.      |
+| `RESTING_ORDER_REJECTED`                                          | IB refused an order the ladder placed at a rung.                                                       | Read the reason. The rung is freed automatically; nothing is held that shouldn't be.                                   |
+| Rung shows **Working**, TWS shows no such order                   | The system did not learn the order went away — usually cancelled by hand, or expired before a restart. | Press **Reconcile** ([§6](#reconcile-when-the-dashboard-and-tws-disagree)). The evening job also fixes this by itself. |
+| Symbol halted, and it holds shares the system has **no lots for** | An order filled while the daemon was down and the fill was missed.                                     | See [Recovering a stranded position](#recovering-a-stranded-position) below. Do not release the halt first.            |
 
 **A connected-but-silent feed is more dangerous than a disconnection.** A disconnection is obvious;
 a stale feed looks completely healthy while decisions are made on outdated prices. That is why it
 has its own alert.
+
+### Recovering a stranded position
+
+**The situation:** a symbol is halted, the broker shows real shares, and the system has no lots
+recorded for them. This happens when a buy order filled at IB while the daemon was down. The engine
+now recovers such fills by itself when it can — but IB only replays the **current day's** executions,
+so once that window passes the fill prices are gone from the wire and it cannot.
+
+There is a script for exactly this case. It reconstructs the lots from the orders the system did
+record, using each order's own limit price as its fill price — which errs slightly **high**, meaning
+those lots are held marginally longer and can never be sold below a true take-profit.
+
+```bash
+# Report only — writes nothing:
+npm run recover:lots -- --symbol TQQQ --broker-quantity 400 --average-cost 61.20
+
+# Write the lots, once the report looks right:
+npm run recover:lots -- --symbol TQQQ --broker-quantity 400 --average-cost 61.20 --apply
+```
+
+Read the report before adding `--apply`. The script **refuses** rather than guesses if the symbol is
+not halted for this reason, if any lot is already recorded, or if the reconstructed shares do not sum
+**exactly** to the broker's position — a leftover means shares nobody can account for, and then the
+answer is genuinely unknown and needs a human.
+
+Release the halt only after the recovered lots and the broker's position agree.
 
 ---
 
@@ -460,7 +604,10 @@ has its own alert.
 
 These are enforced in code and covered by automated tests, not merely intended:
 
-1. **In SHADOW, nothing reaches a broker.** Multiple independent checks.
+1. **No real money is at risk.** Orders go to IB's _paper_ account, and `LIVE` is blocked by startup
+   checks that refuse to run without values a human has deliberately set.
+   _(This replaces the old guarantee "in SHADOW, nothing reaches a broker" — orders **do** now reach
+   a broker. The protection is the paper account and the `LIVE` block, not the mode.)_
 2. **A technical fault never becomes a sale.** Disconnections, timeouts, exhausted retries — all
    halt new buying and leave positions alone. **No code path can automatically sell your positions.**
 3. **Lots only ever sell in profit.** No stop-loss exists anywhere.
@@ -471,20 +618,28 @@ These are enforced in code and covered by automated tests, not merely intended:
 7. **The dashboard stays up when the broker goes down.** Deliberate: an outage is exactly when you
    need to see the screen.
 8. **Every safety check reports a specific reason** — never a bare failure.
+9. **A restart cannot duplicate an order.** Orders resting at IB are checked against the system's own
+   records on every startup, so it cannot place a second order at a level that already has one.
+10. **The system never cancels an order it cannot explain.** An order you placed by hand is reported,
+    not deleted.
 
 ---
 
 ## 10. Things you must never do
 
-1. **Never change `EXECUTION_MODE` from `SHADOW`.** This is the line preventing real trading.
-2. **Never change `IB_PORT` to 4001.** That points at the real-money account. 4002 is the practice one.
+1. **Never change `IB_PORT` to 4001.** That points at the real-money account; 4002 is the practice
+   one. **This is now the single most dangerous line in the settings** — orders are really sent, so
+   this setting alone decides whether the money is real.
+2. **Never change `EXECUTION_MODE` from `PAPER`.** `LIVE` means real money.
 3. **Never set `READ_ONLY_API=no`.** It is a second lock beneath the first.
 4. **Never work around a refused mode switch.** The refusal names missing safety values a human must set.
 5. **Never release a symbol halt you don't understand.** The halt is protecting you from a real disagreement.
-6. **Never fill in `symbolCapital` to "make an error go away."** It is blank because a human must
-   decide it deliberately.
-7. **Never delete the database volume** unless you intend to lose all position history.
-8. **Never run two copies at once against the same IB client id** — IB drops both connections.
+6. **Never edit the capital figures to "make an error go away."** They are deliberate decisions
+   recorded in `docs/decisions/`; changing one changes how much real exposure the ladder takes.
+7. **Never assume stopping the system cancels its orders.** Orders resting at IB survive shutdown.
+   Cancel them in TWS if you truly need them gone.
+8. **Never delete the database volume** unless you intend to lose all position history.
+9. **Never run two copies at once against the same IB client id** — IB drops both connections.
 
 If something suggests doing any of these, stop and ask.
 
@@ -495,12 +650,17 @@ If something suggests doing any of these, stop and ask.
 **In an emergency, in order:** engage the kill switch → `docker compose down` → ask for help.
 Stopping the system is always safe. Nothing is sold when it stops.
 
+**One caveat now:** stopping the system does not cancel orders already resting at IB. They stay and
+can still fill. If that matters for the emergency you are in, cancel them in TWS as well.
+
 Useful commands:
 
 ```bash
 curl localhost:3000/health                       # is it alive?
 curl localhost:3000/status | jq                  # full state: mode, broker, halts, storage
 curl localhost:3000/lots | jq                    # what is held
+curl localhost:3000/orders | jq                  # orders sent, incl. what is resting at IB
+curl localhost:3000/rungs | jq                   # ladder levels; "WORKING" = order resting there
 curl "localhost:3000/reports/daily?date=$(date +%F)" | jq   # today's report
 docker compose logs backend --tail 100           # recent backend log
 ```
@@ -530,11 +690,17 @@ All are safe to call — they only read.
 
 Prefer the dashboard buttons over these.
 
-`POST /kill-switch` · `/engine/replay` · `/engine/reset` · `/strategies/:id/enable|disable` ·
-`/mode` · `/parameters/:strategyId` · `/halts/:symbol/release` · `/backtest`
+`POST /kill-switch` · `/engine/replay` · `/engine/reset` · `/reconcile` ·
+`/strategies/:id/enable|disable` · `/mode` · `/parameters/:strategyId` · `/halts/:symbol/release` ·
+`/backtest`
+
+`POST /reconcile` is what the Reconcile button calls. It reads from the broker and corrects records —
+it never places, cancels, or sells anything — but it **can halt a symbol**. See
+[§6](#reconcile-when-the-dashboard-and-tws-disagree).
 
 ---
 
-**Current status:** SHADOW mode, no real orders. The trial week ("soak") has not yet started —
-`docs/soak-log.md` records it once it does. Real trading remains gated behind that week completing
-and behind safety values nobody has set yet.
+**Current status:** PAPER mode against IB's practice account. Orders **are** sent and rest at the
+broker; the money is simulated. The trial week ("soak") has not yet started — `docs/soak-log.md`
+records it once it does. Real-money trading (`LIVE`) remains gated behind that week completing and
+behind a review of the capital figures in `docs/decisions/`.

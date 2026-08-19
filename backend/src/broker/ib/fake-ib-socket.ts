@@ -24,11 +24,14 @@ import {
   BrokerOrder,
   BrokerPosition,
   Fill,
+  CompletedOrder,
+  OpenOrder,
   OrderAck,
   OrderStatus,
 } from '../broker-adapter.interface';
 import {
   CommissionCorrection,
+  DataErrorEvent,
   DisconnectEvent,
   DisconnectReason,
   HistoricalRequest,
@@ -64,6 +67,8 @@ export class FakeIbSocket implements IbSocket {
   /** Seeded bars, keyed by `symbol|barSize`. */
   private readonly bars = new Map<string, Bar[]>();
   private positions: BrokerPosition[] = [];
+  private openOrders: OpenOrder[] = [];
+  private completedOrders: CompletedOrder[] = [];
   private summary: AccountSummary = { equity: 100_000, availableFunds: 100_000, currency: 'USD' };
 
   /** Set to make the next historical request reject. */
@@ -74,6 +79,10 @@ export class FakeIbSocket implements IbSocket {
   private readonly statusHandlers = new Set<(ack: OrderAck) => void>();
   private readonly commissionHandlers = new Set<(report: CommissionCorrection) => void>();
   private readonly disconnectHandlers = new Set<(event: DisconnectEvent) => void>();
+  private readonly dataErrorHandlers = new Set<(event: DataErrorEvent) => void>();
+
+  /** Every execution emitted this session, for `replayExecutions`. */
+  private readonly executions: Fill[] = [];
 
   private orderSequence = 0;
 
@@ -147,6 +156,18 @@ export class FakeIbSocket implements IbSocket {
     this.orderSequence += 1;
     this.placedOrders.push({ ...order });
 
+    // A placed order rests until something fills or cancels it — which is what
+    // makes it visible to `getOpenOrders` and therefore to reconciliation.
+    this.openOrders.push({
+      clientOrderId: order.clientOrderId,
+      brokerOrderId: `ib-${this.orderSequence}`,
+      symbol: order.contract.symbol,
+      side: order.side,
+      quantity: order.quantity,
+      filledQuantity: 0,
+      limitPrice: order.limitPrice,
+    });
+
     const ack: OrderAck = {
       clientOrderId: order.clientOrderId,
       brokerOrderId: `ib-${this.orderSequence}`,
@@ -159,6 +180,8 @@ export class FakeIbSocket implements IbSocket {
   }
 
   async cancelOrder(clientOrderId: string): Promise<OrderAck> {
+    this.openOrders = this.openOrders.filter((order) => order.clientOrderId !== clientOrderId);
+
     const ack: OrderAck = {
       clientOrderId,
       brokerOrderId: `ib-cancel-${clientOrderId}`,
@@ -168,6 +191,45 @@ export class FakeIbSocket implements IbSocket {
     this.statusHandlers.forEach((h) => h({ ...ack }));
 
     return ack;
+  }
+
+  /**
+   * Orders left working by `placeOrder` and not yet filled or cancelled.
+   *
+   * Seedable directly (`seedOpenOrders`) so a test can model the case that
+   * matters most and is otherwise unreachable offline: an order placed by a
+   * *previous* process that is still resting at IB when this one boots.
+   */
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    if (!this.connected) {
+      throw new Error('not connected');
+    }
+
+    return this.openOrders.map((order) => ({ ...order }));
+  }
+
+  /**
+   * IB's terminal-order history for the day.
+   *
+   * Seedable (`seedCompletedOrders`) for the same reason `getOpenOrders` is:
+   * the case that matters is an order this process never saw complete, which
+   * cannot be produced by driving this fake through a normal placement.
+   */
+  async getCompletedOrders(): Promise<CompletedOrder[]> {
+    if (!this.connected) {
+      throw new Error('not connected');
+    }
+
+    return this.completedOrders.map((order) => ({ ...order }));
+  }
+
+  seedCompletedOrders(orders: CompletedOrder[]): void {
+    this.completedOrders = orders.map((order) => ({ ...order }));
+  }
+
+  /** Places orders at IB as if a previous process had left them resting. */
+  seedOpenOrders(orders: OpenOrder[]): void {
+    this.openOrders = orders.map((order) => ({ ...order }));
   }
 
   async getPositions(): Promise<BrokerPosition[]> {
@@ -202,7 +264,24 @@ export class FakeIbSocket implements IbSocket {
     return () => this.disconnectHandlers.delete(handler);
   }
 
+  onDataError(handler: (event: DataErrorEvent) => void): () => void {
+    this.dataErrorHandlers.add(handler);
+    return () => this.dataErrorHandlers.delete(handler);
+  }
+
   // ---- Test seams ----------------------------------------------------------
+
+  /**
+   * IB rejects a market-data subscription and then delivers nothing.
+   *
+   * Code 354 is "requested market data is not subscribed" — the entitlement
+   * rejection a paper account hits when the live account's subscriptions have
+   * not been shared to it. Not reproducible against a live Gateway on cue,
+   * which is why it belongs here.
+   */
+  simulateDataError(symbol: string, code: number | null = 354, message = 'not subscribed'): void {
+    this.dataErrorHandlers.forEach((handler) => handler({ symbol, code, message }));
+  }
 
   /** Seeds the bars a historical request will serve from. */
   seedBars(symbol: string, barSize: BarSize, bars: Bar[]): void {
@@ -272,7 +351,51 @@ export class FakeIbSocket implements IbSocket {
   }
 
   emitFill(fill: Fill): void {
+    // A fully-filled order is no longer open. Partial fills stay, with their
+    // filled quantity updated — which is exactly the state the engine cancels
+    // the remainder of.
+    const open = this.openOrders.find((order) => order.clientOrderId === fill.clientOrderId);
+
+    if (open) {
+      open.filledQuantity += fill.quantity;
+
+      if (open.filledQuantity >= open.quantity) {
+        this.openOrders = this.openOrders.filter(
+          (order) => order.clientOrderId !== fill.clientOrderId,
+        );
+      }
+    }
+
+    // Retained so `replayExecutions` can re-deliver them, as IB does to any
+    // client that subscribes to executions.
+    this.executions.push({ ...fill });
+
     this.fillHandlers.forEach((handler) => handler({ ...fill }));
+  }
+
+  /**
+   * Re-delivers every execution emitted so far, as IB does on connect.
+   *
+   * **The behavior the real socket was missing entirely.** IB pushes executions
+   * only to a client that has requested them, and replays the session's
+   * executions whenever one subscribes — so a reconnect re-delivers fills the
+   * engine has already turned into lots. Without a seam for it, nothing offline
+   * could distinguish an engine that deduplicates from one that opens a second
+   * lot for every fill after the daily logout.
+   */
+  replayExecutions(): void {
+    this.executions.forEach((fill) => this.fillHandlers.forEach((handler) => handler({ ...fill })));
+  }
+
+  /** A terminal order status from IB — a DAY expiry, or a cancel in TWS. */
+  emitOrderStatus(ack: OrderAck): void {
+    if (ack.status === OrderStatus.CANCELLED || ack.status === OrderStatus.REJECTED) {
+      this.openOrders = this.openOrders.filter(
+        (order) => order.clientOrderId !== ack.clientOrderId,
+      );
+    }
+
+    this.statusHandlers.forEach((handler) => handler({ ...ack }));
   }
 
   /** A late commission report, as IB delivers it after the execution. */

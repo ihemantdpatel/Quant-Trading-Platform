@@ -200,6 +200,9 @@ model Rung {
   status String  @db.VarChar(16)
   /// Id of the lot currently held here, or null.
   lotId  String? @db.VarChar(191)
+  /// clientOrderId of a limit order resting at this level, or null. Nullable
+  /// rather than defaulted: "no order here" is a real state, not a missing one.
+  workingOrderId  String? @db.VarChar(191)
   completedCycles Int    @default(0)
   lastExitAt      String? @db.VarChar(32)
 

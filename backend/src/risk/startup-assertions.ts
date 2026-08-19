@@ -22,7 +22,7 @@
 
 import { ExecutionMode } from '../config/execution-mode';
 import { checkLiveAccountGuard } from './live-account-guard';
-import { RiskConfig } from './risk.config';
+import { assertSingleCurrency, RiskConfig } from './risk.config';
 
 /**
  * Capital configured for each symbol a strategy is enabled on. A `null` value
@@ -63,6 +63,14 @@ export function evaluateStartupAssertions(
   mode: ExecutionMode,
   config: RiskConfig,
   symbolCapital: SymbolCapital = {},
+  /**
+   * Currency of each instrument the enabled strategies trade.
+   *
+   * Defaults to empty, which asserts nothing — the many existing callers that
+   * predate the currency check keep their behaviour. `RiskModule` supplies the
+   * real list, so the check is live where it matters.
+   */
+  instrumentCurrencies: string[] = [],
 ): StartupAssertionResult {
   const failures: string[] = [];
 
@@ -75,9 +83,25 @@ export function evaluateStartupAssertions(
   }
 
   if (mode === ExecutionMode.SHADOW) {
-    // SHADOW submits nothing, so neither open item can cause harm. This is what
-    // lets Phase 1 proceed while both decisions are still outstanding.
-    return { permitted: failures.length === 0, failures };
+    // **SHADOW is retired and is refused, not exempted.**
+    //
+    // It previously returned early here, skipping the capital and loss-threshold
+    // checks because a mode that submits nothing cannot misuse them. That
+    // exemption is now the danger: entries rest at the broker and a lot exists
+    // only once a fill arrives, so a SHADOW ladder would log intents forever and
+    // never open a lot — reporting a position history the system would never
+    // actually have produced.
+    //
+    // Refusing at boot rather than quietly redirecting to PAPER: silently
+    // upgrading a mode that submits nothing into one that submits real orders is
+    // precisely the kind of implicit escalation this file exists to prevent.
+    failures.push(
+      'EXECUTION_MODE=SHADOW is retired and no longer supported. Resting limit orders make a ' +
+        'lot the consequence of a broker fill, and SHADOW submits nothing — the ladder would ' +
+        'record intents forever and never open a lot. Set EXECUTION_MODE=PAPER.',
+    );
+
+    return { permitted: false, failures };
   }
 
   const unsetSymbols = Object.entries(symbolCapital)
@@ -113,6 +137,11 @@ export function evaluateStartupAssertions(
     );
   }
 
+  // A currency mismatch makes the cap wrong by the exchange rate while looking
+  // entirely normal, so it is refused rather than converted. See
+  // `assertSingleCurrency`.
+  failures.push(...assertSingleCurrency(config, instrumentCurrencies));
+
   return { permitted: failures.length === 0, failures };
 }
 
@@ -127,8 +156,9 @@ export function assertStartupSafe(
   mode: ExecutionMode,
   config: RiskConfig,
   symbolCapital: SymbolCapital = {},
+  instrumentCurrencies: string[] = [],
 ): void {
-  const result = evaluateStartupAssertions(mode, config, symbolCapital);
+  const result = evaluateStartupAssertions(mode, config, symbolCapital, instrumentCurrencies);
 
   if (!result.permitted) {
     throw new StartupAssertionError(result.failures);

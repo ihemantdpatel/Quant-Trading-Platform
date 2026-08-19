@@ -2,10 +2,13 @@ import { validateConfig } from './config.schema';
 import { ExecutionMode } from './execution-mode';
 
 describe('validateConfig', () => {
-  it('defaults EXECUTION_MODE to SHADOW when unset', () => {
+  it('defaults EXECUTION_MODE to PAPER when unset', () => {
+    // SHADOW was the default until it was retired (`execution-mode.ts`). The
+    // default is a submitting mode now, which is why `assertStartupSafe` must
+    // refuse to boot without the capital and loss-threshold decisions set.
     const config = validateConfig({});
 
-    expect(config.EXECUTION_MODE).toBe(ExecutionMode.SHADOW);
+    expect(config.EXECUTION_MODE).toBe(ExecutionMode.PAPER);
   });
 
   it('rejects an invalid EXECUTION_MODE value', () => {

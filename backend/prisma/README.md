@@ -60,7 +60,7 @@ Run the CLI and the database tests through Linux instead:
 ```bash
 # from the repo root
 docker run --rm --network host -v "$PWD":/repo -w /repo/backend \
-  -e DATABASE_URL="mysql://ib:ib_password@127.0.0.1:3306/ib" \
+  -e DATABASE_URL="mysql://ib:ib_password@127.0.0.1:${MYSQL_HOST_PORT:-3307}/ib" \
   node:22-slim sh -c "apt-get update -qq && apt-get install -y -qq openssl && \
     ./node_modules/.bin/prisma migrate deploy"
 ```

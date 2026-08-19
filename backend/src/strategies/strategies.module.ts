@@ -15,10 +15,11 @@
 import { Module } from '@nestjs/common';
 import { AppConfigModule } from '../config/config.module';
 import { AppConfigService } from '../config/app-config.service';
+import { PAPER_SYMBOL_CAPITAL } from '../config/capital.config';
 import { ExecutionMode } from '../config/execution-mode';
 import { NullSentimentProvider } from '../sentiment/null-sentiment.provider';
 import { CoordinatorService } from './coordinator.service';
-import { buildDipLadderConfig, DipLadderConfig } from './dip-ladder/config';
+import { buildDipLadderConfig, DipLadderConfig, OrderPlacement } from './dip-ladder/config';
 
 export const DIP_LADDER_CONFIG = Symbol('DIP_LADDER_CONFIG');
 export const SENTIMENT_PROVIDER = Symbol('SENTIMENT_PROVIDER');
@@ -31,27 +32,31 @@ export const SENTIMENT_PROVIDER = Symbol('SENTIMENT_PROVIDER');
 export const DIP_LADDER_SYMBOL = 'TQQQ';
 
 /**
- * A nominal figure used **only** to size intents in `SHADOW`.
+ * The currency `DIP_LADDER_SYMBOL` trades in, matching `equityContract`'s
+ * default.
  *
- * The problem this solves: the real per-symbol allocation is deliberately unset
- * until Story 13 (`PRD.md:503`), and unset sizes every rung at zero shares. The
- * risk manager then rejects every intent as malformed, so a SHADOW replay
- * produces an empty ladder and verifies nothing — which defeats the purpose of
- * the mode that exists to be verified.
- *
- * So SHADOW gets a stated, arbitrary notional and PAPER/LIVE get `null`.
- * Structurally, not by convention: this function returns `null` for any mode
- * other than SHADOW, so the placeholder cannot reach a mode that submits. If it
- * ever did, the Story 5 startup assertion would still refuse to boot, because
- * `SYMBOL_CAPITAL` is derived from this same value.
- *
- * This is **not** the Story 13 decision and must not be mistaken for it. It is
- * a display scale for a mode that submits nothing.
+ * Named alongside the symbol because the two travel together: the risk layer
+ * compares position notional against account equity, and that comparison is
+ * only sound when it knows both currencies. TQQQ is a US-listed ETF, so USD —
+ * which differs from the CAD paper account, and `assertSingleCurrency` is what
+ * makes that difference loud instead of silently mis-scaling the cap.
  */
-export const SHADOW_NOMINAL_CAPITAL = 100_000;
+export const DIP_LADDER_CURRENCY = 'USD';
 
-export function shadowNotional(mode: ExecutionMode): number | null {
-  return mode === ExecutionMode.SHADOW ? SHADOW_NOMINAL_CAPITAL : null;
+/**
+ * The capital the ladder sizes rungs from.
+ *
+ * Reads the real Story 13 allocation for every mode. There is no longer a
+ * per-mode branch: the SHADOW display notional it used to return existed only
+ * so a mode that submitted nothing still produced non-zero quantities to look
+ * at, and SHADOW is retired (`execution-mode.ts`).
+ *
+ * `null` for a symbol absent from `PAPER_SYMBOL_CAPITAL`, so a missing
+ * allocation sizes every rung to zero shares (`ladder.ts:47`) **and** trips the
+ * startup assertion, rather than silently borrowing another symbol's figure.
+ */
+export function ladderCapital(_mode: ExecutionMode, symbol: string): number | null {
+  return PAPER_SYMBOL_CAPITAL[symbol] ?? null;
 }
 
 @Module({
@@ -62,7 +67,19 @@ export function shadowNotional(mode: ExecutionMode): number | null {
       provide: DIP_LADDER_CONFIG,
       useFactory: (appConfig: AppConfigService): DipLadderConfig =>
         buildDipLadderConfig(DIP_LADDER_SYMBOL, {
-          symbolCapital: shadowNotional(appConfig.executionMode),
+          symbolCapital: ladderCapital(appConfig.executionMode, DIP_LADDER_SYMBOL),
+          // **The live engine rests its entries at the broker.**
+          //
+          // The bar-close rule only creates an order once a 5-minute bar has
+          // *closed* at or below the rung, so a dip that touches the level
+          // intra-bar and recovers fires nothing at all. A resting limit order
+          // is filled by the exchange on the way through, which is what a
+          // predetermined-level ladder is supposed to do.
+          //
+          // `DEFAULT_DIP_LADDER_CONFIG` stays `IMMEDIATE` so the committed
+          // fixtures keep testing the rule their expected intents were computed
+          // under; this is the one place the live behaviour is selected.
+          orderPlacement: OrderPlacement.RESTING,
         }),
       inject: [AppConfigService],
     },

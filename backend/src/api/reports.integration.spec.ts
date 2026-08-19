@@ -27,21 +27,27 @@ jest.setTimeout(120_000);
 const FIRST_SESSION = '2025-01-02';
 
 /**
- * The final session of `chop-range`, and **the only one with a snapshot**.
+ * The final session of `chop-range`.
  *
- * `EngineService.persistLadderState` runs once at the end of a replay rather
- * than per session, so a twelve-day fixture leaves exactly one snapshot,
- * stamped with the last bar. That is fine for replay — the whole fixture is one
- * batch — but it means only this session has the anchor scalars the rung
- * recomputation needs.
+ * Every session the replay touches now carries its own snapshot. Resting orders
+ * made fills asynchronous, so `persistLadderState` runs on each fill and each
+ * order ack rather than once at the end of `replayFixture` — and because
+ * snapshots are stamped with `lastBarTimestamp`, each session's own scalars are
+ * captured. This matches the live soak's shape, where bars arrive continuously
+ * and state is persisted as they do.
  *
- * The live soak does not have this shape: bars arrive continuously and state is
- * persisted as they do, so each session gets its own snapshot. The distinction
- * matters when reading these tests as evidence about soak behaviour — what is
- * asserted here is that verification works against a session that *has* a
- * snapshot, and correctly reports a skip for one that does not.
+ * A skip is therefore asserted against `UNTRADED_SESSION` below rather than
+ * against an early session of this fixture.
  */
 const FINAL_SESSION = '2025-01-17';
+
+/**
+ * A date the fixture never traded, so nothing was ever persisted for it.
+ *
+ * `2025-01-01` is the day before the fixture opens — a real market holiday, and
+ * more to the point one this replay produced no bar, lot, or snapshot for.
+ */
+const UNTRADED_SESSION = '2025-01-01';
 
 describe('Story 12: the daily report over HTTP', () => {
   let app: INestApplication;
@@ -74,24 +80,24 @@ describe('Story 12: the daily report over HTTP', () => {
 
     expect(report.sessionDate).toBe(FIRST_SESSION);
     expect(report.symbol).toBe('TQQQ');
-    expect(report.mode).toBe('SHADOW');
+    expect(report.mode).toBe('PAPER');
     expect(report.intents.total).toBeGreaterThan(0);
   });
 
   /**
-   * The mode guarantee, checked from the other end. `SHADOW` submits nothing
-   * whichever broker is bound, so a report that ever showed a submission here
-   * would mean the guarantee had been broken somewhere upstream.
+   * The mode check, from the other end. SHADOW is retired and refused at boot
+   * (`execution-mode.ts`), so a report naming it here would mean the mode
+   * plumbing was wrong — which is exactly what `RETIRED_MODE` flags.
    */
-  it('shows zero submissions and raises no SHADOW anomaly', async () => {
+  it('reports the running mode and raises no retired-mode anomaly', async () => {
     const response = await request(app.getHttpServer())
       .get(`/reports/daily?date=${FIRST_SESSION}`)
       .expect(200);
 
     const report = response.body as DailyReport;
 
-    expect(report.intents.submitted).toBe(0);
-    expect(report.anomalies.map((anomaly) => anomaly.code)).not.toContain('SUBMISSION_IN_SHADOW');
+    expect(report.mode).toBe('PAPER');
+    expect(report.anomalies.map((anomaly) => anomaly.code)).not.toContain('RETIRED_MODE');
   });
 
   /**
@@ -106,20 +112,38 @@ describe('Story 12: the daily report over HTTP', () => {
     const report = response.body as DailyReport;
 
     expect(report.rungVerification.skipped).toBe(false);
-    // The session's own snapshot anchor, with rungs a hand-checkable 5% apart:
-    // 88.00 → 83.60 → 79.42 → 75.45 → 71.68 → 68.10.
-    expect(report.rungVerification.anchor).toBe(88);
-    expect(report.rungVerification.spacingDistance).toBe(4.4);
+
+    /*
+      Progression, not bootstrap: the ladder carried four lots into this session
+      (95, 90.25, 85.74, 77.38 — all of which exit during it), so the anchor is
+      the lowest of them rather than the snapshot's session open. The bootstrap
+      scalars only decide the anchor on a session that opens flat.
+
+      Rungs are then a hand-checkable 5% apart below it:
+      77.38 → 73.51 → 69.83 → 66.34 → 63.02 → 59.87.
+    */
+    expect(report.rungVerification.anchorBasis).toBe('PROGRESSION');
+    expect(report.rungVerification.anchor).toBe(77.38);
+    expect(report.rungVerification.spacingDistance).toBe(3.87);
     expect(report.rungVerification.expected.map((rung) => rung.price)).toEqual([
-      83.6, 79.42, 75.45, 71.68, 68.1,
+      73.51, 69.83, 66.34, 63.02, 59.87,
     ]);
+
+    // The headline property, and the one that survives any change of fixture
+    // shape: every entry the ladder fired sits at a price the recomputation
+    // reached independently.
     expect(report.rungVerification.unexplained).toEqual([]);
   });
 
   /**
-   * The session's two intents are exits, which fire at each lot's own frozen
-   * target rather than at a rung price. Flagging those would make every
-   * profitable session look anomalous.
+   * Exits fire at each lot's own frozen target rather than at a rung price, so
+   * the recomputation must not flag them — doing so would make every profitable
+   * session look anomalous, and a session that cycles heavily worst of all.
+   *
+   * The count is asserted as "many, and all profitable" rather than a fixed
+   * number: under resting orders the ladder captures intra-bar dips it
+   * previously missed, so the exact cycle count is a property of the fixture's
+   * price path and not of the rule under test.
    */
   it('reports completed cycles without flagging their exit prices', async () => {
     const response = await request(app.getHttpServer())
@@ -128,8 +152,8 @@ describe('Story 12: the daily report over HTTP', () => {
 
     const report = response.body as DailyReport;
 
-    expect(report.lots.closedToday).toBe(2);
-    expect(report.cycles).toHaveLength(2);
+    expect(report.lots.closedToday).toBeGreaterThan(0);
+    expect(report.cycles).toHaveLength(report.lots.closedToday);
     // Lots only ever exit in profit — asserted from the engine's own output.
     for (const cycle of report.cycles) {
       expect(cycle.realized).toBeGreaterThan(0);
@@ -142,10 +166,15 @@ describe('Story 12: the daily report over HTTP', () => {
    * A session with no snapshot cannot be verified, and must say so. The
    * alternative — treating "could not check" as "checked and fine" — would let
    * a soak week be called clean on a check that never ran.
+   *
+   * Asserted against a date the fixture never traded. Every session the replay
+   * *did* touch now leaves a snapshot: resting orders made fills asynchronous,
+   * so `persistLadderState` runs per fill rather than once at the end of the
+   * run. An unvisited date is what genuinely has nothing to anchor from.
    */
   it('reports a skip, not a pass, for a session it cannot anchor', async () => {
     const response = await request(app.getHttpServer())
-      .get(`/reports/daily?date=${FIRST_SESSION}`)
+      .get(`/reports/daily?date=${UNTRADED_SESSION}`)
       .expect(200);
 
     const report = response.body as DailyReport;

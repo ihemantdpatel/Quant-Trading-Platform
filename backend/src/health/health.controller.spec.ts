@@ -56,7 +56,7 @@ describe('GET /health', () => {
     }
   }
 
-  it('returns 200 with status ok and SHADOW mode by default', async () => {
+  it('returns 200 with status ok and PAPER mode by default', async () => {
     process.env = { ...originalEnv };
     delete process.env.EXECUTION_MODE;
 
@@ -64,7 +64,7 @@ describe('GET /health', () => {
       await request(app.getHttpServer())
         .get('/health')
         .expect(200)
-        .expect({ status: 'ok', mode: ExecutionMode.SHADOW });
+        .expect({ status: 'ok', mode: ExecutionMode.PAPER });
     });
   });
 
@@ -89,12 +89,27 @@ describe('GET /health', () => {
   });
 
   /**
-   * The Story 5 exit criterion, asserted at the application boundary: the app
-   * refuses to boot in PAPER while the two open PRD items are unset.
+   * Story 13 closed the two open PRD items (`capital.config.ts`), so the boot
+   * this originally asserted must fail now succeeds.
+   *
+   * The capital figures are expressed in USD to match TQQQ, with the CAD account
+   * balance hand-converted once (`capital.config.ts`). That keeps the cap
+   * arithmetic sound — the property the currency check enforces — at the cost of
+   * an equity figure that carries FX staleness.
+   *
+   * The Story 5 claim has not been dropped: `capital.config.spec.ts` asserts the
+   * assertion still refuses PAPER when either original value is removed, and
+   * that the currency check still refuses a CAD-tagged account. The guard stays
+   * load-bearing rather than becoming decoration.
    */
-  it('refuses to boot in PAPER while capital and loss threshold are unset', async () => {
+  it('boots in PAPER now that capital and loss threshold are set', async () => {
     process.env = { ...originalEnv, EXECUTION_MODE: ExecutionMode.PAPER };
 
-    await expect(withApp(async () => undefined)).rejects.toThrow(/Refusing to start/);
+    await withApp(async (app) => {
+      await request(app.getHttpServer())
+        .get('/health')
+        .expect(200)
+        .expect({ status: 'ok', mode: ExecutionMode.PAPER });
+    });
   });
 });

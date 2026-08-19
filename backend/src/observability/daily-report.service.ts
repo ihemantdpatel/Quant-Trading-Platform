@@ -163,7 +163,13 @@ export interface DailyReport {
     rejected: number;
     /** Non-zero in SHADOW would mean the mode guarantee had been violated. */
     submitted: number;
-    /** Intents stamped outside 09:45–16:00 ET. Any is an anomaly. */
+    /**
+     * **Entry** intents stamped outside 09:45–16:00 ET. Any is an anomaly.
+     *
+     * Exits are excluded by design — the window governs firing, not exiting,
+     * and a lot at its frozen take-profit target may exit at any point in the
+     * regular session.
+     */
     outsideFiringWindow: number;
   };
   fills: {
@@ -257,7 +263,21 @@ export class DailyReportService {
       .filter((lot) => lot.exitPrice !== null && lot.closedAt !== null)
       .map((lot) => this.toCycle(lot));
 
-    const rungVerification = await this.verifyRungs(sessionDate, sessionIntents, heldAtSessionEnd);
+    // Every lot the ladder could have been holding at any point in the session,
+    // not just those still held at its end: the anchor moves *within* a session
+    // as lots open and close, so a lot opened and exited mid-session still
+    // determined where rungs sat while it was held.
+    const lotsTouchingSession = allLots.filter(
+      (lot) =>
+        sessionDateOf(lot.openedAt) <= sessionDate &&
+        (lot.closedAt === null || sessionDateOf(lot.closedAt) >= sessionDate),
+    );
+
+    const rungVerification = await this.verifyRungs(
+      sessionDate,
+      sessionIntents,
+      lotsTouchingSession,
+    );
 
     const report: DailyReport = {
       sessionDate,
@@ -327,7 +347,22 @@ export class DailyReportService {
       resized: records.filter((r) => r.decision?.outcome === RiskOutcome.RESIZED).length,
       rejected: records.filter((r) => r.decision?.outcome === RiskOutcome.REJECTED).length,
       submitted: records.filter((r) => r.submitted).length,
-      outsideFiringWindow: records.filter((r) => !isWithinFiringWindow(r.intent.timestamp)).length,
+      /*
+        **Entries only.** The firing window constrains firing, not exiting
+        (`session-window.ts`): `onBar` runs `selectExit` before the window is
+        consulted, so a lot that reaches its take-profit target during the
+        09:30–09:45 opening auction exits then, deliberately. A lot only ever
+        exits in profit and its target is frozen at fill, so nothing about that
+        exit depends on opening-auction pricing being reliable.
+
+        Counting exits here made every session containing an early take-profit
+        raise `INTENT_OUTSIDE_FIRING_WINDOW` — a false anomaly against a rule
+        the engine was honouring, and during a soak that is worse than silence:
+        the week restarts on any unexplained anomaly.
+      */
+      outsideFiringWindow: records.filter(
+        (r) => r.intent.side === 'BUY' && !isWithinFiringWindow(r.intent.timestamp),
+      ).length,
     };
   }
 
@@ -345,20 +380,29 @@ export class DailyReportService {
    * Recomputes the session's expected rung prices and compares them against the
    * intents actually emitted.
    *
-   * The anchor comes from the session's persisted snapshot scalars — the same
-   * `previousSessionClose` / `sessionOpen` pair the strategy anchored from —
-   * and from the lots held entering the session. `resolveAnchor` then applies
-   * the same precedence rule the ladder does: progression off the lowest held
-   * lot whenever anything is held, bootstrap otherwise.
+   * The bootstrap inputs come from the session's persisted snapshot scalars —
+   * the same `previousSessionClose` / `sessionOpen` pair the strategy anchored
+   * from. `resolveAnchor` then applies the same precedence rule the ladder does:
+   * progression off the lowest held lot whenever anything is held, bootstrap
+   * otherwise.
+   *
+   * **The anchor is recomputed at every intent, not once for the session.** It
+   * is a function of what is held *at that moment*, and the ladder re-evaluates
+   * it on every bar — so a session that opens flat and fills four rungs uses
+   * four different anchors, each one progressing off the lot the previous entry
+   * created. Computing a single anchor for the whole session only agrees with
+   * the engine when the held set never changes during it, and reports every
+   * entry after the first as a false mismatch when it does.
    *
    * Rungs are walked downward one spacing unit at a time, exactly as the ladder
-   * extends, up to `maxConcurrentRungs`. An intent matching none of those prices
-   * is `unexplained` — the signal that state and rules have diverged.
+   * extends, up to `maxConcurrentRungs`. An intent matching none of the prices
+   * expected *at its own timestamp* is `unexplained` — the signal that state and
+   * rules have diverged.
    */
   private async verifyRungs(
     sessionDate: string,
     sessionIntents: OrderIntentRecord[],
-    heldAtSessionEnd: Lot[],
+    lotsTouchingSession: Lot[],
   ): Promise<RungVerification> {
     const empty: RungVerification = {
       anchor: null,
@@ -406,42 +450,174 @@ export class DailyReportService {
       };
     }
 
-    // Lots that were already open when the session began are what the ladder
-    // anchored from. A lot opened *during* the session is a consequence of the
-    // rungs being verified, so including it would let the output justify itself.
-    const heldEnteringSession = heldAtSessionEnd.filter(
-      (lot) => sessionDateOf(lot.openedAt) < sessionDate,
+    // Intents in the order the engine emitted them. The anchor depends on what
+    // was held when each fired, so an out-of-order walk would price rungs
+    // against a held set from the future.
+    const ordered = [...sessionIntents].sort((a, b) => {
+      if (a.intent.timestamp === b.intent.timestamp) {
+        return 0;
+      }
+
+      return a.intent.timestamp < b.intent.timestamp ? -1 : 1;
+    });
+
+    // Lots the ladder was already holding when the session opened. Lots opened
+    // *during* the session are added below as their own entries are verified,
+    // so each one only ever influences the rungs that came after it.
+    const held = new Map<string, Lot>(
+      lotsTouchingSession
+        .filter((lot) => sessionDateOf(lot.openedAt) < sessionDate)
+        .map((lot) => [lot.id, lot]),
     );
 
-    const anchor = resolveAnchor(
-      heldEnteringSession,
+    /*
+      Opens and closes merged into one chronologically ordered stream.
+
+      Two separate cursors cannot express this. A lot that opens at 10:00 and
+      closes at 10:30 would have its close applied while the walk was still
+      before its open — deleting an id `held` does not yet contain, then adding
+      it moments later and never removing it. The lot stays held for the rest of
+      the session, its rung never reads as free, and every re-entry at that
+      level is reported unexplained. Interleaving by timestamp is what keeps
+      `held` a faithful picture of the moment.
+
+      Opens sort before closes at equal timestamps only in the sense that both
+      are applied by `<=`/`<` below; the ordering that matters is that a lot's
+      own open always precedes its own close, which holds by construction.
+    */
+    const events: { at: string; kind: 'OPEN' | 'CLOSE'; lot: Lot }[] = [];
+
+    for (const lot of lotsTouchingSession) {
+      if (sessionDateOf(lot.openedAt) === sessionDate) {
+        events.push({ at: lot.openedAt, kind: 'OPEN', lot });
+      }
+
+      if (lot.closedAt !== null && sessionDateOf(lot.closedAt) === sessionDate) {
+        events.push({ at: lot.closedAt, kind: 'CLOSE', lot });
+      }
+    }
+
+    // Closes before opens at the same instant, matching `onBar`: exits are
+    // applied first so the bar's entry sees the rung its exit just freed.
+    events.sort((a, b) => {
+      if (a.at !== b.at) {
+        return a.at < b.at ? -1 : 1;
+      }
+
+      return a.kind === b.kind ? 0 : a.kind === 'CLOSE' ? -1 : 1;
+    });
+
+    let eventCursor = 0;
+
+    /*
+      Rung levels the ladder had created by this point in the session.
+
+      **A rung outlives the lot that occupied it.** When a lot takes profit its
+      rung re-arms at its original price and may fire again, so an entry can
+      land at a level the anchor no longer points to — and under RESTING
+      placement `highestFireableRung` chooses such a level without regard to
+      where the bar closed. Modelling only "one spacing unit below the current
+      anchor" therefore explains the ladder's *first* entry at each level and
+      none of the repeats, which is most of a cycling session.
+
+      Seeded from the levels of lots already held entering the session, since
+      those rungs demonstrably exist. Recomputed levels are added as the walk
+      derives them, never read back from the ladder's own rung list — that
+      readback is the comparison this service exists to avoid.
+    */
+    const knownRungs = new Set<number>(
+      [...held.values()].map((lot) => roundToCents(lot.rungPrice)),
+    );
+
+    /** The ladder as it stood at `timestamp`, from the lots held by then. */
+    const ladderAt = (timestamp: string) => {
+      while (eventCursor < events.length) {
+        const event = events[eventCursor];
+
+        // An exit at this instant has already freed its rung; an open at this
+        // instant has not yet happened from the entry's point of view, because
+        // an entry cannot anchor off the position it is itself creating.
+        const applies = event.kind === 'CLOSE' ? event.at <= timestamp : event.at < timestamp;
+
+        if (!applies) {
+          break;
+        }
+
+        if (event.kind === 'CLOSE') {
+          held.delete(event.lot.id);
+        } else {
+          held.set(event.lot.id, event.lot);
+          knownRungs.add(roundToCents(event.lot.rungPrice));
+        }
+
+        eventCursor += 1;
+      }
+
+      const anchor = resolveAnchor(
+        [...held.values()],
+        scalars.previousSessionClose,
+        scalars.sessionOpen,
+      );
+
+      // The next level the ladder would extend to, which is where an entry
+      // goes when no existing rung is free.
+      const extension = nextRungPrice(anchor.price, this.ladderConfig);
+
+      // Levels currently free: a known rung with no lot sitting on it. These
+      // are the re-arm targets, and under RESTING they take precedence over
+      // extending — `evaluateBar` consults them first.
+      const occupied = new Set([...held.values()].map((lot) => roundToCents(lot.rungPrice)));
+      const free = [...knownRungs].filter((price) => !occupied.has(price));
+
+      return { anchor, extension, free };
+    };
+
+    /*
+      **The reported anchor is the session's opening one**, resolved before any
+      of the session's own lots exist.
+
+      The anchor genuinely moves during a session, and the walk below follows
+      every step of it — that movement is what `unexplained` is judged against.
+      What is *reported* is deliberately the opening value, for two reasons: a
+      lot opened during the session is a consequence of the rungs being checked,
+      so anchoring the summary off it would let the output justify itself; and
+      an operator comparing two reports needs a figure that means the same thing
+      in both, which a mid-session-dependent value would not.
+
+      The consequence to know when reading a report: `expected` describes the
+      ladder as the session *opened*, so on a session that filled several rungs
+      it will not match the dashboard's rung list at the close. `unexplained` is
+      the field that accounts for the whole session.
+    */
+    // Resolved from the lots held *entering* the session, before any of its own
+    // opens or closes are applied — `ladderAt` is deliberately not used here,
+    // since the session's first intent may already sit after an exit that
+    // changed what was held.
+    const openingAnchor = resolveAnchor(
+      [...held.values()],
       scalars.previousSessionClose,
       scalars.sessionOpen,
     );
 
-    const spacing = roundToCents(anchor.price - nextRungPrice(anchor.price, this.ladderConfig));
-
-    const expected: ExpectedRung[] = [];
-    let price = anchor.price;
-
-    for (let level = 1; level <= this.ladderConfig.maxConcurrentRungs; level += 1) {
-      price = nextRungPrice(price, this.ladderConfig);
-      expected.push({ level, price, intentSeen: false });
-    }
-
     const unexplained: UnexplainedIntent[] = [];
+    const seen = new Set<number>();
 
-    for (const record of sessionIntents) {
-      const match = expected.find((rung) => rung.price === roundToCents(record.intent.limitPrice));
-
-      if (match) {
-        match.intentSeen = true;
-        continue;
-      }
+    for (const record of ordered) {
+      const at = ladderAt(record.intent.timestamp);
 
       // A sell exits at a lot's own frozen target, which is not a rung price —
       // rung verification is about entries, so exits are not "unexplained".
       if (record.intent.side === 'SELL') {
+        continue;
+      }
+
+      const price = roundToCents(record.intent.limitPrice);
+
+      // Explained by either of the two paths `evaluateBar` can take: firing an
+      // existing free rung, or extending the ladder one unit below the anchor.
+      if (price === at.extension || at.free.includes(price)) {
+        seen.add(price);
+        knownRungs.add(price);
         continue;
       }
 
@@ -452,11 +628,27 @@ export class DailyReportService {
       });
     }
 
+    const spacing = roundToCents(
+      openingAnchor.price - nextRungPrice(openingAnchor.price, this.ladderConfig),
+    );
+
+    const expectedPrices: number[] = [];
+    let price = openingAnchor.price;
+
+    for (let level = 1; level <= this.ladderConfig.maxConcurrentRungs; level += 1) {
+      price = nextRungPrice(price, this.ladderConfig);
+      expectedPrices.push(price);
+    }
+
     return {
-      anchor: anchor.price,
-      anchorBasis: anchor.basis,
+      anchor: openingAnchor.price,
+      anchorBasis: openingAnchor.basis,
       spacingDistance: spacing,
-      expected,
+      expected: expectedPrices.map((rungPrice, index) => ({
+        level: index + 1,
+        price: rungPrice,
+        intentSeen: seen.has(rungPrice),
+      })),
       unexplained,
       skipped: false,
       skipReason: null,
@@ -503,15 +695,19 @@ export class DailyReportService {
   private detectAnomalies(report: DailyReport): ReportAnomaly[] {
     const anomalies: ReportAnomaly[] = [];
 
-    // The mode guarantee. In SHADOW nothing is submitted whichever broker is
-    // bound (`CLAUDE.md`), so a non-zero count here is the most serious thing
-    // this report can find.
-    if (report.mode === ExecutionMode.SHADOW && report.intents.submitted > 0) {
+    // SHADOW is retired and refused at boot (`execution-mode.ts`), so a report
+    // claiming that mode describes a session this build could not have run.
+    // Kept because reports are read from persisted evidence and a session
+    // recorded before the retirement can still be requested by date — and if
+    // one ever appeared for *today*, the mode plumbing is wrong in a way an
+    // operator must see rather than have silently normalized.
+    if (report.mode === ExecutionMode.SHADOW) {
       anomalies.push({
-        code: 'SUBMISSION_IN_SHADOW',
+        code: 'RETIRED_MODE',
         detail:
-          `${report.intents.submitted} intent(s) recorded as submitted while in SHADOW. ` +
-          'Nothing may reach a broker in this mode.',
+          'session recorded in SHADOW, which is retired and refused at startup. ' +
+          `${report.intents.submitted} intent(s) were marked submitted. Either this is a ` +
+          'historic session predating the retirement, or the mode configuration is wrong.',
       });
     }
 

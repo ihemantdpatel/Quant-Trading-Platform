@@ -155,17 +155,25 @@ export class EngineController {
     }));
   }
 
-  /** Rungs distinguishing held / re-armed / pending with their prices. */
+  /** Rungs distinguishing held / working / re-armed / pending with their prices. */
   @Get('rungs')
   getRungs(): unknown[] {
     return this.engine.ladderRungs().map((rung) => ({
       price: rung.price,
       status: rung.status,
       lotId: rung.lotId,
+      // The handle for the order resting at this level. Exposed so the dashboard
+      // can join a working rung to its row in `GET /orders` — without it the two
+      // views show the same order twice with nothing tying them together.
+      workingOrderId: rung.workingOrderId,
       completedCycles: rung.completedCycles,
       lastExitAt: rung.lastExitAt,
       held: rung.status === RungStatus.HELD,
-      fireable: rung.status !== RungStatus.HELD,
+      // Mirrors `selectFireableRung`: a rung with an order resting at the broker
+      // holds no lot but must not fire again. Deriving this from `status !== HELD`
+      // alone would report a WORKING rung as fireable and tell an operator the
+      // ladder is armed at a level where an order is already committed.
+      fireable: rung.lotId === null && !rung.workingOrderId,
     }));
   }
 
@@ -220,6 +228,11 @@ export class EngineController {
               pacing: this.broker.pacingStats(),
               dataStale: this.broker.isDataStale(),
               lastBarAt: this.broker.lastBarAt(),
+              // Why the feed is silent, next to the fact that it is. IB rejects
+              // an unentitled data request and then delivers nothing, which
+              // leaves every other field here reading healthy — so without this
+              // the cause was visible only in the container log.
+              dataErrors: this.broker.dataErrorList(),
             }
           : {}),
       },
@@ -239,6 +252,10 @@ export class EngineController {
       // which an operator should be able to see, rather than reading absence
       // as success.
       reconciliation: this.reconciliation.lastReconciliation(),
+      // The post-close job's last run. Null until it has fired — an operator
+      // must be able to tell "scheduled but not yet due" from "ran and found
+      // nothing", which absence alone cannot express.
+      orderReconciliation: this.reconciliation.lastOrderReconcile(),
       alerts: this.engine.activeAlerts(),
       strategies: this.coordinator.snapshots().map((s) => ({ id: s.id, enabled: s.enabled })),
     };
@@ -266,6 +283,44 @@ export class EngineController {
   }
 
   /** Every active reconciliation halt, for the dashboard's alert surface. */
+  /**
+   * Re-runs the full startup reconciliation on demand.
+   *
+   * **Why this exists as a manual control.** `reconcileOpenOrders` is already
+   * the designated repair for a rung whose order no longer exists at the
+   * broker — a DAY order that expired, or one cancelled by hand in TWS. Until
+   * now the only way to reach it was to restart the daemon, because
+   * `StartupSequence` was its sole caller. An operator who cancels an order in
+   * TWS and then watches the dashboard keep showing the rung as `WORKING` has
+   * no way to correct it short of a restart, which is a poor answer during a
+   * live session.
+   *
+   * **This is the full sequence, not just the open-order half**, and the
+   * difference matters before pressing it. It re-runs the lot-sum assertion and
+   * therefore **can halt symbols**, and it restores lots and rungs from the
+   * database over whatever is in memory. At startup that restore writes into an
+   * empty ladder; here it can overwrite live state with the last persisted
+   * copy. Since the live path persists per bar (`BarConsumer.persistState`) the
+   * two are normally identical, but a symbol whose persistence is suppressed by
+   * an existing halt is exactly where they are not — which is the case an
+   * operator is most likely to be reaching for this control to fix.
+   *
+   * It deliberately does **not** connect the broker or re-initialize
+   * strategies: those are boot concerns, and re-initializing would discard the
+   * live ladder rather than reconcile it. An unreachable broker still halts
+   * every symbol here, exactly as it does at startup, because `null` positions
+   * mean "unknown" and unknown may not resume.
+   *
+   * No order is ever cancelled and no position is ever traded by this route —
+   * `reconcileAll` has no path to either, which is what makes exposing it to a
+   * button acceptable.
+   */
+  @Post('reconcile')
+  @HttpCode(HttpStatus.OK)
+  async reconcile(): Promise<unknown> {
+    return this.reconciliation.reconcileAll(new Date().toISOString());
+  }
+
   @Get('halts')
   getHalts(): unknown {
     return {

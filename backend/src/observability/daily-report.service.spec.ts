@@ -81,7 +81,7 @@ function harness(
   const reconciliation: { report: ReconciliationReport | null } = { report: null };
 
   const service = new DailyReportService(
-    { executionMode: options.mode ?? ExecutionMode.SHADOW } as never,
+    { executionMode: options.mode ?? ExecutionMode.PAPER } as never,
     { lastReconciliation: () => reconciliation.report },
     halts,
     buildDipLadderConfig(SYMBOL, options.config),
@@ -439,10 +439,97 @@ describe('DailyReportService', () => {
       expect(report.rungVerification.skipped).toBe(true);
       expect(report.rungVerification.anchor).toBeNull();
     });
+
+    /**
+     * The anchor moves *within* a session as lots open.
+     *
+     * A session that starts flat and fills two rungs anchors three different
+     * ways: bootstrap for the first entry, then progression off each new lot.
+     * Computing one anchor for the whole session explains the first entry and
+     * reports every later one as a false mismatch — which during a soak reads
+     * as the strategy having gone wrong when nothing has.
+     */
+    it('re-anchors as lots open during the session', async () => {
+      const h = harness();
+      await saveAnchorSnapshot(h);
+
+      // Bootstrap anchor 100 → first rung 95.
+      await h.lots.saveAll(
+        [
+          lot({ id: `${SYMBOL}-lot-1`, rungPrice: 95, openedAt: etTime('10:00:00') }),
+          // Progression off the 95 lot → 90.25, filled later in the session.
+          lot({ id: `${SYMBOL}-lot-2`, rungPrice: 90.25, openedAt: etTime('11:00:00') }),
+        ],
+        SYMBOL,
+      );
+
+      await h.intents.save(
+        intentRecord({ intent: { limitPrice: 95, timestamp: etTime('10:00:00') } as never }),
+      );
+      await h.intents.save(
+        intentRecord({ intent: { limitPrice: 90.25, timestamp: etTime('11:00:00') } as never }),
+      );
+
+      const report = await h.service.build(SESSION, NOW);
+
+      // Both entries verify, though they anchored differently: the first off
+      // the bootstrap open, the second off the lot the first one created. A
+      // single session-wide anchor explains one of them and flags the other.
+      expect(report.rungVerification.unexplained).toEqual([]);
+      // The *reported* anchor stays the session's opening one — see the note in
+      // `verifyRungs`. Only the internal walk moves.
+      expect(report.rungVerification.anchorBasis).toBe('BOOTSTRAP');
+      expect(report.rungVerification.anchor).toBe(100);
+    });
+
+    /**
+     * A rung outlives the lot that occupied it (`PRD.md:78`).
+     *
+     * When a lot exits, its rung re-arms **at its original price** and may fire
+     * again — that repeated cycling in a range is the whole point of per-lot
+     * exits. The re-entry sits at a level the current anchor no longer points
+     * to, so a recomputation that only ever expects "one spacing unit below the
+     * anchor" flags every second cycle onward as unexplained.
+     */
+    it('explains a re-entry at a rung that re-armed earlier in the session', async () => {
+      const h = harness();
+      await saveAnchorSnapshot(h);
+
+      await h.lots.saveAll(
+        [
+          // Fires 95, takes profit, and the rung re-arms at 95.
+          lot({
+            id: `${SYMBOL}-lot-1`,
+            rungPrice: 95,
+            openedAt: etTime('10:00:00'),
+            status: LotStatus.CLOSED,
+            closedAt: etTime('10:30:00'),
+            exitPrice: 99.75,
+          }),
+          // The same level fires again an hour later.
+          lot({ id: `${SYMBOL}-lot-2`, rungPrice: 95, openedAt: etTime('11:30:00') }),
+        ],
+        SYMBOL,
+      );
+
+      await h.intents.save(
+        intentRecord({ intent: { limitPrice: 95, timestamp: etTime('10:00:00') } as never }),
+      );
+      await h.intents.save(
+        intentRecord({ intent: { limitPrice: 95, timestamp: etTime('11:30:00') } as never }),
+      );
+
+      const report = await h.service.build(SESSION, NOW);
+
+      expect(report.rungVerification.unexplained).toEqual([]);
+    });
   });
 
   describe('anomaly detection', () => {
-    it('flags any submission recorded while in SHADOW', async () => {
+    it('flags a session recorded in the retired SHADOW mode', async () => {
+      // SHADOW is refused at startup (`execution-mode.ts`), so a report naming
+      // it is either a historic session or a mode-plumbing fault. Either way an
+      // operator must see it rather than have it normalized away.
       const h = harness({ mode: ExecutionMode.SHADOW });
       await saveAnchorSnapshot(h);
 
@@ -450,7 +537,7 @@ describe('DailyReportService', () => {
 
       const report = await h.service.build(SESSION, NOW);
 
-      expect(report.anomalies.map((a) => a.code)).toContain('SUBMISSION_IN_SHADOW');
+      expect(report.anomalies.map((a) => a.code)).toContain('RETIRED_MODE');
       expect(report.clean).toBe(false);
     });
 
@@ -467,6 +554,32 @@ describe('DailyReportService', () => {
       expect(report.anomalies.map((a) => a.code)).toContain('INTENT_OUTSIDE_FIRING_WINDOW');
     });
 
+    /**
+     * The window constrains firing, not exiting (`session-window.ts`).
+     *
+     * `onBar` evaluates exits before consulting the window, so a lot reaching
+     * its frozen take-profit target during the opening auction exits then — by
+     * design, and safely, since the target was fixed at fill and a lot only
+     * ever exits in profit. Counting that as an anomaly raises a false alarm on
+     * every session with an early take-profit, and any unexplained anomaly
+     * restarts the soak week.
+     */
+    it('does not flag an exit stamped before the firing window opens', async () => {
+      const h = harness();
+      await saveAnchorSnapshot(h);
+
+      await h.intents.save(
+        intentRecord({
+          intent: { side: 'SELL', limitPrice: 99.75, timestamp: etTime('09:40:00') } as never,
+        }),
+      );
+
+      const report = await h.service.build(SESSION, NOW);
+
+      expect(report.intents.outsideFiringWindow).toBe(0);
+      expect(report.anomalies.map((a) => a.code)).not.toContain('INTENT_OUTSIDE_FIRING_WINDOW');
+    });
+
     it('flags an unclean reconciliation', async () => {
       const h = harness();
       await saveAnchorSnapshot(h);
@@ -476,6 +589,7 @@ describe('DailyReportService', () => {
         clean: false,
         symbols: [],
         haltedSymbols: [SYMBOL],
+        ordersUpdated: 0,
       };
 
       const report = await h.service.build(SESSION, NOW);
@@ -531,6 +645,7 @@ describe('DailyReportService', () => {
         clean: true,
         symbols: [],
         haltedSymbols: [],
+        ordersUpdated: 0,
       };
       await h.intents.save(intentRecord({ intent: { limitPrice: 95 } as never }));
 
