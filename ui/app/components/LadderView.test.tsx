@@ -27,7 +27,7 @@ function rung(overrides: Partial<Rung> = {}): Rung {
 }
 
 describe('LadderView', () => {
-  it('distinguishes held, re-armed, and pending rungs', () => {
+  it('distinguishes held, re-armed, and armed rungs', () => {
     render(
       <LadderView
         rungs={[
@@ -41,12 +41,12 @@ describe('LadderView', () => {
 
     expect(within(screen.getByTestId('rung-95')).getByText('Held')).toBeInTheDocument();
     expect(within(screen.getByTestId('rung-90.25')).getByText('Re-armed')).toBeInTheDocument();
-    expect(within(screen.getByTestId('rung-85.5')).getByText('Pending')).toBeInTheDocument();
+    expect(within(screen.getByTestId('rung-85.5')).getByText('Armed')).toBeInTheDocument();
   });
 
   /*
-    A working rung is empty but carries a live order. Labelling it "Pending"
-    would tell an operator the level is merely armed while capital is already
+    A working rung is empty but carries a live order. Labelling it "Armed"
+    would tell an operator the level is merely ready while capital is already
     committed there, so the label and the resting order's id are both asserted.
   */
   it('shows a rung with a resting order as working, with its order id', () => {
@@ -64,7 +64,7 @@ describe('LadderView', () => {
 
     expect(within(working).getByText('Working')).toBeInTheDocument();
     expect(within(working).getByText('co-7')).toBeInTheDocument();
-    expect(within(screen.getByTestId('rung-90.25')).getByText('Pending')).toBeInTheDocument();
+    expect(within(screen.getByTestId('rung-90.25')).getByText('Armed')).toBeInTheDocument();
   });
 
   /*

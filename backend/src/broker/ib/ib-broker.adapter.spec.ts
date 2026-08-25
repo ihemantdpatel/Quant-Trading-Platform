@@ -41,6 +41,7 @@ function buildAdapter(
     staleThresholdMs?: number;
     now?: () => number;
     livenessProbeMs?: number;
+    failedRetryMs?: number;
   } = {},
 ): IBBrokerAdapter {
   return new IBBrokerAdapter(
@@ -50,6 +51,8 @@ function buildAdapter(
       // Off by default: these tests call `checkLiveness()` directly rather than
       // waiting on a timer, so no suite depends on wall-clock timing.
       livenessProbeMs: options.livenessProbeMs ?? 0,
+      // Off for the same reason — `retryFailedConnection()` is driven directly.
+      failedRetryMs: options.failedRetryMs ?? 0,
     },
     options.now ?? (() => 0),
     new PacingQueue({}, () => 0, instantSleep),
@@ -72,17 +75,58 @@ describe('IBBrokerAdapter', () => {
       expect(adapter.connectionHealth().state).toBe(ConnectionState.CONNECTED);
     });
 
-    it('reports DISCONNECTED with a reason when the initial connect fails', async () => {
+    it('reports FAILED with a reason when the initial connect fails', async () => {
       const socket = new FakeIbSocket();
       socket.failConnectUntil(99, 'gateway not running');
       const adapter = buildAdapter(socket);
 
       await expect(adapter.connect()).rejects.toThrow('gateway not running');
 
-      // Not FAILED: no retry budget has been spent, so this is not the
-      // exhausted state that halts entries.
-      expect(adapter.connectionHealth().state).toBe(ConnectionState.DISCONNECTED);
+      // FAILED rather than DISCONNECTED, which is a deliberate change. A
+      // requested `disconnect()` also reports DISCONNECTED, and the two must be
+      // distinguishable now that one is retried and the other must not be.
+      // `reconnectAttempts` stays 0, so "never got a connection" is still
+      // legible next to "exhausted a budget".
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.FAILED);
       expect(adapter.connectionHealth().lastError).toBe('gateway not running');
+      expect(adapter.connectionHealth().reconnectAttempts).toBe(0);
+    });
+
+    it('recovers from a failed initial connect once the Gateway appears', async () => {
+      const socket = new FakeIbSocket();
+      // Fails the first call, succeeds on the second — the Gateway starting up
+      // a moment after the daemon did.
+      socket.failConnectUntil(2, 'gateway not running');
+      const adapter = buildAdapter(socket);
+
+      await expect(adapter.connect()).rejects.toThrow('gateway not running');
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.FAILED);
+
+      // The Gateway comes up. Previously nothing re-attempted a socket that
+      // never opened — no disconnect event can fire for it and the liveness
+      // probe only runs once connected — so a Gateway that was merely slow to
+      // start left the daemon permanently disconnected until someone restarted
+      // it. This is that case.
+      await expect(adapter.retryFailedConnection()).resolves.toBe(true);
+
+      expect(adapter.isConnected()).toBe(true);
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.CONNECTED);
+      expect(adapter.connectionHealth().lastError).toBeNull();
+    });
+
+    it('stays FAILED and keeps retrying while the Gateway is still absent', async () => {
+      const socket = new FakeIbSocket();
+      socket.failConnectUntil(99, 'gateway not running');
+      const adapter = buildAdapter(socket);
+
+      await expect(adapter.connect()).rejects.toThrow('gateway not running');
+
+      await expect(adapter.retryFailedConnection()).resolves.toBe(false);
+
+      // A retry that fails is not itself a new fault: the state is unchanged
+      // and the poll simply comes round again.
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.FAILED);
+      expect(adapter.isConnected()).toBe(false);
     });
   });
 
@@ -167,6 +211,102 @@ describe('IBBrokerAdapter', () => {
       await settle();
 
       expect(states).toContain(ConnectionState.FAILED);
+    });
+  });
+
+  describe('FAILED is recoverable without restarting the daemon', () => {
+    it('reconnects once the Gateway returns, long after the budget was spent', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket, { maxAttempts: 2 });
+      await adapter.connect();
+
+      socket.failConnectUntil(99, 'gateway down');
+      socket.simulateSocketDrop();
+      await settle();
+
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.FAILED);
+
+      // The outage outlasts the bounded budget — IB Gateway's daily restart
+      // routinely does. Before the slow poll existed this was terminal: the
+      // liveness probe was stopped, no further disconnect event could fire, and
+      // restarting the process was the only way back.
+      socket.failConnectUntil(0);
+
+      await expect(adapter.retryFailedConnection()).resolves.toBe(true);
+
+      expect(adapter.isConnected()).toBe(true);
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.CONNECTED);
+      expect(adapter.connectionHealth().lastError).toBeNull();
+    });
+
+    it('notifies subscribers, so the live feed can re-subscribe', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket, { maxAttempts: 2 });
+      await adapter.connect();
+
+      socket.failConnectUntil(99, 'gateway down');
+      socket.simulateSocketDrop();
+      await settle();
+
+      const states: ConnectionState[] = [];
+      adapter.onConnectionChange((health) => states.push(health.state));
+
+      socket.failConnectUntil(0);
+      await adapter.retryFailedConnection();
+
+      // The recovery has to travel the same channel a reconnect does, or the
+      // socket comes back with no bar subscription on it — connected broker,
+      // no data, indefinitely.
+      expect(states).toContain(ConnectionState.CONNECTED);
+    });
+
+    it('restarts the staleness clock, so a silent feed is still caught', async () => {
+      const socket = new FakeIbSocket();
+      let clock = 0;
+      const adapter = buildAdapter(socket, {
+        maxAttempts: 2,
+        staleThresholdMs: 1_000,
+        now: () => clock,
+      });
+      await adapter.connect();
+
+      socket.failConnectUntil(99, 'gateway down');
+      socket.simulateSocketDrop();
+      await settle();
+
+      socket.failConnectUntil(0);
+      await adapter.retryFailedConnection();
+
+      // A recovered socket that never resumes its feed must not read as
+      // healthy just because it is connected.
+      clock = 5_000;
+      expect(adapter.isDataStale()).toBe(true);
+    });
+
+    it('does nothing from a state that is not FAILED', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      // Guards the poll against racing a connection that recovered by another
+      // route — a second socket against the same Gateway is worse than a late
+      // recovery.
+      await expect(adapter.retryFailedConnection()).resolves.toBe(true);
+      expect(socket.connectCalls).toBe(1);
+    });
+
+    it('a requested disconnect is not retried', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      await adapter.disconnect();
+
+      // DISCONNECTED means "by choice". Reviving it behind the caller's back
+      // would be the adapter overruling a deliberate operator action.
+      expect(adapter.connectionHealth().state).toBe(ConnectionState.DISCONNECTED);
+      await expect(adapter.retryFailedConnection()).resolves.toBe(false);
+      expect(adapter.isConnected()).toBe(false);
     });
   });
 

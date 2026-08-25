@@ -1,23 +1,33 @@
 /**
  * The ladder: every rung with its price and state — held / working / re-armed /
- * pending (`PRD.md:377`).
+ * armed (`PRD.md:377`).
  *
  * Rungs are ordered highest price first, which is how the ladder is reasoned
  * about: the shallowest rung is the one that fires next on a dip, and the
  * deepest is nearest the hard floor.
  *
- * **Re-armed is shown distinctly from pending**, because they mean different
+ * **`PENDING` is labelled "Armed", not "Pending".** The enum name is the
+ * domain's and it stays — but this dashboard also has a "Pending orders" panel,
+ * and the word means opposite things in the two places: a `PENDING` rung is one
+ * with *no* order anywhere, free to fire. An operator reading a released rung as
+ * "an order is pending here" sees a stale ledger where the state is in fact
+ * correct — exactly the misreading a DAY order expiring overnight produces,
+ * since `clearWorking` returns a never-cycled rung to `PENDING`. "Armed" says
+ * the level is ready and nothing is committed to it.
+ *
+ * **Re-armed is shown distinctly from armed**, because they mean different
  * things to an operator even though both are fireable: a re-armed rung has
- * already completed at least one cycle and booked a realized gain, while a
- * pending rung has never fired. The cycle count is what makes the chop
+ * already completed at least one cycle and booked a realized gain, while an
+ * armed rung has never fired. The cycle count is what makes the chop
  * behaviour visible in the browser, which is Story 7's exit criterion.
  *
  * **Working is the one state carrying live broker exposure without a position.**
  * An order is resting at that price and may fill at any moment, so it reads as
  * an active commitment rather than as another flavour of empty — the amber
  * treatment is shared with risk events for that reason. Conflating it with
- * pending would tell an operator the level is merely armed when capital is
- * already committed to it, which is the mistake the header count exists to stop.
+ * an armed rung would tell an operator the level is merely ready when capital
+ * is already committed to it, which is the mistake the header count exists to
+ * stop.
  */
 
 import { formatCurrency, type Rung } from '../lib/api';
@@ -29,7 +39,7 @@ const STATUS_STYLE: Record<Rung['status'], { label: string; className: string }>
     label: 'Re-armed',
     className: 'border-emerald-700 bg-emerald-950/60 text-emerald-300',
   },
-  PENDING: { label: 'Pending', className: 'border-slate-700 bg-slate-900 text-slate-400' },
+  PENDING: { label: 'Armed', className: 'border-slate-700 bg-slate-900 text-slate-400' },
 };
 
 export function LadderView({ rungs, mark }: { rungs: Rung[]; mark: number | null }) {

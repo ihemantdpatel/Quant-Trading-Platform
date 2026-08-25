@@ -13,7 +13,7 @@ import request from 'supertest';
 import { AppModule } from '../app.module';
 import { BROKER_ADAPTER, ConnectionState, OrderStatus } from '../broker/broker-adapter.interface';
 import { FillMode, MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
-import { EngineService } from '../engine/engine.service';
+import { EngineService, EntryHaltCode } from '../engine/engine.service';
 import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
 
@@ -443,13 +443,81 @@ describe('Story 6: engine HTTP API', () => {
     });
 
     it('surfaces the entry halt and its reason on GET /status', async () => {
-      engine['haltEntries']('broker connection failed: socket dropped');
+      engine['haltEntries'](
+        'broker connection failed: socket dropped',
+        EntryHaltCode.BROKER_CONNECTION,
+      );
 
       const status = await request(app.getHttpServer()).get('/status');
 
       expect(status.body.halts.entryHalt.halted).toBe(true);
       expect(status.body.halts.entryHalt.reason).toMatch(/socket dropped/);
       expect(status.body.alerts.some((a: { code: string }) => a.code === 'ENTRY_HALT')).toBe(true);
+    });
+
+    it('POST /engine/clear-halt resumes entries after operator resolution', async () => {
+      engine['haltEntries'](
+        'broker connection failed: socket dropped',
+        EntryHaltCode.BROKER_CONNECTION,
+      );
+
+      const response = await request(app.getHttpServer()).post('/engine/clear-halt').expect(200);
+
+      expect(response.body.halted).toBe(false);
+      expect(response.body.cleared).toMatch(/socket dropped/);
+
+      const status = await request(app.getHttpServer()).get('/status').expect(200);
+      expect(status.body.halts.entryHalt.halted).toBe(false);
+    });
+
+    it('POST /engine/clear-halt is 404 when nothing is halted', async () => {
+      // Reporting success for a halt that never existed would tell an operator
+      // they had fixed something, which is the one answer worse than an error.
+      await request(app.getHttpServer()).post('/engine/clear-halt').expect(404);
+    });
+
+    it('POST /engine/clear-halt does not itself place an order', async () => {
+      const before = broker.submittedOrders().length;
+
+      engine['haltEntries']('feed quiet', EntryHaltCode.STALE_DATA);
+      await request(app.getHttpServer()).post('/engine/clear-halt').expect(200);
+
+      // Clearing a halt permits the *strategy* to decide again; it decides
+      // nothing itself, and every later intent still crosses the risk
+      // chokepoint unchanged.
+      expect(broker.submittedOrders()).toHaveLength(before);
+    });
+
+    it('POST /broker/reconnect reports a broker that is already connected', async () => {
+      const response = await request(app.getHttpServer()).post('/broker/reconnect').expect(200);
+
+      expect(response.body.connected).toBe(true);
+      // No attempt made: a second socket against a healthy connection is worse
+      // than doing nothing.
+      expect(response.body.attempted).toBe(false);
+    });
+
+    it('POST /broker/reconnect re-establishes a dropped connection', async () => {
+      broker.simulateDisconnect('socket dropped');
+      expect(broker.isConnected()).toBe(false);
+
+      const response = await request(app.getHttpServer()).post('/broker/reconnect').expect(200);
+
+      expect(response.body.attempted).toBe(true);
+      expect(response.body.connected).toBe(true);
+      expect(broker.isConnected()).toBe(true);
+    });
+
+    it('POST /broker/reconnect leaves the entry halt alone', async () => {
+      engine['haltEntries']('broker connection failed', EntryHaltCode.BROKER_CONNECTION);
+      broker.simulateDisconnect('socket dropped');
+
+      await request(app.getHttpServer()).post('/broker/reconnect').expect(200);
+
+      // A recovered socket proves the broker is reachable. It proves nothing
+      // about whether positions still agree with the database, so resuming
+      // entries stays a separate, explicit decision.
+      expect(engine.isHalted()).toBe(true);
     });
 
     it('a FAILED connection halts entries automatically', async () => {

@@ -305,6 +305,17 @@ export class FakeIbSocket implements IbSocket {
     this.connectError = error;
   }
 
+  /**
+   * How many times `connect()` has been called.
+   *
+   * Lets a test assert that a recovery path did *not* open a second socket —
+   * an assertion about a call that should not have happened, which no state
+   * check can make.
+   */
+  get connectCalls(): number {
+    return this.connectAttempts;
+  }
+
   /** Makes the next historical request reject once. */
   failNextHistorical(message = 'pacing violation'): void {
     this.historicalError = message;

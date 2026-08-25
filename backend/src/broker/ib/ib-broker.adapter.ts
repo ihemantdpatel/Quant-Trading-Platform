@@ -77,6 +77,25 @@ export interface IbBrokerConfig {
    * silent loss into an event the rest of the file already knows how to handle.
    */
   livenessProbeMs: number;
+  /**
+   * How often to retry a connection that has already reached `FAILED`.
+   *
+   * `ReconnectPolicy` is a *bounded* budget, and reaching its end used to be
+   * the end of the story: the liveness probe stopped, no disconnect event could
+   * fire again, and nothing in the process ever attempted another connection.
+   * A Gateway that came back a minute later was never noticed, so the only
+   * recovery from any exhausted reconnect was restarting the daemon — including
+   * for IB Gateway's own daily restart, which routinely outlasts the ~3.5
+   * minutes six exponential attempts cover.
+   *
+   * This is deliberately a **slow, fixed, unbounded** poll rather than a second
+   * backoff. The fast budget exists to ride out a blip without disturbing a
+   * live session; this exists to notice, eventually, that a long outage ended.
+   * Different jobs, different cadences.
+   *
+   * Zero disables it, for tests that drive `retryFailedConnection` directly.
+   */
+  failedRetryMs: number;
 }
 
 /**
@@ -86,11 +105,23 @@ export interface IbBrokerConfig {
  */
 export const DEFAULT_LIVENESS_PROBE_MS = 15_000;
 
+/**
+ * 5 minutes between attempts to revive a `FAILED` connection.
+ *
+ * Long enough that a Gateway which is genuinely gone costs one log line per
+ * five minutes rather than a flood, short enough that an outage ending between
+ * sessions is picked up well before the next open. It is also one ladder bar
+ * interval, so at worst a single evaluation is missed after the Gateway
+ * returns.
+ */
+export const DEFAULT_FAILED_RETRY_MS = 5 * 60 * 1000;
+
 export const DEFAULT_IB_BROKER_CONFIG: IbBrokerConfig = {
   pacing: {},
   reconnect: {},
   staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
   livenessProbeMs: DEFAULT_LIVENESS_PROBE_MS,
+  failedRetryMs: DEFAULT_FAILED_RETRY_MS,
 };
 
 /** A historical request as callers of this adapter express it. */
@@ -152,6 +183,15 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   /** The liveness poll, running only while the adapter believes it is connected. */
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * The slow retry poll, running only while the connection is `FAILED`.
+   *
+   * Mutually exclusive with `livenessTimer` by construction: one watches a
+   * connection we believe exists, the other tries to rebuild one we know does
+   * not. Both are cleared on `disconnect()` and on shutdown.
+   */
+  private failedRetryTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     private readonly socket: IbSocket,
     config: Partial<IbBrokerConfig> = {},
@@ -191,6 +231,10 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   }
 
   async connect(): Promise<void> {
+    // An explicit connect supersedes the slow poll — otherwise a timer firing
+    // mid-connect would open a second socket against the same Gateway.
+    this.stopFailedRetry();
+
     this.setHealth({ ...this.health, state: ConnectionState.CONNECTING });
 
     try {
@@ -205,22 +249,45 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
-      // A failed *initial* connect is not the exhausted-retry state: no retry
-      // budget has been spent. It is reported as disconnected with the reason,
-      // and the caller decides whether to retry.
+      // Reported as FAILED, which is a change: this used to be DISCONNECTED on
+      // the grounds that no retry budget had been spent. But DISCONNECTED is
+      // also what a *requested* disconnect reports, and the two need telling
+      // apart now that one of them is being retried and the other must not be.
+      // FAILED is the state that means "not connected, not by choice, and being
+      // worked on" — which is exactly this. `reconnectAttempts` stays 0, so the
+      // distinction the old comment cared about is still legible on
+      // `GET /status`.
       this.setHealth({
-        state: ConnectionState.DISCONNECTED,
+        state: ConnectionState.FAILED,
         connectedAt: null,
         reconnectAttempts: 0,
         lastError: message,
       });
+
+      // **The caller is told, and the adapter keeps trying anyway.**
+      //
+      // `StartupSequence` catches this and boots regardless, which is right —
+      // the dashboard must come up so an operator can see *why* nothing is
+      // trading. But nothing then re-attempted the connection: no disconnect
+      // event can fire for a socket that never opened, and the liveness probe
+      // only runs once connected. A Gateway that was merely slow to start left
+      // the daemon permanently disconnected with every symbol halted, and a
+      // restart was the only way back.
+      //
+      // The slow poll makes a boot-time outage recoverable on exactly the same
+      // terms as a mid-session one. `retryFailedConnection` gates on FAILED, so
+      // this is the state that expresses "gave up, still watching".
+      this.startFailedRetry();
 
       throw error;
     }
   }
 
   async disconnect(): Promise<void> {
+    // Both polls: a requested disconnect is deliberate, and reviving the socket
+    // behind the caller's back would be the adapter overruling it.
     this.stopLivenessProbe();
+    this.stopFailedRetry();
     await this.socket.disconnect();
     this.setHealth({ ...this.health, state: ConnectionState.DISCONNECTED, connectedAt: null });
   }
@@ -284,13 +351,114 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   }
 
   /**
-   * Stops the liveness poll.
+   * One attempt to revive a connection that has reached `FAILED`.
    *
-   * Nest calls this on shutdown; without it the interval keeps the event loop
+   * The counterpart to `checkLiveness`: that one notices a connection we
+   * believe in has gone, this one notices a connection we have given up on has
+   * become possible again. Between them there is no state the adapter can
+   * settle into where nothing is watching.
+   *
+   * On success the adapter re-enters `CONNECTED` through the same path a
+   * reconnect takes — pacing window reset, staleness clock restarted, liveness
+   * probe running — and emits the health change the engine and live feed are
+   * already subscribed to. It does **not** clear the engine's entry halt: this
+   * proves the socket is back, not that positions still reconcile. That
+   * decision belongs to reconciliation and to the operator.
+   *
+   * Public so a test can drive it without a timer, and so an operator route can
+   * force an immediate attempt rather than waiting out the poll.
+   */
+  async retryFailedConnection(): Promise<boolean> {
+    if (this.health.state !== ConnectionState.FAILED) {
+      // Only meaningful from FAILED. A connection that recovered by any other
+      // route has already stopped this poll; racing it would risk a second
+      // socket.
+      return this.health.state === ConnectionState.CONNECTED;
+    }
+
+    try {
+      await this.socket.connect();
+    } catch (error) {
+      // Stays FAILED and stays polling. Logged at warn, not error: the outage
+      // was already reported as critical when the budget ran out, and repeating
+      // that every five minutes is how an operator learns to filter the alert
+      // that matters.
+      this.logger.warn(
+        `IB retry from FAILED did not connect: ${
+          error instanceof Error ? error.message : String(error)
+        }. Still retrying every ${Math.round(this.config.failedRetryMs / 1000)}s.`,
+      );
+
+      return false;
+    }
+
+    this.stopFailedRetry();
+
+    this.setHealth({
+      state: ConnectionState.CONNECTED,
+      connectedAt: new Date(this.now()).toISOString(),
+      reconnectAttempts: 0,
+      lastError: null,
+    });
+
+    // The same session bookkeeping a successful reconnect does — IB counts
+    // pacing per session, and a new session starts with an empty budget.
+    this.pacing.reset();
+
+    // A fresh session has delivered no bar. Restarting the expectation clock is
+    // what keeps a socket that reconnects but never resumes its feed visible to
+    // the staleness watchdog rather than reading as startup forever.
+    this.lastBarAtMs = null;
+    this.dataExpectedSinceMs = this.now();
+
+    this.startLivenessProbe();
+
+    this.logger.log(
+      'IB connection recovered from FAILED. New entries remain halted until an ' +
+        'operator clears the halt or reconciliation confirms positions.',
+    );
+
+    return true;
+  }
+
+  /**
+   * Stops both polls.
+   *
+   * Nest calls this on shutdown; without it an interval keeps the event loop
    * alive and the process never exits.
    */
   onModuleDestroy(): void {
     this.stopLivenessProbe();
+    this.stopFailedRetry();
+  }
+
+  private startFailedRetry(): void {
+    this.stopFailedRetry();
+
+    if (this.config.failedRetryMs <= 0) {
+      // Opt-out for tests that drive `retryFailedConnection` directly.
+      return;
+    }
+
+    this.logger.warn(
+      `IB connection FAILED — retrying every ${Math.round(
+        this.config.failedRetryMs / 1000,
+      )}s until it returns. No further alert will be raised for this outage.`,
+    );
+
+    this.failedRetryTimer = setInterval(() => {
+      void this.retryFailedConnection();
+    }, this.config.failedRetryMs);
+
+    // Like the liveness probe: never the reason the daemon cannot exit.
+    this.failedRetryTimer.unref?.();
+  }
+
+  private stopFailedRetry(): void {
+    if (this.failedRetryTimer !== null) {
+      clearInterval(this.failedRetryTimer);
+      this.failedRetryTimer = null;
+    }
   }
 
   private startLivenessProbe(): void {
@@ -549,8 +717,9 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
 
       // Exhausted. FAILED is what the engine watches for: it halts new entries
       // and raises a critical alert. **Nothing is liquidated** (`PRD.md:316`).
-      // The probe stops here: the loss is known and reported, and re-detecting
-      // it would spend a fresh retry budget on every tick.
+      // The liveness probe stops: it watches a connection we believed in, and
+      // we no longer do — re-detecting the same loss would spend a fresh retry
+      // budget every tick.
       this.stopLivenessProbe();
       this.setHealth({
         state: ConnectionState.FAILED,
@@ -562,6 +731,13 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
       this.logger.error(
         'IB reconnect exhausted — new entries halted. Existing positions are held, NOT liquidated.',
       );
+
+      // **But FAILED is not the end.** The slow poll takes over from the fast
+      // budget, so an outage that outlasts six exponential attempts — IB
+      // Gateway's daily restart is routinely one — is still recovered from
+      // without an operator restarting the daemon. Entries stay halted until a
+      // connection actually returns; this only restores the *ability* to notice.
+      this.startFailedRetry();
     } finally {
       this.reconnecting = false;
     }

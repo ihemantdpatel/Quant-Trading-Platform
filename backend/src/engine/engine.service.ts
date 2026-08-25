@@ -89,6 +89,25 @@ export interface EngineAlert {
 }
 
 /**
+ * Why new entries are halted.
+ *
+ * The distinction that matters is **which faults can prove themselves over**.
+ * `STALE_DATA` can: a bar arriving is direct positive evidence that the exact
+ * condition — no bars — has ended. Nothing else here has an equivalent. A
+ * broker that reconnects has not shown its positions still reconcile, and a
+ * submission that failed once says nothing about the next one. Those stay
+ * latched until an operator says otherwise.
+ */
+export enum EntryHaltCode {
+  /** Market data stopped arriving. Self-clears when it resumes. */
+  STALE_DATA = 'STALE_DATA',
+  /** The broker connection failed. Operator-cleared only. */
+  BROKER_CONNECTION = 'BROKER_CONNECTION',
+  /** An order could not be submitted or cancelled. Operator-cleared only. */
+  ORDER_FAULT = 'ORDER_FAULT',
+}
+
+/**
  * A resting entry order this engine is waiting on, keyed by `clientOrderId`.
  *
  * `rungPrice` is the reason this exists: a fill carries only broker vocabulary
@@ -127,12 +146,36 @@ export class EngineService {
   private readonly logger = new Logger(EngineService.name);
 
   /**
-   * Set when a technical fault halts new entries. Sticky until an operator
-   * clears it — a fault that silently un-halted would resume trading on a
-   * connection nobody confirmed was healthy.
+   * Set when a technical fault halts new entries.
+   *
+   * Sticky until an operator clears it, with **one exception**: a halt raised
+   * because market data went stale clears itself when a bar actually arrives.
+   * See `clearStaleHalt`. Every other cause stays latched — a fault that
+   * silently un-halted would resume trading on a connection nobody confirmed
+   * was healthy.
+   *
+   * `code` is what makes that distinction expressible. Without it the only
+   * thing distinguishing a stale-data halt from a broker-failure halt was
+   * English prose in `reason`, and self-clearing on a substring match would be
+   * one reworded log line away from resuming trading against a dead broker.
    */
-  private entryHalt: { reason: string; at: string } | null = null;
+  private entryHalt: { reason: string; at: string; code: EntryHaltCode } | null = null;
   private readonly alerts: EngineAlert[] = [];
+  /**
+   * High-water mark behind `co-N` client order ids.
+   *
+   * **Restored from persisted orders at startup, never assumed to be zero.** A
+   * restart leaves the `Order` table intact while this counter restarts, so a
+   * fresh process re-issues `co-1` for an id the previous one already used.
+   * Both repositories *upsert* on `clientOrderId`, so the collision does not
+   * error — it silently overwrites the earlier order's row, and a fill arriving
+   * for either order then resolves to the wrong one. That is how a 69.00 limit
+   * came to carry a 73.18 fill and open a phantom lot the lot-sum assertion
+   * later halted on.
+   *
+   * `reset()` may still return this to zero: it clears the order table in the
+   * same call, so there is nothing left to collide with.
+   */
   private clientOrderSequence = 0;
   private lastBarTimestamp: string | null = null;
 
@@ -180,7 +223,10 @@ export class EngineService {
     // mid-submission.
     this.broker.onConnectionChange((health) => {
       if (health.state === ConnectionState.FAILED) {
-        this.haltEntries(`broker connection failed: ${health.lastError ?? 'unknown'}`);
+        this.haltEntries(
+          `broker connection failed: ${health.lastError ?? 'unknown'}`,
+          EntryHaltCode.BROKER_CONNECTION,
+        );
       }
     });
 
@@ -253,6 +299,12 @@ export class EngineService {
    */
   async processBar(bar: Bar): Promise<Omit<ReplayResult, 'fixture' | 'barsProcessed'>> {
     this.lastBarTimestamp = bar.timestamp;
+
+    // Before the outcome is snapshotted below, so the bar that proves the feed
+    // recovered is itself allowed to trade. Deferring to the *next* bar would
+    // discard a live evaluation for no added safety — this bar is the evidence.
+    // No-op unless the halt was raised by staleness; see `clearStaleHalt`.
+    this.clearStaleHalt();
 
     const outcome = {
       intentsGenerated: 0,
@@ -494,7 +546,11 @@ export class EngineService {
     } catch (error) {
       // Technical fault. Halt new entries; liquidate nothing.
       const detail = error instanceof Error ? error.message : String(error);
-      this.haltEntries(`order submission failed: ${detail}`, intent.timestamp);
+      this.haltEntries(
+        `order submission failed: ${detail}`,
+        EntryHaltCode.ORDER_FAULT,
+        intent.timestamp,
+      );
       await this.orders.updateStatus(clientOrderId, OrderStatus.CANCELLED, detail);
 
       // The order never reached the broker, so nothing is resting — drop the
@@ -827,6 +883,7 @@ export class EngineService {
       this.haltEntries(
         `failed to cancel the remainder of ${clientOrderId} (${filled}/${working.quantity} filled ` +
           `at rung ${working.rungPrice.toFixed(2)}): ${detail}`,
+        EntryHaltCode.ORDER_FAULT,
       );
     }
   }
@@ -976,13 +1033,13 @@ export class EngineService {
     return { deployed, pnl: { realized: 0, unrealized: 0 } };
   }
 
-  private haltEntries(reason: string, at?: string): void {
+  private haltEntries(reason: string, code: EntryHaltCode, at?: string): void {
     if (this.entryHalt) {
       return;
     }
 
     const timestamp = at ?? this.lastBarTimestamp ?? '1970-01-01T00:00:00.000Z';
-    this.entryHalt = { reason, at: timestamp };
+    this.entryHalt = { reason, at: timestamp, code };
 
     this.raiseAlert('CRITICAL', 'ENTRY_HALT', reason, timestamp);
     this.logger.error(
@@ -1008,8 +1065,42 @@ export class EngineService {
    * broker fault: halting a sell would trap a position the strategy has already
    * decided to close, and **nothing here liquidates anything**.
    */
-  haltEntriesForFault(reason: string): void {
-    this.haltEntries(reason);
+  haltEntriesForFault(reason: string, code: EntryHaltCode = EntryHaltCode.STALE_DATA): void {
+    this.haltEntries(reason, code);
+  }
+
+  /**
+   * Clears a **staleness** halt once bars are arriving again.
+   *
+   * Called from `processBar`, so the trigger is a bar that actually reached the
+   * engine — direct positive evidence that the fault condition ("no bars") has
+   * ended. That is the whole justification for this being automatic, and it is
+   * why the check is on `code` rather than on anything about the connection:
+   * a socket reporting healthy is not evidence that data flows, which is
+   * precisely the failure the staleness watchdog exists to catch.
+   *
+   * **Every other halt code is left alone.** A broker fault is not disproved by
+   * a bar (bars and orders travel different paths, and a feed can recover while
+   * submission stays broken), and a failed submission is not disproved by
+   * anything except trying again. Those stay latched for an operator.
+   *
+   * Without this, a feed that went quiet and then simply resumed — a data-farm
+   * blip, a pacing throttle, no socket drop anywhere — left entries halted for
+   * the life of the process. Bars flowed, the ladder evaluated, and every BUY
+   * was silently dropped until someone restarted the daemon.
+   */
+  private clearStaleHalt(): void {
+    if (this.entryHalt?.code !== EntryHaltCode.STALE_DATA) {
+      return;
+    }
+
+    const previous = this.entryHalt;
+    this.entryHalt = null;
+
+    this.logger.log(
+      `market data resumed — entry halt raised at ${previous.at} cleared automatically. ` +
+        'Only a staleness halt clears this way; every other fault waits for an operator.',
+    );
   }
 
   /** Operator action: clears a technical halt. Never happens on a timer. */
@@ -1060,6 +1151,44 @@ export class EngineService {
   /** True when a reconciliation mismatch has halted this symbol (Story 9). */
   isSymbolHalted(symbol: string): boolean {
     return this.symbolHalts.isHalted(symbol);
+  }
+
+  /**
+   * Advances the client-order sequence past every id already persisted.
+   *
+   * Called once from `StartupSequence`, before the gate opens and therefore
+   * before any bar can submit. Ids are never reused across a restart, so the
+   * fill router cannot resolve an execution to a superseded order.
+   *
+   * **The maximum is taken, not the row count.** Counting rows would repeat an
+   * id whenever the table has been pruned or a submission failed after
+   * incrementing, which is precisely the collision this closes.
+   *
+   * Ids that do not match `co-N` are ignored rather than rejected: orders
+   * recovered from IB or written by hand carry the broker's own vocabulary, and
+   * refusing to boot over one would take the dashboard down for a row that
+   * cannot collide with this generator anyway.
+   */
+  async restoreClientOrderSequence(): Promise<void> {
+    const orders = await this.orders.findAll();
+    let highest = 0;
+
+    for (const order of orders) {
+      const match = /^co-(\d+)$/.exec(order.clientOrderId);
+
+      if (match) {
+        highest = Math.max(highest, Number(match[1]));
+      }
+    }
+
+    // Only ever moves forward. A restore that lowered the counter would hand
+    // out ids the running process had already issued.
+    if (highest > this.clientOrderSequence) {
+      this.clientOrderSequence = highest;
+      this.logger.log(
+        `client order sequence resumed at co-${highest} — ${orders.length} persisted order(s)`,
+      );
+    }
   }
 
   async reset(): Promise<void> {
