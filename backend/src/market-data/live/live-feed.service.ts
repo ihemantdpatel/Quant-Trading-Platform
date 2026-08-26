@@ -68,6 +68,20 @@ export interface LiveBarSource {
    * behaviour those callers already had.
    */
   onConnectionChange?(handler: (connected: boolean) => void): () => void;
+  /**
+   * The most recent market-data error per symbol, if the source tracks any.
+   *
+   * Read only when a stale halt is being raised, to name the *cause* alongside
+   * the effect. IB answers an unentitled or refused subscription here and then
+   * delivers nothing, so the error and the silence are the same fault seen from
+   * two sides — but the halt message previously reported only the silence, and
+   * an operator had to go find `broker.dataErrors` to learn why.
+   *
+   * Optional, like `onConnectionChange`: a source with no notion of data errors
+   * (a fixture, a test double) simply contributes no cause, and the halt reads
+   * exactly as it did before.
+   */
+  dataErrors?(): Array<{ symbol: string; code: number | null; message: string }>;
 }
 
 export interface LiveFeedConfig {
@@ -216,12 +230,53 @@ export class LiveFeedService implements OnModuleDestroy {
 
     this.staleHaltRaised = true;
 
+    // Names the cause next to the effect. IB refuses a subscription on the
+    // error channel and then delivers nothing, so "no bars" and "code 162" are
+    // one fault; reporting only the silence sent an operator hunting through
+    // `broker.dataErrors` for the half that says what to actually fix.
+    const cause = this.staleCause();
+
     // Halts **new entries**. Nothing is sold — there is deliberately no path
     // from here to a liquidation (`PRD.md:317`).
     this.consumer.haltEntriesForFault(
-      'market data stale beyond threshold — halting new entries. Positions are held, NOT liquidated.',
+      `market data stale beyond threshold — halting new entries. Positions are held, NOT liquidated.${cause}`,
     );
-    this.logger.error('market data stale beyond threshold — new entries halted');
+    this.logger.error(`market data stale beyond threshold — new entries halted${cause}`);
+  }
+
+  /**
+   * The reported market-data errors, as a clause to append to the halt reason.
+   *
+   * Empty string when there is nothing to add, so the message is unchanged for
+   * a source that tracks no errors or a feed that simply went quiet with no
+   * error reported — silence with no stated cause is still the honest report,
+   * and inventing one would be worse than none.
+   *
+   * Defensive around the source: this runs while a fault is already being
+   * reported, and a throw here would replace a halt an operator needs with an
+   * unhandled error from the diagnostic that was only meant to describe it.
+   */
+  private staleCause(): string {
+    let errors: Array<{ symbol: string; code: number | null; message: string }>;
+
+    try {
+      errors = this.source.dataErrors?.() ?? [];
+    } catch {
+      return '';
+    }
+
+    if (errors.length === 0) {
+      return '';
+    }
+
+    const detail = errors
+      .map(
+        (error) =>
+          `${error.symbol}: ${error.code === null ? '' : `[${error.code}] `}${error.message}`,
+      )
+      .join('; ');
+
+    return ` Reported market-data error(s) — ${detail}`;
   }
 
   /**
@@ -232,6 +287,18 @@ export class LiveFeedService implements OnModuleDestroy {
    * the socket still looked healthy.
    */
   private enqueue(bar: Bar): void {
+    // A bar arrived, so the feed is not stale any more. Unlatching here is what
+    // lets a *second* outage be reported: the flag is sticky so one fault does
+    // not flood the alert list, but leaving it latched after recovery meant the
+    // next silence passed unnoticed. Paired with the engine's own auto-clear of
+    // a staleness halt — this side re-arms the detector, that side lifts the
+    // halt, and both are driven by the same evidence.
+    //
+    // Set before the bar is processed rather than after: it describes the
+    // arrival, not the outcome, and a bar that throws in `processBar` still
+    // proves data is flowing.
+    this.staleHaltRaised = false;
+
     this.queue = this.queue
       .then(() => this.consumer.processBar(bar))
       .then(() => {

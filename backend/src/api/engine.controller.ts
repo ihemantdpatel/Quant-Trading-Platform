@@ -347,6 +347,95 @@ export class EngineController {
     return { symbol, halted: false };
   }
 
+  /**
+   * Clears the engine's **technical** entry halt after operator resolution.
+   *
+   * The counterpart to `POST /halts/:symbol/release`, which clears a
+   * *reconciliation* halt. Both exist for the same reason: a halt that only a
+   * process restart can clear is not an operator control, and restarting a
+   * trading daemon to clear a flag is a far blunter instrument than the flag
+   * itself. `EngineService.clearHalt()` has existed since Story 6 and was
+   * reachable from nothing — a stale feed, an exhausted reconnect, or a failed
+   * submission latched entries off until someone killed the process.
+   *
+   * **This is narrower than it looks.** It clears one boolean that gates new
+   * BUY intents. It does not reconnect a broker, resume a dead feed, or resolve
+   * a reconciliation mismatch — those have their own routes and their own
+   * evidence. Clearing a halt whose cause is still present simply means the
+   * next fault re-raises it, which is the correct behaviour and not a loophole:
+   * the fault detectors all still run.
+   *
+   * There is deliberately no path from here to a trade. Clearing the halt
+   * permits the *strategy* to decide again; every intent it produces still goes
+   * through the risk chokepoint, the caps, the loss breaker, and the kill
+   * switch exactly as before.
+   */
+  @Post('engine/clear-halt')
+  @HttpCode(HttpStatus.OK)
+  clearHalt(): unknown {
+    const reason = this.engine.haltReason();
+
+    if (reason === null) {
+      throw new NotFoundException('no active entry halt');
+    }
+
+    this.engine.clearHalt();
+
+    return { halted: false, cleared: reason };
+  }
+
+  /**
+   * Operator action: re-establish a broker connection that has given up.
+   *
+   * The adapter retries a `FAILED` connection on a slow poll of its own, so
+   * this is not the only way back — but the poll is deliberately slow (minutes)
+   * and an operator who has just restarted IB Gateway should not have to wait
+   * it out. This forces the attempt immediately.
+   *
+   * **Reconciliation is not run from here, deliberately.** A recovered socket
+   * proves the broker is reachable; it proves nothing about whether positions
+   * still agree with the database, and that question has its own route
+   * (`POST /reconcile`) whose answer can halt symbols. Chaining them would hide
+   * a halt-raising operation behind a button labelled "reconnect". An operator
+   * reconnects, reads the result, and then reconciles.
+   *
+   * Nothing here submits, cancels, or liquidates.
+   */
+  @Post('broker/reconnect')
+  @HttpCode(HttpStatus.OK)
+  async reconnectBroker(): Promise<unknown> {
+    if (this.broker.isConnected()) {
+      return { connected: true, attempted: false, state: this.brokerState() };
+    }
+
+    // Only the IB adapter has a FAILED state to recover from; the mock has no
+    // notion of one, and calling `connect()` on it is the honest equivalent.
+    const connected =
+      this.broker instanceof IBBrokerAdapter
+        ? await this.broker.retryFailedConnection()
+        : await this.connectPlainBroker();
+
+    return { connected, attempted: true, state: this.brokerState() };
+  }
+
+  /** `connect()` for an adapter with no FAILED state, reporting rather than throwing. */
+  private async connectPlainBroker(): Promise<boolean> {
+    try {
+      await this.broker.connect();
+    } catch {
+      // Reported through `connected: false` — an operator pressing a reconnect
+      // button on an unreachable broker is asking a question, not making a
+      // mistake, and a 500 would tell them less than the state does.
+      return false;
+    }
+
+    return this.broker.isConnected();
+  }
+
+  private brokerState(): string {
+    return this.broker.connectionHealth().state;
+  }
+
   @Post('strategies/:id/enable')
   @HttpCode(HttpStatus.OK)
   async enableStrategy(@Param('id') id: string): Promise<unknown> {

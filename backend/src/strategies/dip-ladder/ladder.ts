@@ -82,6 +82,50 @@ export function isRungHeld(position: LadderPosition, rungPrice: number): boolean
   return position.heldLots.some((lot) => roundToCents(lot.rungPrice) === target);
 }
 
+/**
+ * True when a BUY limit at `rungPrice` would actually rest rather than fill on
+ * arrival.
+ *
+ * A buy limit is marketable at or above the offer, so the exchange fills it
+ * immediately at the prevailing price instead of holding it at the level. The
+ * strict comparison is deliberate: a limit *equal* to the close is marketable
+ * too, and a rung the market is already sitting on is not a dip.
+ *
+ * The bar's close stands in for the market. It is the freshest price a pure
+ * bar-driven strategy has, and it is the same reference the IMMEDIATE path
+ * already compares against — so both placement modes decide "is this level
+ * below the market" from one source, and neither needs a quote.
+ *
+ * This is only a question under RESTING. Under IMMEDIATE the order is created
+ * at the moment the close reaches the rung, and being marketable is then the
+ * intent rather than a fault.
+ */
+export function isRestable(rungPrice: number, close: number): boolean {
+  return roundToCents(rungPrice) < roundToCents(close);
+}
+
+/**
+ * The decline a RESTING rung above the market produces.
+ *
+ * Reuses `ABOVE_RUNG` rather than introducing a kind: the condition is the same
+ * one the IMMEDIATE path reports — the market has not come down to this level —
+ * and callers that already surface `ABOVE_RUNG` need no change to describe it.
+ * The detail names the placement so a log line distinguishes "waiting for the
+ * close to reach the rung" from "refusing to rest a marketable buy".
+ */
+function aboveMarket(rungPrice: number, close: number): FiringDecision {
+  return {
+    intent: null,
+    rungPrice,
+    blocked: {
+      kind: 'ABOVE_RUNG',
+      detail:
+        `rung ${rungPrice.toFixed(2)} is at or above close ${close.toFixed(2)} — ` +
+        'a resting buy limit there would be marketable and fill immediately',
+    },
+  };
+}
+
 export type BlockedReason =
   | { kind: 'OUTSIDE_WINDOW'; detail: string }
   | { kind: 'ABOVE_RUNG'; detail: string }
@@ -135,6 +179,16 @@ export function evaluateBar(
     : selectFireableRung(position.rungs, bar.close, bar.timestamp);
 
   if (existing) {
+    // A resting BUY limit must sit *below* the market to rest. A re-armed rung
+    // keeps its original price while price recovers past it, so
+    // `highestFireableRung` — which ignores where price is, by design — will
+    // hand back a level above the close. Sent as a limit order that is a
+    // marketable buy: it fills instantly at the ask instead of waiting for the
+    // dip, which is the opposite of what a predetermined-level ladder does.
+    if (resting && !isRestable(existing.price, bar.close)) {
+      return aboveMarket(existing.price, bar.close);
+    }
+
     return buildEntry(existing.price, bar, position, config, `re-arm/pending rung`);
   }
 
@@ -163,7 +217,17 @@ export function evaluateBar(
   // rule below, a wick through the rung that recovered before the close fired
   // nothing at all (`PRD.md:92`); with an order already resting, the exchange
   // fills it on the way through.
+  //
+  // "Below the market" is the one thing that still has to hold. A newly
+  // extended rung sits a full spacing unit under the anchor, so it is normally
+  // well below the close — but the anchor is the lowest *held* lot, not the
+  // market, so a position held while price falls far beneath it puts the next
+  // computed rung above the close too.
   if (config.orderPlacement === OrderPlacement.RESTING) {
+    if (!isRestable(rungPrice, bar.close)) {
+      return aboveMarket(rungPrice, bar.close);
+    }
+
     return buildEntry(
       rungPrice,
       bar,

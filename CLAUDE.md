@@ -41,7 +41,7 @@ All backend commands run from `backend/`.
 
 | Command | Purpose |
 |---|---|
-| `npm test` | Full suite (1468 tests), no database required |
+| `npm test` | Full suite (1494 tests), no database required |
 | `npm run test:cov` | Suite + coverage thresholds — what CI gates on |
 | `npm run test:db` | The Prisma suites; needs `DATABASE_URL` |
 | `npm run test:watch` | Watch mode |
@@ -82,13 +82,16 @@ IB Gateway can come from either place, and **the container is opt-in**:
   `TWS_PASSWORD` in `.env` (gitignored).
 
 There is deliberately **no `depends_on`** for IB: it may be on the host, in the optional container,
-or absent, and compose cannot express "wait only if that profile is active". The adapter's bounded
-reconnect handles a Gateway that is not ready — which is the right mechanism anyway, since a Gateway
-can also go away after startup.
+or absent, and compose cannot express "wait only if that profile is active". The adapter's reconnect
+handles a Gateway that is not ready — which is the right mechanism anyway, since a Gateway can also
+go away after startup. A Gateway that starts *after* the daemon is picked up by the slow retry poll
+rather than needing a restart; see "`FAILED` is not terminal" under the IB adapter.
 
 **A Gateway that is running but not logged in is the awkward case**, not a Gateway that is down: it
 accepts the socket and never handshakes. Expect `connect failed … within 15000ms`, then
 `IB did not respond within 10000ms`, then a `BROKER_UNAVAILABLE` halt — the API stays up throughout.
+That halt is a *reconciliation* halt and stays until released by hand, even once the connection
+recovers: the broker being reachable again is not evidence that positions reconcile.
 
 **CI** (`.github/workflows/ci.yml`): lint → test with coverage → build, for backend and UI separately.
 Coverage thresholds are enforced by Jest exiting non-zero, which fails the job.
@@ -483,6 +486,27 @@ all happen on cue, and none of them is reproducible against a live Gateway.
   to ignore alerts.
 - **Retries exhausted → `FAILED` → new entries halt, positions untouched.** There is no code path
   from a technical fault to a sell, and none may be added.
+- **`FAILED` is not terminal — a slow poll keeps trying.** It used to be: exhaustion stopped the
+  liveness probe, no further disconnect event could fire, and *nothing in the process ever attempted
+  another connection*. A Gateway that came back a minute later was never noticed, so the only
+  recovery from any exhausted reconnect was restarting the daemon — including for IB Gateway's own
+  daily restart, which routinely outlasts the ~3.5 minutes six exponential attempts cover.
+  `failedRetryMs` (5 min, unbounded) now takes over from the bounded budget. The two are deliberately
+  different mechanisms: the fast budget rides out a blip without disturbing a live session, the slow
+  poll notices — eventually — that a long outage ended. **Entries stay halted throughout**; the poll
+  restores only the *ability to notice*, never the decision to trade.
+- **A failed *initial* connect is retried the same way, and reports `FAILED`.** Previously it set
+  `DISCONNECTED` and rethrew: `StartupSequence` caught it and booted anyway (right — the dashboard
+  must come up so an operator can see why nothing is trading), but nothing then re-attempted the
+  connection. No disconnect event can fire for a socket that never opened, and the liveness probe
+  only runs once connected, so a Gateway merely slow to start left the daemon permanently
+  disconnected with every symbol halted. `FAILED` rather than `DISCONNECTED` because a *requested*
+  `disconnect()` also reports `DISCONNECTED`, and the two must be distinguishable now that one is
+  retried and the other must not be. `reconnectAttempts` stays 0, so "never got a connection" is
+  still legible next to "exhausted a budget".
+- **`connect()` and `disconnect()` both stop the poll.** An explicit connect supersedes it (a timer
+  firing mid-connect would open a second socket against the same Gateway); a requested disconnect is
+  deliberate, and reviving it behind the caller's back would be the adapter overruling an operator.
 - **Stale data is its own fail-safe trigger.** A connected socket that stopped delivering is more
   dangerous than a dropped one — nothing looks wrong while the ladder evaluates against a stale
   price. `LiveFeedService` watches it and halts *new entries only*.
@@ -492,7 +516,8 @@ all happen on cue, and none of them is reproducible against a live Gateway.
   process: connected broker, no bars, indefinitely. `LiveFeedService` re-subscribes on every
   `CONNECTED`, guarded so a reconnect that succeeds on attempt 2 does not subscribe twice. The
   watchdog would catch the silence, but a halt clearable only by restarting the daemon each morning
-  is not a working feed.
+  is not a working feed. Recovery from `FAILED` travels this same channel, which is what stops a
+  revived socket coming back with no subscription on it — connected broker, no bars, indefinitely.
 - **Market-data errors are reported, not just logged.** IB rejects an unentitled or malformed data
   request on the subscription's error channel and then delivers nothing — the socket stays connected
   and every other `/status` field reads healthy, so the failure that matters most (no bars) was
@@ -536,6 +561,50 @@ which in `PAPER` went straight at the submission path.
 The pure wire conversions live in `ib-wire.ts`, separate from the socket, so they stay under the
 coverage threshold while the Gateway-dependent plumbing is excluded from it. That is where a
 mis-encoded payload or misread timestamp would come from; it is covered at 100%.
+
+### Halts, and how each one clears
+
+There are **two** halts with different scopes and different exits, and the distinction between them
+is covered under "Why this is not the engine's `entryHalt`" in `symbol-halt.service.ts`. What this
+section adds is the part that was missing: **how each one ends**.
+
+The governing rule is that no fault may latch with no way out. Every halt here refuses to liquidate —
+that part is unchanged and must stay that way — but a halt only a process restart can clear is not an
+operator control, and restarting a trading daemon to clear a flag is a far blunter instrument than
+the flag itself.
+
+| Halt | Scope | Exits allowed? | Clears by |
+|---|---|---|---|
+| `entryHalt` (`EngineService`) | whole engine | **yes** | operator, or self on resumed data |
+| `SymbolHaltService` | one symbol | no | operator only |
+
+**`EntryHaltCode` decides which technical halts can self-clear**, and it exists precisely so that
+decision is structural rather than textual. The halt previously carried only English prose in
+`reason`; matching on a substring to decide whether to resume trading would be one reworded log line
+away from resuming against a dead broker.
+
+- **`STALE_DATA` clears itself when a bar arrives.** A bar is direct positive evidence that the fault
+  condition — no bars — has ended. `processBar` calls `clearStaleHalt()` *before* snapshotting the
+  outcome, so the bar that proves recovery may itself trade; deferring to the next bar would discard
+  a live evaluation for no added safety.
+- **`BROKER_CONNECTION` and `ORDER_FAULT` never self-clear.** Bars and orders travel different paths,
+  so a bar is no evidence about the broker — a feed can recover while submission stays broken. And a
+  failed submission is disproved by nothing except trying again, which is an operator's decision.
+
+Without the auto-clear, a feed that went quiet and then simply resumed — a data-farm blip, a pacing
+throttle, no socket drop anywhere — left entries halted for the life of the process: bars flowed, the
+ladder evaluated, and **every BUY was silently dropped** until someone restarted the daemon.
+
+**`LiveFeedService` re-arms its detector on the same evidence.** `staleHaltRaised` is sticky so one
+fault does not flood the alert list, but it used to reset only in `resubscribe()` — i.e. only on a
+connection change. A recovery without a socket event left the detector permanently spent and the
+*next* silence went unreported. It now unlatches when a bar arrives, set before processing rather
+than after: it describes the arrival, not the outcome, and a bar that throws in `processBar` still
+proves data is flowing.
+
+**Reconciliation halts stay operator-only, deliberately.** "The numbers disagree" is never
+self-resolving, and the existing refusal to guess at lot composition is what makes that right. Clear
+them with `POST /halts/:symbol/release` after resolving the account by hand.
 
 ### Historical cache: IB is called only for gaps
 
@@ -700,13 +769,32 @@ fireable and tell an operator the ladder is armed at a level where an order is a
 
 Read: `GET /parameters` `/parameters/changes` `/parameters/:strategyId`
 
-Control: `POST /engine/replay` `{fixture}` · `/engine/reset` · `/reconcile` · `/kill-switch`
-`{engaged, reason}` · `/strategies/:id/enable|disable` · `/mode` `{mode}` ·
-`/parameters/:strategyId` `{parameters, reason}` · `/halts/:symbol/release`
+Control: `POST /engine/replay` `{fixture}` · `/engine/reset` · `/engine/clear-halt` · `/reconcile` ·
+`/broker/reconnect` · `/kill-switch` `{engaged, reason}` · `/strategies/:id/enable|disable` ·
+`/mode` `{mode}` · `/parameters/:strategyId` `{parameters, reason}` · `/halts/:symbol/release`
 
 `POST /reconcile` takes no body and runs the **full** startup reconciliation — it can halt symbols
 and it restores persisted state over live memory. See "Reconciliation on demand and after the close"
 before wiring anything else to it.
+
+`POST /engine/clear-halt` clears the engine's **technical** entry halt — the counterpart to
+`/halts/:symbol/release`, which clears a *reconciliation* halt. `EngineService.clearHalt()` existed
+from Story 6 and was reachable from **no route at all**, so a stale feed, an exhausted reconnect, or
+a failed submission latched entries off until someone killed the process; `POST /engine/reset` was
+the only alternative and it discards ladder state. It is narrower than it looks: it clears one
+boolean gating new BUY intents, and 404s when nothing is halted, since reporting success for a halt
+that never existed is the one answer worse than an error. Clearing a halt whose cause is still
+present simply means the next fault re-raises it — the detectors all still run. There is no path from
+here to a trade: clearing permits the *strategy* to decide again, and every intent it produces still
+crosses the risk chokepoint, the caps, the loss breaker, and the kill switch unchanged.
+
+`POST /broker/reconnect` forces an immediate connection attempt. The adapter already retries a
+`FAILED` connection on its own slow poll, so this is not the only way back — but the poll is
+deliberately slow, and an operator who has just restarted IB Gateway should not have to wait it out.
+**It deliberately does not run reconciliation.** A recovered socket proves the broker is reachable;
+it proves nothing about whether positions still agree with the database, and that question has its
+own route whose answer can halt symbols. Chaining them would hide a halt-raising operation behind a
+button labelled "reconnect". Nothing here submits, cancels, or liquidates.
 
 ```bash
 curl -X POST localhost:3000/engine/replay -H 'Content-Type: application/json' \
@@ -716,7 +804,7 @@ curl localhost:3000/lots
 
 ## Testing
 
-1468 backend tests across 73 suites, plus database tests (`npm run test:db`, needs MySQL) and 119 UI
+1494 backend tests across 73 suites, plus database tests (`npm run test:db`, needs MySQL) and 119 UI
 component tests. Coverage thresholds are enforced in CI: **80% global, 95% on
 `src/strategies/**` and `src/risk/**`** — those are pure functions where a bug costs real money.
 
@@ -749,6 +837,13 @@ reason; a safety check that cannot fail reports confidence it has not earned.
 - Everything runs locally in containers — no cloud deployment target.
 - **A technical fault must never become a realized loss.** On a disconnect or exhausted retries: halt
   new entries, raise an alert, and leave existing positions alone. No code path may auto-liquidate.
+- **No fault may latch with no way out.** The rule above says what a fault must not do; this one says
+  what it must not become. Every halt needs an exit an operator can reach without restarting the
+  process, and every terminal connection state needs something still trying. Both were violated until
+  recently — `FAILED` stopped its own detector, and `clearHalt()` was wired to no route — and the
+  symptom was a daemon that had to be restarted to recover from faults it had handled correctly.
+  Recovering the *ability to act* is not the same as deciding to act: a reconnect never clears a
+  halt, and only `STALE_DATA` clears on evidence rather than on an operator's say-so.
 - **This code places real orders through a broker, and there is no longer a mode that does not.**
   `SHADOW` was the standing safety net for Stories 0–12 and is retired; the default is `PAPER`, which
   submits to a paper account, and entries **rest at the broker unattended, across restarts**. Confirm

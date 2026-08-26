@@ -1,5 +1,5 @@
 import { Bar, BarSize } from '../../market-data/types';
-import { buildDipLadderConfig } from './config';
+import { buildDipLadderConfig, OrderPlacement } from './config';
 import { evaluateBar, isRungHeld, rungAllocationFraction, rungQuantity } from './ladder';
 import { HeldLot, LadderPosition } from './types';
 
@@ -299,6 +299,93 @@ describe('evaluateBar', () => {
       evaluateBar(bar(60), deep, config, 100, 100);
 
       expect(deep.heldLots).toEqual(before);
+    });
+  });
+
+  /**
+   * RESTING places the order before price arrives, so the reach test that
+   * governs IMMEDIATE does not apply. What still must hold is that a BUY limit
+   * rests *below* the market — at or above it the order is marketable and the
+   * exchange fills it on arrival, which is the opposite of a ladder waiting at
+   * a predetermined level.
+   */
+  describe('RESTING placement stays below the market', () => {
+    const resting = buildDipLadderConfig('TQQQ', {
+      symbolCapital: 10_000,
+      orderPlacement: OrderPlacement.RESTING,
+    });
+
+    it('rests a newly extended rung below the close', () => {
+      // Anchor 100 → rung 95, with the close at 99. The ordinary case: the
+      // order waits at 95 rather than being declined for not being reached.
+      const decision = evaluateBar(bar(99), FLAT, resting, 100, 100);
+
+      expect(decision.intent?.limitPrice).toBe(95);
+    });
+
+    /**
+     * The bug this guard exists for, at the prices it was reported at: a rung
+     * at 69 with the market at 68.20. The rung re-armed at its original price
+     * and price then recovered past it, so `highestFireableRung` — which
+     * ignores where price is — returned a level above the close. Sent as a
+     * resting buy it was marketable and filled instantly at the ask.
+     */
+    it('declines a re-armed rung that price has recovered above', () => {
+      const reArmed: LadderPosition = {
+        rungs: [{ price: 69, lotId: null, lastExitAt: null }],
+        heldLots: [],
+        firstEntryPrice: 69,
+      };
+
+      const decision = evaluateBar(bar(68.2), reArmed, resting, 70, 70);
+
+      expect(decision.intent).toBeNull();
+      expect(decision.blocked?.kind).toBe('ABOVE_RUNG');
+    });
+
+    it('declines a rung sitting exactly at the close', () => {
+      // A limit equal to the close is marketable too, and a level the market is
+      // already sitting on is not a dip.
+      const atClose: LadderPosition = {
+        rungs: [{ price: 95, lotId: null, lastExitAt: null }],
+        heldLots: [],
+        firstEntryPrice: 95,
+      };
+
+      expect(evaluateBar(bar(95), atClose, resting, 100, 100).intent).toBeNull();
+    });
+
+    it('still rests a re-armed rung the market is above', () => {
+      // The guard must not break cycling: a re-armed rung below the close is
+      // exactly what the ladder re-places an order at.
+      const reArmed: LadderPosition = {
+        rungs: [{ price: 95, lotId: null, lastExitAt: null }],
+        heldLots: [],
+        firstEntryPrice: 95,
+      };
+
+      expect(evaluateBar(bar(99), reArmed, resting, 100, 100).intent?.limitPrice).toBe(95);
+    });
+
+    /**
+     * The anchor is the lowest *held* lot, not the market, so a position held
+     * while price falls beneath it computes a next rung above the close. The
+     * newly-extended path needs the same guard as the re-armed one.
+     */
+    it('declines a newly extended rung when price has fallen below the anchor', () => {
+      // Held at 95 → anchor 95, next rung 90.25, with the close already at 88.
+      const decision = evaluateBar(bar(88), position([95]), resting, 100, 100);
+
+      expect(decision.rungPrice).toBe(90.25);
+      expect(decision.intent).toBeNull();
+      expect(decision.blocked?.kind).toBe('ABOVE_RUNG');
+    });
+
+    it('leaves IMMEDIATE placement unchanged', () => {
+      // The default the committed fixtures were computed under: a close above
+      // the rung fires nothing, and a close at or below it fires.
+      expect(evaluateBar(bar(99), FLAT, config, 100, 100).intent).toBeNull();
+      expect(evaluateBar(bar(95), FLAT, config, 100, 100).intent?.limitPrice).toBe(95);
     });
   });
 

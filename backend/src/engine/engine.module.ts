@@ -307,8 +307,26 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // `StartupSequence.hasReconciled()`, which the engine checks before
     // dispatching any bar, and the live feed below only starts once the
     // sequence resolves. A bar arriving early is dropped, not evaluated.
-    void this.startup
-      .run(new Date().toISOString())
+    // **Before the gate opens, so no bar can submit under a colliding id.**
+    // The `Order` table survives a restart while the engine's `co-N` counter
+    // does not, and both repositories upsert on `clientOrderId` — so a reused
+    // id overwrites the earlier order's row instead of erroring, and a fill for
+    // either order then resolves to the wrong one. Chained ahead of `run`
+    // rather than injected into `StartupSequence`, which would close a cycle:
+    // `EngineService` already depends on the sequence.
+    void this.engine
+      .restoreClientOrderSequence()
+      .catch((error: unknown) => {
+        // Non-fatal. A failed read leaves the counter at zero, which is the
+        // pre-existing behaviour — the collision risk returns, but refusing to
+        // boot would take the operator's only view of the ladder down with it.
+        this.logger.error(
+          `could not restore the client order sequence: ${
+            error instanceof Error ? error.message : String(error)
+          }. Order ids may repeat those of a previous run.`,
+        );
+      })
+      .then(() => this.startup.run(new Date().toISOString()))
       .then(() => this.startLiveFeed())
       .catch((error: unknown) => {
         // `run` already absorbs an unreachable broker (every symbol halts and
@@ -344,6 +362,8 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       {
         subscribeBars: (contract, barSize, handler) => ib.subscribeBars(contract, barSize, handler),
         isDataStale: () => ib.isDataStale(),
+        // Lets the stale halt name IB's own reason for the silence.
+        dataErrors: () => ib.dataErrorList(),
         // A bar subscription does not survive the socket it was made on, and
         // IB Gateway logs itself out daily. Without this the feed ends at the
         // first logout and never returns. See `LiveFeedService.start`.

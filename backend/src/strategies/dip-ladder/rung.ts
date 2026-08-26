@@ -192,9 +192,16 @@ export function findRung<T extends { price: number }>(rungs: T[], price: number)
  * currently is.
  *
  * The resting-order counterpart to `selectFireableRung`. Price is deliberately
- * not a factor: a resting limit order is placed *above* the market and waits,
- * so requiring the bar to have reached the level first would defeat the point
- * and would strand a released rung whenever price sits above it.
+ * not a factor: a resting limit order is placed ahead of the market and waits
+ * for price to come to it, so requiring the bar to have reached the level first
+ * would defeat the point and would strand a released rung whenever price sits
+ * above it.
+ *
+ * **This selects a level, not an order.** Ignoring price means the level
+ * returned may be *above* the close — a re-armed rung price recovered past —
+ * and a BUY limit there is marketable rather than resting. `evaluateBar` is
+ * where that is caught (`isRestable`); do not read this function's indifference
+ * to price as permission to place the order without checking.
  *
  * Highest, for the same reason `selectFireableRung` picks the highest: the
  * ladder descends one level at a time, so the shallowest unplaced rung is the

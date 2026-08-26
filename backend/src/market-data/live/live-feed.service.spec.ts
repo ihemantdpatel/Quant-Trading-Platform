@@ -47,6 +47,23 @@ class FakeSource implements LiveBarSource {
     return this.stale;
   }
 
+  /** Market-data errors IB has reported, newest state per symbol. */
+  private errors: Array<{ symbol: string; code: number | null; message: string }> = [];
+  /** Set to make `dataErrors` throw, modelling a source that fails mid-fault. */
+  failDataErrors = false;
+
+  dataErrors(): Array<{ symbol: string; code: number | null; message: string }> {
+    if (this.failDataErrors) {
+      throw new Error('adapter blew up while listing data errors');
+    }
+
+    return this.errors;
+  }
+
+  reportDataError(symbol: string, code: number | null, message: string): void {
+    this.errors.push({ symbol, code, message });
+  }
+
   onConnectionChange(handler: (connected: boolean) => void): () => void {
     this.connectionHandler = handler;
 
@@ -74,6 +91,11 @@ class FakeSource implements LiveBarSource {
 
   goStale(): void {
     this.stale = true;
+  }
+
+  /** The feed recovers — data flows again with no socket event in between. */
+  goLive(): void {
+    this.stale = false;
   }
 
   goFresh(): void {
@@ -278,6 +300,72 @@ describe('LiveFeedService', () => {
       expect(consumer.halts[0]).toContain('NOT liquidated');
     });
 
+    it('names the reported market-data error in the halt reason', () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      // The observed production fault: IB refuses the subscription and then
+      // delivers nothing, so the silence and the error are one fault.
+      source.reportDataError(
+        'TQQQ',
+        162,
+        'Historical Market Data Service error message:Trading TWS session is connected from a different IP address',
+      );
+      source.goStale();
+      feed.checkStale();
+
+      expect(consumer.halts[0]).toContain('stale');
+      expect(consumer.halts[0]).toContain('[162]');
+      expect(consumer.halts[0]).toContain('different IP address');
+      // The safety clause survives the addition.
+      expect(consumer.halts[0]).toContain('NOT liquidated');
+    });
+
+    it('reports the silence alone when no data error was reported', () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      source.goStale();
+      feed.checkStale();
+
+      // No cause is honest where there is none — a feed can go quiet with IB
+      // reporting nothing at all.
+      expect(consumer.halts[0]).not.toContain('Reported market-data error');
+    });
+
+    it('omits the code when IB supplied none', () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      source.reportDataError('TQQQ', null, 'no code from IB');
+      source.goStale();
+      feed.checkStale();
+
+      expect(consumer.halts[0]).toContain('no code from IB');
+      expect(consumer.halts[0]).not.toContain('[null]');
+    });
+
+    it('still halts when the source throws while listing data errors', () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      source.failDataErrors = true;
+      source.goStale();
+
+      // The diagnostic must never replace the halt it only describes.
+      expect(() => feed.checkStale()).not.toThrow();
+      expect(consumer.halts).toHaveLength(1);
+      expect(consumer.halts[0]).toContain('NOT liquidated');
+    });
+
     it('does not halt while data is flowing', () => {
       const source = new FakeSource();
       const consumer = new RecordingConsumer();
@@ -302,6 +390,29 @@ describe('LiveFeedService', () => {
 
       // One fault, one alert — a flood would bury the next real one.
       expect(consumer.halts).toHaveLength(1);
+    });
+
+    it('re-arms once a bar arrives, so a second outage is still reported', () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+      source.goStale();
+      feed.checkStale();
+      expect(consumer.halts).toHaveLength(1);
+
+      // The feed recovers on its own — a data-farm blip or a pacing throttle,
+      // with no socket drop anywhere. Only `resubscribe` used to unlatch this
+      // flag, so a recovery without a connection event left the detector
+      // permanently spent and the *next* silence went unreported.
+      source.goLive();
+      source.emit(bar('2025-01-02T10:00:00.000-05:00'));
+
+      source.goStale();
+      feed.checkStale();
+
+      expect(consumer.halts).toHaveLength(2);
     });
 
     it('fires from the interval once started', async () => {
