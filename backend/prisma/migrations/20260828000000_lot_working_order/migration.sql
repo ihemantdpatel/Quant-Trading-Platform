@@ -1,0 +1,11 @@
+-- Resting exit orders: a held lot may have a SELL working at the broker.
+--
+-- The exit-side counterpart to `Rung.workingOrderId`, and durable for the same
+-- reason: an order outlives the process that placed it, so after a restart this
+-- column is the only record tying a resting sell to the lot it disposes.
+--
+-- Nullable with no default, deliberately. "No sell resting for this lot" is a
+-- genuine state rather than a missing value, and every existing row is exactly
+-- that — they predate resting exits — so NULL is the correct backfill and needs
+-- no data migration.
+ALTER TABLE `Lot` ADD COLUMN `workingOrderId` VARCHAR(191) NULL AFTER `exitPrice`;

@@ -349,6 +349,85 @@ describe('EngineService', () => {
       expect(engine.isHalted()).toBe(true);
     });
 
+    /**
+     * The bug these cover: `activeAlerts()` returned the entire history, so an
+     * ENTRY_HALT alert outlived the halt that raised it. A live daemon showed
+     * three nights of long-recovered staleness halts stacked in the dashboard
+     * while `entryHalt.halted` was already `false` — and the only thing that
+     * emptied the list was `reset()`, which discards ladder state.
+     */
+    it('resolves the ENTRY_HALT alert when the halt self-clears', async () => {
+      const { engine } = await harness();
+
+      engine.haltEntriesForFault('market data stale beyond threshold');
+      expect(engine.activeAlerts().filter((a) => a.code === 'ENTRY_HALT')).toHaveLength(1);
+
+      await engine.replayFixture('steady-decline');
+
+      expect(engine.isHalted()).toBe(false);
+      // The banner's source is empty...
+      expect(engine.activeAlerts().filter((a) => a.code === 'ENTRY_HALT')).toEqual([]);
+
+      // ...but the soak's evidence survives, stamped with when it ended.
+      const history = engine.alertHistory().filter((a) => a.code === 'ENTRY_HALT');
+      expect(history).toHaveLength(1);
+      expect(history[0].resolvedAt).not.toBeNull();
+    });
+
+    it('resolves the ENTRY_HALT alert when an operator clears the halt', async () => {
+      const { engine, broker } = await harness();
+      broker.simulateDisconnect('socket dropped');
+      await engine.replayFixture('steady-decline');
+
+      expect(engine.activeAlerts().filter((a) => a.code === 'ENTRY_HALT')).toHaveLength(1);
+
+      engine.clearHalt();
+
+      expect(engine.activeAlerts().filter((a) => a.code === 'ENTRY_HALT')).toEqual([]);
+      expect(engine.alertHistory().filter((a) => a.code === 'ENTRY_HALT')).toHaveLength(1);
+    });
+
+    /**
+     * The failure mode a resolution scheme must not introduce. Hiding a
+     * recovered alert is only correct if a *fresh* fault still surfaces — an
+     * over-eager filter that suppressed the second halt would leave an operator
+     * blind to a live outage, which is far worse than the stale banner.
+     */
+    it('a NEW halt after a recovery raises a fresh active alert', async () => {
+      const { engine } = await harness();
+
+      engine.haltEntriesForFault('feed quiet');
+      await engine.replayFixture('steady-decline');
+      expect(engine.activeAlerts().filter((a) => a.code === 'ENTRY_HALT')).toEqual([]);
+
+      // The feed goes quiet a second time.
+      engine.haltEntriesForFault('feed quiet again');
+
+      const active = engine.activeAlerts().filter((a) => a.code === 'ENTRY_HALT');
+      expect(active).toHaveLength(1);
+      expect(active[0].detail).toBe('feed quiet again');
+      expect(engine.alertHistory().filter((a) => a.code === 'ENTRY_HALT')).toHaveLength(2);
+    });
+
+    /**
+     * A rejection is a point-in-time event, not a condition that ends. Nothing
+     * observes it "recovering", so it must never be stamped resolved — an
+     * operator would lose the only notice that a broker refused an order.
+     */
+    it('never resolves a point-in-time alert such as ORDER_REJECTED', async () => {
+      const { engine, broker } = await harness();
+      broker.configure({ fillMode: FillMode.REJECT, rejectReason: 'no buying power' });
+
+      await engine.replayFixture('steady-decline');
+      expect(engine.activeAlerts().some((a) => a.code === 'ORDER_REJECTED')).toBe(true);
+
+      engine.clearHalt();
+      await engine.replayFixture('steady-decline');
+
+      // Still active: clearing an entry halt says nothing about a rejection.
+      expect(engine.activeAlerts().some((a) => a.code === 'ORDER_REJECTED')).toBe(true);
+    });
+
     it('an explicitly coded stale halt is the only self-clearing kind', async () => {
       const { engine } = await harness();
 

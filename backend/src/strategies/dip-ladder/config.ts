@@ -20,6 +20,21 @@ export enum SpacingMode {
   PERCENTAGE = 'PERCENTAGE',
   /** Rungs an ATR multiple apart, volatility-normalized. */
   ATR = 'ATR',
+  /**
+   * Rungs a fixed currency amount apart, independent of price level.
+   *
+   * Percentage spacing is *proportional*, so the dollar gap between rungs — and
+   * therefore the profit a round trip yields at a fixed share count — changes
+   * as price moves. A 1% target on 50 shares is $36 at $72 and $50 at $100.
+   * This mode exists for the operator who is targeting a **currency** figure
+   * per round trip rather than a percentage return: with `fixedQuantity`, the
+   * profit per cycle is `spacingDollars * fixedQuantity` at every price level.
+   *
+   * The trade-off it accepts is that a fixed gap is a *widening* percentage as
+   * price falls, so a ladder in a deep drawdown spaces its rungs further apart
+   * in relative terms than a percentage ladder would.
+   */
+  FIXED_DOLLAR = 'FIXED_DOLLAR',
 }
 
 export enum OrderPlacement {
@@ -68,6 +83,13 @@ export interface DipLadderConfig {
   spacingPercent: number;
   /** Multiple of ATR-14 on daily bars. Used when mode is ATR. */
   atrMultiple: number;
+  /**
+   * Absolute currency distance between rungs. Used when mode is FIXED_DOLLAR.
+   *
+   * In the same currency as the instrument's price, so the arithmetic
+   * `spacingDollars * fixedQuantity = profit per round trip` holds directly.
+   */
+  spacingDollars: number;
   /** Lookback for the ATR calculation, in daily bars. */
   atrPeriod: number;
   /**
@@ -75,6 +97,19 @@ export interface DipLadderConfig {
    * lot's target sits at the level of the rung above it.
    */
   takeProfitPercent: number;
+  /**
+   * Per-lot take-profit as an absolute currency amount above the lot's own
+   * fill price. When set, it **supersedes** `takeProfitPercent`.
+   *
+   * `null` — the default — leaves the percentage rule in force, so every
+   * committed fixture and every existing lot keeps the behaviour its expected
+   * values were computed under.
+   *
+   * Set this to match `spacingDollars` when targeting a fixed profit per
+   * cycle: a lot's target then lands exactly on the rung above it, which is
+   * the property that makes the ladder cycle cleanly.
+   */
+  takeProfitDollars: number | null;
   /** Per-lot (default) or blended average-cost exits. */
   exitMode: ExitMode;
   /**
@@ -86,8 +121,37 @@ export interface DipLadderConfig {
    * `RESTING`; see `strategies.module.ts`.
    */
   orderPlacement: OrderPlacement;
+  /**
+   * Fractional gap-down size beyond which the bootstrap anchor re-bases onto
+   * today's open instead of the previous close. 0.01 = 1%.
+   *
+   * `null` — the default — leaves the plain `max(previousClose, open)` rule in
+   * force, so every committed fixture keeps the rung prices its expected
+   * intents were computed under. Opted into in `strategies.module.ts`, the same
+   * way `orderPlacement` and `fixedQuantity` are, and for the same reason.
+   *
+   * The problem it solves is specific to RESTING placement: an anchor left at
+   * the previous close puts the first rung above a gapped-down market, where
+   * `isRestable` refuses to place it, so the ladder does nothing for as long as
+   * the gap holds. See `bootstrapAnchor` for why erring toward the open is the
+   * safe direction — the entry is still a limit order resting below the market.
+   */
+  gapRebasePercent: number | null;
   /** Fraction of symbol capital per rung. 0.25 = 25%. */
   sizePerRung: number;
+  /**
+   * Whole-share quantity for every rung, overriding capital-derived sizing.
+   *
+   * `null` — the default — sizes each rung as a fraction of `symbolCapital`,
+   * which is price-dependent. A fixed count is what makes profit per round trip
+   * a knowable currency figure rather than one that drifts with price.
+   *
+   * **This bypasses `sizePerRung` and `escalationFactor` entirely**, so it also
+   * bypasses the capital allocation as a sizing input. It does *not* bypass the
+   * risk layer: `RiskManagerService` still caps and resizes every intent, so a
+   * fixed quantity is a request, not a guarantee.
+   */
+  fixedQuantity: number | null;
   /**
    * Multiplier applied per rung depth: rung N is sized
    * `sizePerRung * escalationFactor^N`. 1 means flat.
@@ -114,10 +178,14 @@ export const DEFAULT_DIP_LADDER_CONFIG: Omit<DipLadderConfig, 'symbol'> = {
   spacingPercent: 0.05,
   atrMultiple: 1,
   atrPeriod: 14,
+  spacingDollars: 1,
   takeProfitPercent: 0.05,
+  takeProfitDollars: null,
   exitMode: ExitMode.PER_LOT,
   orderPlacement: OrderPlacement.IMMEDIATE,
+  gapRebasePercent: null,
   sizePerRung: 0.25,
+  fixedQuantity: null,
   escalationFactor: 1,
   maxConcurrentRungs: 5,
   hardFloorPercent: 0.25,
@@ -151,6 +219,10 @@ export function buildDipLadderConfig(
     throw new Error(`atrMultiple must be positive, got ${config.atrMultiple}`);
   }
 
+  if (config.spacingDollars <= 0) {
+    throw new Error(`spacingDollars must be positive, got ${config.spacingDollars}`);
+  }
+
   // An ATR needs at least one prior bar to produce a true range.
   if (!Number.isInteger(config.atrPeriod) || config.atrPeriod < 2) {
     throw new Error(`atrPeriod must be an integer of at least 2, got ${config.atrPeriod}`);
@@ -162,8 +234,38 @@ export function buildDipLadderConfig(
     throw new Error(`takeProfitPercent must be positive, got ${config.takeProfitPercent}`);
   }
 
+  if (config.takeProfitDollars !== null && config.takeProfitDollars <= 0) {
+    // Same reasoning as the percentage above: a non-positive absolute target
+    // would place a lot's exit at or below its fill price, which is the
+    // loss-booking exit the strategy does not have.
+    throw new Error(`takeProfitDollars must be positive when set, got ${config.takeProfitDollars}`);
+  }
+
+  if (
+    config.gapRebasePercent !== null &&
+    (config.gapRebasePercent <= 0 || config.gapRebasePercent >= 1)
+  ) {
+    // Zero would re-base on any open below the previous close — every ordinary
+    // down day, not a gap — which is the "chase the market" behaviour this rule
+    // is bounded to avoid. One or more can never be reached by a real session.
+    throw new Error(
+      `gapRebasePercent must be between 0 and 1 exclusive when set, got ${config.gapRebasePercent}`,
+    );
+  }
+
   if (config.sizePerRung <= 0) {
     throw new Error(`sizePerRung must be positive, got ${config.sizePerRung}`);
+  }
+
+  if (
+    config.fixedQuantity !== null &&
+    (!Number.isInteger(config.fixedQuantity) || config.fixedQuantity < 1)
+  ) {
+    // Whole shares only: a fractional quantity would be rejected at the broker
+    // rather than here, where the reason is legible.
+    throw new Error(
+      `fixedQuantity must be a positive integer when set, got ${config.fixedQuantity}`,
+    );
   }
 
   if (config.escalationFactor < 1) {

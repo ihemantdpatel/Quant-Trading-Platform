@@ -20,7 +20,7 @@ import { BROKER_ADAPTER, BrokerAdapter, ConnectionState } from '../broker/broker
 import { equityContract } from '../domain/contract';
 import { IBBrokerAdapter } from '../broker/ib/ib-broker.adapter';
 import { StoqeyIbSocket } from '../broker/ib/stoqey-ib-socket';
-import { MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
+import { FillMode, MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
 import { AppConfigModule } from '../config/config.module';
 import { AppConfigService } from '../config/app-config.service';
 import { MarketDataModule } from '../market-data/market-data.module';
@@ -35,6 +35,13 @@ import { PostCloseReconcileService } from '../reconciliation/post-close-reconcil
 import { ReplayService } from '../market-data/mock/replay.service';
 import { ReconciliationModule } from '../reconciliation/reconciliation.module';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
+// Declared alongside `ReconciliationService` for the same reason: both depend
+// on `BROKER_ADAPTER`, and diagnosing against a different broker instance than
+// the engine trades through would compare the ladder to the wrong account.
+import {
+  DuplicateOrderService,
+  OrderDiagnosisService,
+} from '../reconciliation/order-diagnosis.service';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 import { RepositoriesModule } from '../repositories/repositories.module';
 import {
@@ -103,6 +110,8 @@ import { StartupSequence } from './startup.sequence';
     // different broker instance than the engine trades through would compare
     // the database to the wrong account.
     ReconciliationService,
+    OrderDiagnosisService,
+    DuplicateOrderService,
     // A single broker instance shared by the engine and the API, so a
     // simulated disconnect in a test is visible to both.
     //
@@ -117,7 +126,12 @@ import { StartupSequence } from './startup.sequence';
       provide: BROKER_ADAPTER,
       useFactory: (config: AppConfigService) => {
         if (!config.usesIbBroker) {
-          return new MockBrokerAdapter();
+          // **`MARKET_AWARE`, not the `IMMEDIATE` default.** With exits resting
+          // (Story 14a) a take-profit sell sits *above* the market by
+          // construction, and a mock that fills every order on submission would
+          // close each lot on the bar that opened it — a cycle no exchange
+          // could produce. The engine drives it per bar from `processBar`.
+          return new MockBrokerAdapter({ fillMode: FillMode.MARKET_AWARE });
         }
 
         return new IBBrokerAdapter(
@@ -221,6 +235,8 @@ import { StartupSequence } from './startup.sequence';
     ParameterService,
     StartupSequence,
     ReconciliationService,
+    OrderDiagnosisService,
+    DuplicateOrderService,
     HistoryCacheService,
     BackfillService,
   ],

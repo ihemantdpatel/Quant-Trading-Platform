@@ -15,11 +15,21 @@ export function StatusBar({
   positions,
   deployed,
   realized,
+  positionsUnavailable = false,
 }: {
   status: Status | null;
   positions: Position[];
   deployed: number;
   realized: number;
+  /**
+   * True when the `/positions` read failed.
+   *
+   * This is the field where conflating "unknown" with "empty" is most
+   * dangerous: an unreachable broker would otherwise render as **flat**, which
+   * is the same word a genuinely empty account gets. An operator reading
+   * "flat" during a broker outage concludes they have no exposure.
+   */
+  positionsUnavailable?: boolean;
 }) {
   const connected = status?.broker.connected ?? false;
 
@@ -35,9 +45,15 @@ export function StatusBar({
       </Item>
 
       <Item label="Open positions">
-        {positions.length === 0
-          ? 'flat'
-          : positions.map((p) => `${p.quantity} ${p.symbol}`).join(', ')}
+        {positionsUnavailable ? (
+          <span className="text-amber-400" title="The broker could not be asked">
+            unavailable
+          </span>
+        ) : positions.length === 0 ? (
+          'flat'
+        ) : (
+          positions.map((p) => `${p.quantity} ${p.symbol}`).join(', ')
+        )}
       </Item>
 
       <Item label="Deployed at cost">{formatCurrency(deployed)}</Item>

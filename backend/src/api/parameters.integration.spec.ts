@@ -416,3 +416,56 @@ describe('Story 7: live parameter editing', () => {
     });
   });
 });
+
+/**
+ * Clearing an absolute parameter back to its percentage fallback.
+ *
+ * The dashboard sends an explicit `null` when the operator empties the Take
+ * profit ($) or Fixed quantity box — omitting the key means "leave unchanged",
+ * so null is the only way to express "unset this". These assert the API honours
+ * that rather than rejecting it as a bad value.
+ */
+describe('Story 13: clearing absolute parameters', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  it('accepts null to restore the percentage rule', async () => {
+    const response = await request(app.getHttpServer())
+      .post('/parameters/dip-ladder:TQQQ')
+      .send({ parameters: { takeProfitDollars: null, fixedQuantity: null }, reason: 'test' })
+      .expect(200);
+
+    expect(response.body.parameters.takeProfitDollars).toBeNull();
+    expect(response.body.parameters.fixedQuantity).toBeNull();
+  });
+
+  it('accepts absolute values and reports them back', async () => {
+    const response = await request(app.getHttpServer())
+      .post('/parameters/dip-ladder:TQQQ')
+      .send({
+        parameters: { spacingDollars: 2, takeProfitDollars: 2, fixedQuantity: 25 },
+        reason: 'test',
+      })
+      .expect(200);
+
+    expect(response.body.parameters.spacingDollars).toBe(2);
+    expect(response.body.parameters.takeProfitDollars).toBe(2);
+    expect(response.body.parameters.fixedQuantity).toBe(25);
+  });
+
+  it('still refuses a fractional share count', async () => {
+    await request(app.getHttpServer())
+      .post('/parameters/dip-ladder:TQQQ')
+      .send({ parameters: { fixedQuantity: 12.5 }, reason: 'test' })
+      .expect(422);
+  });
+});

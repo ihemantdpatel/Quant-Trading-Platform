@@ -13,6 +13,7 @@ function lot(overrides: Partial<Lot> & Pick<Lot, 'id'>): Lot {
     status: LotStatus.HELD,
     closedAt: null,
     exitPrice: null,
+    workingOrderId: null,
     ...overrides,
   };
 }

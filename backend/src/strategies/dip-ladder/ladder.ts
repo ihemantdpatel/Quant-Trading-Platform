@@ -44,6 +44,15 @@ export function rungAllocationFraction(depth: number, config: DipLadderConfig): 
  * startup assertion refuses PAPER/LIVE until a real figure is configured.
  */
 export function rungQuantity(price: number, depth: number, config: DipLadderConfig): number {
+  // A fixed quantity is checked first and is independent of both price and
+  // capital — that independence is the whole point, since it is what makes
+  // profit per round trip a knowable currency figure rather than one that
+  // drifts as price moves. `symbolCapital` is deliberately not consulted here:
+  // the risk layer, not the allocation, is what bounds a fixed-size ladder.
+  if (config.fixedQuantity !== null) {
+    return config.fixedQuantity;
+  }
+
   if (config.symbolCapital === null || price <= 0) {
     return 0;
   }
@@ -102,6 +111,26 @@ export function isRungHeld(position: LadderPosition, rungPrice: number): boolean
  */
 export function isRestable(rungPrice: number, close: number): boolean {
   return roundToCents(rungPrice) < roundToCents(close);
+}
+
+/**
+ * True when a SELL limit at `target` would rest rather than fill on arrival.
+ *
+ * The mirror of `isRestable`: a sell limit is marketable at or below the bid,
+ * so a target the market has already reached fills immediately at the
+ * prevailing price instead of holding at the level.
+ *
+ * **Under normal operation this always passes**, and that is the point rather
+ * than a weakness. `exitTarget` is frozen above `fillPrice` at open, and at the
+ * instant a BUY fills the market is *at* that fill price — so a lot's sell limit
+ * is non-marketable when placed and stays so until price rallies to it. The
+ * guard earns its place on the one case where the premise does not hold: a lot
+ * reconstructed by `recover:lots` whose target is already below the current
+ * market. There the correct action is to place nothing and report, never to dump
+ * shares into a marketable sell on a 3x ETF.
+ */
+export function isRestableExit(target: number, close: number): boolean {
+  return roundToCents(target) > roundToCents(close);
 }
 
 /**
@@ -192,7 +221,7 @@ export function evaluateBar(
     return buildEntry(existing.price, bar, position, config, `re-arm/pending rung`);
   }
 
-  const anchor = resolveAnchor(position.heldLots, previousClose, sessionOpen);
+  const anchor = resolveAnchor(position.heldLots, previousClose, sessionOpen, config);
   const rungPrice = nextRungPrice(anchor.price, config, dailyBars);
 
   // The ladder only extends below a level it does not already have. Without

@@ -20,7 +20,13 @@
 import type { EngineAlert, Status } from '../lib/api';
 
 export function AlertBanner({ status, error }: { status: Status | null; error: string | null }) {
-  const alerts: EngineAlert[] = status?.alerts ?? [];
+  // `GET /status` already returns active alerts only. Filtering again here is
+  // deliberate belt-and-braces: this banner is the operator's read on whether
+  // the engine is currently faulted, and a resolved alert rendered as a live
+  // one is precisely the bug this guards against. An alert with no `resolvedAt`
+  // field at all (an older backend) counts as active — failing toward showing
+  // a fault, never toward hiding one.
+  const alerts: EngineAlert[] = (status?.alerts ?? []).filter((alert) => !alert.resolvedAt);
   const entryHalt = status?.halts.entryHalt;
   const brokerDown = status ? !status.broker.connected : false;
   const symbolHalts = status?.halts.symbols ?? [];

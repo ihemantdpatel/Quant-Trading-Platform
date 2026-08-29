@@ -181,6 +181,10 @@ model Lot {
   status     String  @db.VarChar(16)
   closedAt   String? @db.VarChar(32)
   exitPrice  Decimal? @db.Decimal(18, 6)
+  /// The resting SELL working against this lot, or null when none is. The
+  /// durable record reconciliation rebuilds the engine's in-memory map from
+  /// after a restart — an order outlives the process that placed it.
+  workingOrderId String? @db.VarChar(191)
 
   // FIFO reads are `WHERE symbol = ? ORDER BY openedAt, id`. `id` is in the
   // index so the ordering is total and stable when one bar fills two rungs.

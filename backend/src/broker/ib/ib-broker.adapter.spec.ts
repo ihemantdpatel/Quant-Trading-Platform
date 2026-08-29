@@ -550,6 +550,60 @@ describe('IBBrokerAdapter', () => {
     });
   });
 
+  describe('the last bar price is reported for the dashboard', () => {
+    it('reports nothing before any bar has arrived', () => {
+      const adapter = buildAdapter(new FakeIbSocket());
+
+      // Absent, not zero: a fabricated price beside real ones is worse than a
+      // blank on a control surface.
+      expect(adapter.lastPrices()).toEqual([]);
+    });
+
+    it('records the bar close and its arrival time', async () => {
+      const socket = new FakeIbSocket();
+      const clock = 7_000;
+      const adapter = buildAdapter(socket, { now: () => clock });
+      await adapter.connect();
+
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+      socket.emitBar(bar('2025-01-02T10:00:00.000-05:00', 72.15));
+
+      expect(adapter.lastPrices()).toEqual([{ symbol: 'TQQQ', price: 72.15, at: 7_000 }]);
+    });
+
+    it('keeps only the newest bar per symbol', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+      socket.emitBar(bar('2025-01-02T10:00:00.000-05:00', 72.15));
+      socket.emitBar(bar('2025-01-02T10:05:00.000-05:00', 71.9));
+
+      expect(adapter.lastPrices()).toHaveLength(1);
+      expect(adapter.lastPrices()[0].price).toBe(71.9);
+    });
+
+    it('survives a reconnect, unlike the staleness clock', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      adapter.subscribeBars(TQQQ, BarSize.FIVE_MIN, () => undefined);
+      socket.emitBar(bar('2025-01-02T10:00:00.000-05:00', 72.15));
+
+      socket.simulateSocketDrop();
+      await settle();
+
+      // `lastBarAt` is cleared to restart the staleness clock — that is a
+      // statement about delivery. The last known price is still the last
+      // known price, and blanking the dashboard on IB's daily logout would
+      // report a market fault where there is only a connection one.
+      expect(adapter.lastBarAt()).toBeNull();
+      expect(adapter.lastPrices()[0].price).toBe(72.15);
+    });
+  });
+
   describe('stale data is its own fail-safe trigger (stories.md:618)', () => {
     it('is not stale before any bar has arrived', () => {
       const adapter = buildAdapter(new FakeIbSocket(), { now: () => 10_000_000 });

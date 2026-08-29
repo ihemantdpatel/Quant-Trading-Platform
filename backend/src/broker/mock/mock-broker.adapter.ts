@@ -48,6 +48,23 @@ export enum FillMode {
   PARTIAL = 'PARTIAL',
   /** Acknowledged and left resting — filled only by an explicit `fillResting`. */
   RESTING = 'RESTING',
+  /**
+   * Acknowledged and left resting until the **market reaches the limit** —
+   * a BUY fills when price trades at or below its limit, a SELL at or above.
+   *
+   * The only mode that models what a resting order actually is. `IMMEDIATE`
+   * fills at the limit price on submission regardless of where the market is,
+   * which is roughly right for an entry (a ladder rung sits below the market,
+   * so a marketable order would fill near there anyway) and completely wrong
+   * for an exit: a take-profit sell rests *above* the market by construction
+   * and must not fill until price rallies to it. Under `IMMEDIATE` every lot
+   * opens and closes on the same bar, which is not a cycle any exchange would
+   * produce.
+   *
+   * Requires the caller to drive `advanceMarket` per bar; without it nothing
+   * ever fills, which is the honest representation of a market that never moved.
+   */
+  MARKET_AWARE = 'MARKET_AWARE',
   /** Refused with `rejectReason`. */
   REJECT = 'REJECT',
 }
@@ -102,6 +119,15 @@ export class MockBrokerAdapter implements BrokerAdapter {
 
   private readonly positions = new Map<string, BrokerPosition>();
   private readonly resting = new Map<string, RestingOrder>();
+  /**
+   * Last price supplied to `advanceMarket`, or null before any bar.
+   *
+   * Null is not zero: before the first bar the mock has no opinion about where
+   * the market is, and treating that as 0 would make every SELL marketable.
+   */
+  private lastPrice: number | null = null;
+  /** Timestamp of the last bar supplied to `advanceMarket`. Stamps its fills. */
+  private lastTime: string | null = null;
   /**
    * Terminal-state orders, in the order they completed.
    *
@@ -265,6 +291,14 @@ export class MockBrokerAdapter implements BrokerAdapter {
 
     if (this.config.fillMode === FillMode.IMMEDIATE) {
       this.fillResting(order.clientOrderId, order.quantity);
+    } else if (this.config.fillMode === FillMode.MARKET_AWARE) {
+      // A marketable order fills on arrival, exactly as an exchange would take
+      // it. Anything else waits for `advanceMarket` to bring price to it.
+      if (this.lastPrice !== null && this.isMarketable(order, this.lastPrice)) {
+        // The order's own timestamp is correct here: it filled on arrival, on
+        // the bar that placed it.
+        this.fillResting(order.clientOrderId, order.quantity, this.lastPrice, order.timestamp);
+      }
     } else if (this.config.fillMode === FillMode.PARTIAL) {
       const quantity = Math.max(1, Math.floor(order.quantity * this.config.partialFillRatio));
       this.fillResting(order.clientOrderId, Math.min(quantity, order.quantity));
@@ -279,7 +313,12 @@ export class MockBrokerAdapter implements BrokerAdapter {
    * The seam a test uses to drive delayed and partial fills explicitly, and
    * what the engine calls to settle a `RESTING` order on a later bar.
    */
-  fillResting(clientOrderId: string, quantity?: number, atPrice?: number): Fill | null {
+  fillResting(
+    clientOrderId: string,
+    quantity?: number,
+    atPrice?: number,
+    atTime?: string,
+  ): Fill | null {
     const resting = this.resting.get(clientOrderId);
 
     if (!resting) {
@@ -305,7 +344,13 @@ export class MockBrokerAdapter implements BrokerAdapter {
       quantity: fillQuantity,
       price,
       commission: this.config.commissionPerOrder,
-      timestamp: resting.order.timestamp,
+      // **When it filled, not when it was placed.** A resting order can wait
+      // bars or sessions for price to reach it, and stamping the fill with the
+      // order's own timestamp would backdate every lot's open and close to the
+      // moment the order was submitted. The daily report walks a session's lots
+      // in timestamp order to reconstruct which rungs were free when, so a
+      // backdated close is reported as a rung the ladder could not have used.
+      timestamp: atTime ?? resting.order.timestamp,
     };
 
     resting.filledQuantity += fillQuantity;
@@ -544,6 +589,8 @@ export class MockBrokerAdapter implements BrokerAdapter {
     this.submitted.length = 0;
     this.orderSequence = 0;
     this.fillSequence = 0;
+    this.lastPrice = null;
+    this.lastTime = null;
   }
 
   /**
@@ -566,6 +613,58 @@ export class MockBrokerAdapter implements BrokerAdapter {
   }
 
   /** Slippage works against the order, which is the only honest direction. */
+  /**
+   * True when `price` has reached this order's limit.
+   *
+   * A BUY limit is executable at or below its limit, a SELL at or above — the
+   * inclusive comparison matching an exchange taking an order the moment price
+   * touches the level, which is the intra-bar fill a resting order exists to
+   * capture.
+   */
+  private isMarketable(order: BrokerOrder, price: number): boolean {
+    return order.side === 'BUY' ? price <= order.limitPrice : price >= order.limitPrice;
+  }
+
+  /**
+   * Moves the simulated market, filling every resting order price has reached.
+   *
+   * The seam that makes `MARKET_AWARE` usable: the mock has no clock and no feed
+   * of its own, so the caller — the engine's replay loop, or a test — supplies
+   * the price per bar and the mock settles whatever that price crossed.
+   *
+   * **Fills at the limit price, not at `price`.** A resting order is filled by
+   * the exchange *at its limit* when the market reaches it; filling at the bar's
+   * close would hand a lot a basis better or worse than the level it was placed
+   * at, and every downstream target is derived from that basis.
+   *
+   * Iterates a snapshot because `fillResting` mutates the resting map.
+   */
+  advanceMarket(price: number, at?: string): Fill[] {
+    this.lastPrice = price;
+    this.lastTime = at ?? this.lastTime;
+
+    const fills: Fill[] = [];
+
+    for (const [clientOrderId, resting] of [...this.resting]) {
+      if (!this.isMarketable(resting.order, price)) {
+        continue;
+      }
+
+      const fill = this.fillResting(
+        clientOrderId,
+        undefined,
+        undefined,
+        this.lastTime ?? undefined,
+      );
+
+      if (fill) {
+        fills.push(fill);
+      }
+    }
+
+    return fills;
+  }
+
   private fillPrice(order: BrokerOrder): number {
     const slip = this.config.slippagePerShare;
     const price = order.side === 'BUY' ? order.limitPrice + slip : order.limitPrice - slip;

@@ -1,5 +1,5 @@
 import { Bar, BarSize } from '../../market-data/types';
-import { buildDipLadderConfig, OrderPlacement } from './config';
+import { buildDipLadderConfig, OrderPlacement, SpacingMode } from './config';
 import { evaluateBar, isRungHeld, rungAllocationFraction, rungQuantity } from './ladder';
 import { HeldLot, LadderPosition } from './types';
 
@@ -386,6 +386,86 @@ describe('evaluateBar', () => {
       // the rung fires nothing, and a close at or below it fires.
       expect(evaluateBar(bar(99), FLAT, config, 100, 100).intent).toBeNull();
       expect(evaluateBar(bar(95), FLAT, config, 100, 100).intent?.limitPrice).toBe(95);
+    });
+  });
+
+  /**
+   * Gap re-basing, end to end through the firing decision.
+   *
+   * The anchor rule is unit-tested in `anchor.spec.ts`; what these cases pin is
+   * the consequence that motivates it — under RESTING placement a stale anchor
+   * does not merely shift the rung, it means **no order is placed at all**, and
+   * re-basing is what restores a placement. Written at the live fixed-dollar
+   * geometry because that is where the defect actually bites: a $1 rung is
+   * narrower than an ordinary TQQQ gap.
+   */
+  describe('gap-down open under RESTING placement', () => {
+    const base = {
+      symbolCapital: 10_000,
+      orderPlacement: OrderPlacement.RESTING,
+      spacingMode: SpacingMode.FIXED_DOLLAR,
+      spacingDollars: 1,
+      fixedQuantity: 50,
+    };
+
+    const stranded = buildDipLadderConfig('TQQQ', base);
+    const rebasing = buildDipLadderConfig('TQQQ', { ...base, gapRebasePercent: 0.01 });
+
+    // Previous close 72.00, session gaps down and opens at 70.00 (-2.8%).
+    const PREVIOUS_CLOSE = 72;
+    const GAPPED_OPEN = 70;
+
+    it('places nothing without re-basing — the defect', () => {
+      // Anchor stays at 72.00, so the first rung is 71.00: above a market
+      // trading at 69.95, where a resting BUY limit would be marketable.
+      const decision = evaluateBar(bar(69.95), FLAT, stranded, PREVIOUS_CLOSE, GAPPED_OPEN);
+
+      expect(decision.rungPrice).toBe(71);
+      expect(decision.intent).toBeNull();
+      expect(decision.blocked?.kind).toBe('ABOVE_RUNG');
+    });
+
+    it('places a resting limit below the market once re-based', () => {
+      // Anchor follows the open to 70.00, so the rung lands at 69.00 — under
+      // the 69.95 close, where the order rests instead of filling on arrival.
+      const decision = evaluateBar(bar(69.95), FLAT, rebasing, PREVIOUS_CLOSE, GAPPED_OPEN);
+
+      expect(decision.rungPrice).toBe(69);
+      expect(decision.intent?.limitPrice).toBe(69);
+      expect(decision.intent?.quantity).toBe(50);
+    });
+
+    it('still emits a limit order, never a market order', () => {
+      // The ladder buys at a predetermined level. Re-basing moves *where* that
+      // level is; it must not turn the entry into a market order, since there
+      // is no stop-loss underneath a lot once it fills.
+      const intent = evaluateBar(bar(69.95), FLAT, rebasing, PREVIOUS_CLOSE, GAPPED_OPEN).intent;
+
+      expect(intent?.limitPrice).toBeDefined();
+      expect(intent!.limitPrice).toBeLessThan(69.95);
+    });
+
+    it('leaves an ordinary down open on the max rule', () => {
+      // Opening 0.3% below the previous close is not a gap: the anchor holds at
+      // 72.00 and the ladder waits at 71.00 rather than chasing price down.
+      const decision = evaluateBar(bar(71.75), FLAT, rebasing, PREVIOUS_CLOSE, 71.8);
+
+      expect(decision.rungPrice).toBe(71);
+      expect(decision.intent?.limitPrice).toBe(71);
+    });
+
+    it('does not re-base while a lot is held', () => {
+      // Progression anchors on the held lot at 71.00, so the next rung is
+      // 70.00 — below existing exposure, regardless of the gap.
+      const decision = evaluateBar(
+        bar(69.95),
+        position([71]),
+        rebasing,
+        PREVIOUS_CLOSE,
+        GAPPED_OPEN,
+      );
+
+      expect(decision.rungPrice).toBe(70);
     });
   });
 

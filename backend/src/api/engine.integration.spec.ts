@@ -10,12 +10,14 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { LADDER_SPACING_DOLLARS } from '../strategies/strategies.module';
 import { AppModule } from '../app.module';
 import { BROKER_ADAPTER, ConnectionState, OrderStatus } from '../broker/broker-adapter.interface';
 import { FillMode, MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
 import { EngineService, EntryHaltCode } from '../engine/engine.service';
 import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
+import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 
 /**
  * Replaying a full fixture is ~936 bars through the whole path, and under
@@ -100,13 +102,29 @@ describe('Story 6: engine HTTP API', () => {
       });
     });
 
-    it('every lot target is its own fill price +5%, never the blended average', async () => {
+    it('every lot target is derived from its own fill price, never the blended average', async () => {
       await replay();
       const response = await request(app.getHttpServer()).get('/lots');
+      const lots: { fillPrice: number; exitTarget: number }[] = response.body;
 
-      response.body.forEach((lot: { fillPrice: number; exitTarget: number }) => {
-        expect(lot.exitTarget).toBeCloseTo(Math.round(lot.fillPrice * 1.05 * 100) / 100, 2);
+      // Asserted against the *live* geometry rather than a hardcoded +5%: the
+      // app boots through `StrategiesModule`, which selects the fixed-dollar
+      // ladder. The rule under test is per-lot derivation, not the particular
+      // take-profit — expressing it in terms of the configured value keeps the
+      // test honest when the geometry is retuned.
+      lots.forEach((lot) => {
+        expect(lot.exitTarget).toBeCloseTo(
+          Math.round((lot.fillPrice + LADDER_SPACING_DOLLARS) * 100) / 100,
+          2,
+        );
       });
+
+      // The blended-average target every lot would share if the rule were
+      // average-cost. Distinct fills must therefore produce distinct targets.
+      const distinctFills = new Set(lots.map((lot) => lot.fillPrice));
+      if (distinctFills.size > 1) {
+        expect(new Set(lots.map((lot) => lot.exitTarget)).size).toBeGreaterThan(1);
+      }
     });
 
     it('every closed lot realized a profit — no loss-booking path', async () => {
@@ -129,7 +147,16 @@ describe('Story 6: engine HTTP API', () => {
 
       response.body.forEach((rung: Record<string, unknown>) => {
         expect(typeof rung.price).toBe('number');
-        expect([RungStatus.HELD, RungStatus.RE_ARMED, RungStatus.PENDING]).toContain(rung.status);
+        // WORKING is reachable now that the mock only fills a resting order
+        // once price reaches its limit: an entry placed at a level the fixture
+        // never traded down to is still working at the end of the replay, which
+        // is exactly what a resting order does.
+        expect([
+          RungStatus.HELD,
+          RungStatus.RE_ARMED,
+          RungStatus.PENDING,
+          RungStatus.WORKING,
+        ]).toContain(rung.status);
         expect(rung.held).toBe(rung.status === RungStatus.HELD);
         expect(rung.fireable).toBe(rung.lotId === null && !rung.workingOrderId);
       });
@@ -146,14 +173,22 @@ describe('Story 6: engine HTTP API', () => {
       opposite and leaves the whole suite green.
     */
     it('reports a rung with a resting order as not fireable', async () => {
-      jest.spyOn(engine, 'ladderRungs').mockReturnValue([
+      // Stubs the symbol-aware accessor the endpoint reads: `/rungs` must know
+      // which symbol a rung belongs to, because a halted symbol is served from
+      // the database instead of from live state.
+      jest.spyOn(engine, 'ladderRungsBySymbol').mockReturnValue([
         {
-          price: 95,
-          status: RungStatus.WORKING,
-          lotId: null,
-          workingOrderId: 'co-resting',
-          completedCycles: 0,
-          lastExitAt: null,
+          symbol: 'TQQQ',
+          rungs: [
+            {
+              price: 95,
+              status: RungStatus.WORKING,
+              lotId: null,
+              workingOrderId: 'co-resting',
+              completedCycles: 0,
+              lastExitAt: null,
+            },
+          ],
         },
       ]);
 
@@ -558,14 +593,87 @@ describe('Story 6: engine HTTP API', () => {
     });
 
     it('reports the position built up by a replay that actually submitted', async () => {
-      await replay();
+      // `steady-decline` rather than the default `chop-range`, deliberately.
+      // The mock now fills a resting order only when price reaches its limit
+      // (`FillMode.MARKET_AWARE`), so `chop-range` — which ends at its own high
+      // — cycles every lot to its take-profit and finishes genuinely flat. A
+      // fixture that ends at its low is the one that leaves shares held, which
+      // is what this test is about: a real net position for reconciliation to
+      // check the lot sum against.
+      await replay('steady-decline');
 
       const positions = (await request(app.getHttpServer()).get('/positions')).body;
 
-      // The mock broker fills on submit, so a replay leaves a real net
-      // position — the thing reconciliation checks the lot sum against.
       expect(positions.length).toBeGreaterThan(0);
       expect(positions[0].symbol).toBe('TQQQ');
+    });
+  });
+
+  /**
+   * The dashboard must keep working when trading stops.
+   *
+   * A reconciliation halt deliberately restores nothing into strategy state,
+   * so `GET /lots` and `GET /rungs` — which read live strategy state — served
+   * an empty ladder for a halted symbol. The operator lost sight of the
+   * position at exactly the moment they needed to compare the database against
+   * the broker to resolve the halt.
+   *
+   * Only *trading* may stop. The read path serves the persisted rows instead,
+   * flagged `unverified` so nobody mistakes them for confirmed state.
+   */
+  describe('a halted symbol stays visible on the dashboard', () => {
+    /** Builds real ladder state, then halts the symbol it was built for. */
+    const replayThenHalt = async (): Promise<void> => {
+      await replay();
+      app
+        .get(SymbolHaltService)
+        .halt('TQQQ', 'LOT_SUM_MISMATCH', 'test halt', new Date().toISOString());
+    };
+
+    it('still serves lots for a halted symbol', async () => {
+      await replayThenHalt();
+
+      const lots = (await request(app.getHttpServer()).get('/lots').expect(200)).body;
+
+      // The regression: this was `[]`, because a halt restores nothing into
+      // the ladder and this endpoint only ever read the ladder.
+      expect(lots.length).toBeGreaterThan(0);
+      expect(lots.every((lot: { unverified: boolean }) => lot.unverified)).toBe(true);
+    });
+
+    it('still serves rungs for a halted symbol, none of them armed', async () => {
+      await replayThenHalt();
+
+      const rungs = (await request(app.getHttpServer()).get('/rungs').expect(200)).body;
+
+      expect(rungs.length).toBeGreaterThan(0);
+      expect(rungs.every((rung: { unverified: boolean }) => rung.unverified)).toBe(true);
+      // A halted symbol trades in neither direction, so no level is armed —
+      // whatever the persisted status says. Reporting one as fireable would
+      // tell an operator the ladder is live at a price it will never fire at.
+      expect(rungs.some((rung: { fireable: boolean }) => rung.fireable)).toBe(false);
+    });
+
+    it('leaves the halt itself in force — visibility is not permission', async () => {
+      await replayThenHalt();
+
+      const status = (await request(app.getHttpServer()).get('/status').expect(200)).body;
+
+      expect(status.halts.symbols).toEqual([
+        expect.objectContaining({ symbol: 'TQQQ', code: 'LOT_SUM_MISMATCH' }),
+      ]);
+    });
+
+    it('marks live lots verified when nothing is halted', async () => {
+      await replay();
+
+      const lots = (await request(app.getHttpServer()).get('/lots').expect(200)).body;
+
+      // The flag must distinguish, not decorate: an unhalted ladder reads as
+      // verified, or the banner would fire permanently and stop meaning
+      // anything.
+      expect(lots.length).toBeGreaterThan(0);
+      expect(lots.some((lot: { unverified: boolean }) => lot.unverified)).toBe(false);
     });
   });
 

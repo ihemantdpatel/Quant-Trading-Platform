@@ -158,6 +158,23 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   private lastBarAtMs: number | null = null;
 
   /**
+   * The most recent bar's close per symbol — the price the *engine* last saw.
+   *
+   * Keyed by symbol because a single global figure would silently report one
+   * instrument's price under another's name the moment a second symbol is
+   * subscribed.
+   *
+   * Deliberately **not cleared on reconnect**, unlike `lastBarAtMs`. That
+   * timestamp is cleared to restart the staleness clock, which is a statement
+   * about *delivery*; the last known price is still the last known price after
+   * a socket drop, and blanking it on IB's daily logout would empty the
+   * dashboard's price for a fault that says nothing about the market. Its `at`
+   * timestamp travels with it so a held-over price cannot be read as a fresh
+   * one.
+   */
+  private readonly lastBars = new Map<string, { price: number; at: number }>();
+
+  /**
    * The most recent market-data error per symbol, for `GET /status`.
    *
    * Keyed by symbol rather than appended, because IB repeats a rejection on
@@ -534,6 +551,13 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
       this.lastBarAtMs = this.now();
       this.dataExpectedSinceMs = null;
 
+      // The bar's close is the price the ladder is about to evaluate against,
+      // which is what makes it the right figure to show an operator: a header
+      // disagreeing with the ladder's own basis would be worse than one that
+      // lags. Arrival time, not the bar's own timestamp, for the same reason
+      // `lastBarAtMs` uses arrival — it answers "how old is what I am seeing".
+      this.lastBars.set(bar.symbol, { price: bar.close, at: this.now() });
+
       // A bar is proof the subscription recovered, so a stale rejection must
       // not linger on `/status` describing a feed that is now working.
       this.dataErrors.delete(bar.symbol);
@@ -561,6 +585,17 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   /** Epoch ms of the last bar received, or null before the first. */
   lastBarAt(): number | null {
     return this.lastBarAtMs;
+  }
+
+  /**
+   * The last bar close per symbol, with the epoch ms it arrived.
+   *
+   * Reporting only — nothing in the trading path reads this. The ladder
+   * evaluates the bar it is handed; this is the same number kept so an
+   * operator can see it.
+   */
+  lastPrices(): Array<{ symbol: string; price: number; at: number }> {
+    return [...this.lastBars.entries()].map(([symbol, bar]) => ({ symbol, ...bar }));
   }
 
   /** The most recent market-data error per symbol, newest state only. */
@@ -609,6 +644,18 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
   }
 
   async getPositions(): Promise<BrokerPosition[]> {
+    // Same distinction as `getOpenOrders`, and for a sharper reason: an
+    // unauthenticated Gateway accepts the socket and then never emits, so
+    // without this guard the call hangs until `firstValue` times out at 10s.
+    // Every dashboard poll paid that, and reconciliation reads the rejection
+    // as "unknown" either way — it just learns it immediately instead.
+    //
+    // Still a throw rather than `[]`: unknown and flat must never look alike,
+    // or an unreachable broker would reconcile as a clean flat account.
+    if (!this.isConnected()) {
+      throw new Error(`IB not connected (${this.health.state}) — cannot list positions`);
+    }
+
     return this.socket.getPositions();
   }
 

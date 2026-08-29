@@ -22,6 +22,7 @@ import {
   NotFoundException,
   Param,
   Post,
+  ServiceUnavailableException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { BROKER_ADAPTER, BrokerAdapter } from '../broker/broker-adapter.interface';
@@ -30,26 +31,44 @@ import { AppConfigService } from '../config/app-config.service';
 import { ExecutionMode } from '../config/execution-mode';
 import { EngineService } from '../engine/engine.service';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
+import {
+  DuplicateOrderService,
+  OrderDiagnosisService,
+} from '../reconciliation/order-diagnosis.service';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 import { KillSwitchService } from '../risk/kill-switch.service';
 import { RISK_CONFIG, SYMBOL_CAPITAL } from '../risk/risk.module';
 import { RiskConfig } from '../risk/risk.config';
 import { evaluateStartupAssertions, SymbolCapital } from '../risk/startup-assertions';
 import { CoordinatorService } from '../strategies/coordinator.service';
-import { RungStatus } from '../strategies/dip-ladder/rung';
-import { LotStatus } from '../strategies/dip-ladder/lot';
+import { Rung, RungStatus } from '../strategies/dip-ladder/rung';
+import { Lot, LotStatus } from '../strategies/dip-ladder/lot';
 import {
   FILL_REPOSITORY,
   FillRepository,
+  LOT_REPOSITORY,
+  LotRepository,
   ORDER_INTENT_REPOSITORY,
   ORDER_REPOSITORY,
   OrderIntentRepository,
   OrderRepository,
   RISK_EVENT_REPOSITORY,
   RiskEventRepository,
+  RUNG_REPOSITORY,
+  RungRepository,
 } from '../repositories/repository.interfaces';
 import { STORAGE_MODE, StorageMode } from '../repositories/repositories.module';
 import { isFixtureName } from '../market-data/mock/fixtures';
+
+/**
+ * The symbol a lot belongs to, recovered from its id (`${symbol}-lot-N`).
+ *
+ * A `Lot` carries no symbol field of its own — the id is the record of it —
+ * so this is the only way to tell whose ladder a lot came from.
+ */
+function symbolOfLot(lot: Lot): string {
+  return lot.id.split('-lot-')[0];
+}
 
 /** A lot as the dashboard renders it, including derived display fields. */
 interface LotView {
@@ -65,6 +84,31 @@ interface LotView {
   exitPrice: number | null;
   /** Realized P&L for a closed lot, null while held. */
   realized: number | null;
+  /**
+   * True when this row came from the database rather than live strategy state,
+   * because its symbol is halted and reconciliation deliberately restored
+   * nothing into the ladder.
+   *
+   * Carried per row rather than as a response-level flag because a halt is
+   * per-symbol: one halted symbol must not label another symbol's live lots as
+   * unverified. The dashboard uses it to say *why* the numbers may disagree
+   * with the broker — which is the question an operator is holding while
+   * resolving the halt.
+   */
+  unverified: boolean;
+}
+
+/** A rung as the dashboard renders it. `unverified` as in `LotView`. */
+interface RungView {
+  price: number;
+  status: RungStatus;
+  lotId: string | null;
+  workingOrderId: string | null;
+  completedCycles: number;
+  lastExitAt: string | null;
+  held: boolean;
+  fireable: boolean;
+  unverified: boolean;
 }
 
 @Controller()
@@ -74,12 +118,19 @@ export class EngineController {
     private readonly coordinator: CoordinatorService,
     private readonly killSwitch: KillSwitchService,
     private readonly reconciliation: ReconciliationService,
+    private readonly orderDiagnosis: OrderDiagnosisService,
+    private readonly duplicateOrders: DuplicateOrderService,
     private readonly symbolHalts: SymbolHaltService,
     private readonly appConfig: AppConfigService,
     @Inject(BROKER_ADAPTER) private readonly broker: BrokerAdapter,
     @Inject(ORDER_INTENT_REPOSITORY) private readonly intents: OrderIntentRepository,
     @Inject(ORDER_REPOSITORY) private readonly orders: OrderRepository,
     @Inject(FILL_REPOSITORY) private readonly fills: FillRepository,
+    // Read-only, and only for halted symbols: a halt restores nothing into
+    // strategy state, so these tables are the *only* place that symbol's lots
+    // and rungs still exist. See `getLots`.
+    @Inject(LOT_REPOSITORY) private readonly lotRepository: LotRepository,
+    @Inject(RUNG_REPOSITORY) private readonly rungRepository: RungRepository,
     @Inject(RISK_EVENT_REPOSITORY) private readonly riskEvents: RiskEventRepository,
     @Inject(STORAGE_MODE) private readonly storageMode: StorageMode,
     @Inject(RISK_CONFIG) private readonly riskConfig: RiskConfig,
@@ -136,10 +187,60 @@ export class EngineController {
    * (`PRD.md:386`).
    */
   @Get('lots')
-  getLots(): LotView[] {
-    return this.engine.ladderLots().map((lot) => ({
+  async getLots(): Promise<LotView[]> {
+    // A halted symbol restored from the database has an **empty** ladder in
+    // memory: `haltWith` restores nothing, deliberately, so the exit path can
+    // never read composition nobody verified. That is right for trading and
+    // wrong for looking — it blanked the very panel an operator opens to
+    // compare the database against the broker and resolve the halt.
+    //
+    // Serving the persisted rows is read-only and cannot reach a strategy:
+    // nothing is written back into the coordinator, so `processBar` still
+    // returns before `dispatchBar` and the symbol still trades in neither
+    // direction. The halt is unchanged; only its visibility is.
+    //
+    // The persisted rows **replace** a halted symbol's live rows rather than
+    // adding to them. A halt raised mid-session (via `POST /reconcile`, or on
+    // a lot-sum failure) leaves the ladder populated in memory, so appending
+    // would show every lot twice and double the totals derived from them. One
+    // authority per symbol: halted → the database, otherwise → the ladder.
+    const halted = this.symbolHalts.haltedSymbols();
+    const live = this.engine
+      .ladderLots()
+      .filter((lot) => !halted.includes(symbolOfLot(lot)))
+      .map((lot) => this.toLotView(lot, false));
+
+    return [...live, ...(await this.haltedLots(halted))];
+  }
+
+  /**
+   * Persisted lots for every halted symbol, flagged `unverified`.
+   *
+   * A failed read degrades to `[]` rather than throwing. The live rows above
+   * are already in hand, and a database hiccup must not blank the panel for
+   * the symbols that *are* healthy — that is the coupling this whole change
+   * exists to remove.
+   */
+  private async haltedLots(symbols: string[]): Promise<LotView[]> {
+    const views: LotView[] = [];
+
+    for (const symbol of symbols) {
+      try {
+        const lots = await this.lotRepository.findBySymbol(symbol);
+        views.push(...lots.map((lot) => this.toLotView(lot, true)));
+      } catch {
+        // Reported by the halt banner already; an empty section is not worth
+        // failing the whole read for.
+      }
+    }
+
+    return views;
+  }
+
+  private toLotView(lot: Lot, unverified: boolean): LotView {
+    return {
       id: lot.id,
-      symbol: lot.id.split('-lot-')[0],
+      symbol: symbolOfLot(lot),
       rungPrice: lot.rungPrice,
       fillPrice: lot.fillPrice,
       quantity: lot.quantity,
@@ -152,13 +253,42 @@ export class EngineController {
         lot.status === LotStatus.CLOSED && lot.exitPrice !== null
           ? Math.round((lot.exitPrice - lot.fillPrice) * lot.quantity * 100) / 100
           : null,
-    }));
+      unverified,
+    };
   }
 
   /** Rungs distinguishing held / working / re-armed / pending with their prices. */
   @Get('rungs')
-  getRungs(): unknown[] {
-    return this.engine.ladderRungs().map((rung) => ({
+  async getRungs(): Promise<RungView[]> {
+    // Same reasoning as `getLots`, including the substitution: a halted
+    // symbol's rungs come from the database and its in-memory rungs are
+    // dropped, so a mid-session halt cannot render the ladder twice.
+    const halted = this.symbolHalts.haltedSymbols();
+    const live = this.engine
+      .ladderRungsBySymbol()
+      .filter(({ symbol }) => !halted.includes(symbol))
+      .flatMap(({ rungs }) => rungs.map((rung) => this.toRungView(rung, false)));
+
+    return [...live, ...(await this.haltedRungs(halted))];
+  }
+
+  private async haltedRungs(symbols: string[]): Promise<RungView[]> {
+    const views: RungView[] = [];
+
+    for (const symbol of symbols) {
+      try {
+        const rungs = await this.rungRepository.findBySymbol(symbol);
+        views.push(...rungs.map((rung) => this.toRungView(rung, true)));
+      } catch {
+        // As in `haltedLots` — degrade to omitting this symbol's rungs.
+      }
+    }
+
+    return views;
+  }
+
+  private toRungView(rung: Rung, unverified: boolean): RungView {
+    return {
       price: rung.price,
       status: rung.status,
       lotId: rung.lotId,
@@ -173,15 +303,30 @@ export class EngineController {
       // holds no lot but must not fire again. Deriving this from `status !== HELD`
       // alone would report a WORKING rung as fireable and tell an operator the
       // ladder is armed at a level where an order is already committed.
-      fireable: rung.lotId === null && !rung.workingOrderId,
-    }));
+      //
+      // Always false for an unverified row: the symbol is halted, so no level
+      // is armed regardless of what the persisted ledger says.
+      fireable: !unverified && rung.lotId === null && !rung.workingOrderId,
+      unverified,
+    };
   }
 
   @Get('positions')
   async getPositions(): Promise<unknown[]> {
     // Broker-reported: net quantity and average cost, nothing more. Lot
     // composition comes from `GET /lots` — the two are reconciled at Story 9.
-    return this.broker.getPositions();
+    try {
+      return await this.broker.getPositions();
+    } catch (error) {
+      // 503 rather than 500: "the broker cannot answer right now" is a
+      // temporary upstream condition, not a bug in this endpoint, and the
+      // dashboard renders it as an unavailable *panel* instead of a failed
+      // page. Deliberately not `[]` — that would report a flat account during
+      // an outage, which is the one answer worse than an error.
+      throw new ServiceUnavailableException(
+        `positions unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   @Get('risk-events')
@@ -228,6 +373,12 @@ export class EngineController {
               pacing: this.broker.pacingStats(),
               dataStale: this.broker.isDataStale(),
               lastBarAt: this.broker.lastBarAt(),
+              // The last bar close per symbol, so the dashboard can show the
+              // price the ladder is actually evaluating against. Carried on
+              // `/status` rather than a route of its own because the shell
+              // already fetches this on every tab and polls it — a second
+              // endpoint would double the request rate to report one number.
+              lastPrices: this.broker.lastPrices(),
               // Why the feed is silent, next to the fact that it is. IB rejects
               // an unentitled data request and then delivers nothing, which
               // leaves every other field here reading healthy — so without this
@@ -256,6 +407,10 @@ export class EngineController {
       // must be able to tell "scheduled but not yet due" from "ran and found
       // nothing", which absence alone cannot express.
       orderReconciliation: this.reconciliation.lastOrderReconcile(),
+      // **Active alerts only.** A resolved alert is history, and rendering it
+      // as a live banner told an operator the engine was halted when it had
+      // already recovered. The full record, resolved rows included, is at
+      // `GET /alerts`.
       alerts: this.engine.activeAlerts(),
       strategies: this.coordinator.snapshots().map((s) => ({ id: s.id, enabled: s.enabled })),
     };
@@ -319,6 +474,109 @@ export class EngineController {
   @HttpCode(HttpStatus.OK)
   async reconcile(): Promise<unknown> {
     return this.reconciliation.reconcileAll(new Date().toISOString());
+  }
+
+  /**
+   * Reports what rests at the broker against what the ladder believes rests.
+   *
+   * **Read-only, and deliberately separate from `POST /reconcile`.** Asking
+   * reconciliation "what is wrong" changes the answer — it releases rungs,
+   * adopts orphans, restores state, and can halt a symbol on the lot-sum
+   * assertion. An operator deciding whether to intervene needs to see the
+   * divergence *before* anything acts on it, which is what this provides.
+   *
+   * A GET because it has no effect: nothing here writes state, places an
+   * order, or cancels one.
+   */
+  @Get('orders/diagnosis')
+  async diagnoseOrders(): Promise<unknown> {
+    return this.orderDiagnosis.diagnose(new Date().toISOString());
+  }
+
+  /**
+   * Places resting orders for gaps the diagnosis identified.
+   *
+   * **This creates orders, and it is the only route that does.** Two properties
+   * make it safe to expose:
+   *
+   * - **It acts only on diagnosed gaps**, never on an empty book. A ladder
+   *   resting nothing is not evidence of a fault — a flat ladder with no
+   *   fireable rung correctly rests nothing — so candidates come from a
+   *   specific claim the ladder makes and the broker contradicts: a HELD lot
+   *   with no resting sell, or a fireable rung with no resting buy. The
+   *   diagnosis is re-run inside the call, so a stale preview cannot place an
+   *   order the ladder no longer wants.
+   * - **It bypasses nothing.** Each candidate crosses
+   *   `RiskManagerService.evaluate()` exactly as a bar-generated intent does,
+   *   so the capital caps, the loss breaker, and the kill switch all apply. An
+   *   entry halt still blocks BUYs, and every order must pass `isRestable` —
+   *   an order that cannot be proven non-marketable is refused rather than sent
+   *   to cross the spread.
+   *
+   * Refused candidates are returned with their reasons rather than silently
+   * dropped: an operator who pressed this needs to know which gaps remain.
+   */
+  @Post('orders/place-missing')
+  @HttpCode(HttpStatus.OK)
+  async placeMissingOrders(): Promise<unknown> {
+    const diagnosis = await this.orderDiagnosis.diagnose(new Date().toISOString());
+
+    if (!diagnosis.brokerReachable) {
+      // "Cannot ask" is not "nothing is resting". Placing against an unreadable
+      // book could duplicate an order already working at that level.
+      throw new ServiceUnavailableException({
+        message: 'the broker could not be reached, so no order was placed',
+        reason: diagnosis.reason,
+      });
+    }
+
+    const result = await this.engine.placeMissingOrders(
+      diagnosis.missing.map((missing) => ({
+        strategyId: missing.strategyId,
+        symbol: missing.symbol,
+        side: missing.side,
+        quantity: missing.quantity,
+        limitPrice: missing.limitPrice,
+        reason: missing.reason,
+        lotId: missing.lotId,
+      })),
+    );
+
+    return { ranAt: diagnosis.ranAt, ...result };
+  }
+
+  /**
+   * Cancels the redundant orders in each unambiguous duplicate group.
+   *
+   * **The one route that destroys an order.** The standing rule — an order the
+   * engine cannot explain is reported, not cancelled — is preserved wherever it
+   * still applies: only *untracked* extras at a price where exactly one order
+   * is tied to a rung or lot are cancelled, the ladder's own claim always
+   * survives, and an ambiguous group (no tracked order, or several) is skipped
+   * and reported for an operator to resolve in TWS. A partially filled order is
+   * never eligible, so this cannot strand a fill mid-flight.
+   *
+   * The justification is that two orders at one rung both fill, which is
+   * surplus exposure at a level already covered — the concrete harm the
+   * no-cancel rule was never protecting against.
+   */
+  @Post('orders/resolve-duplicates')
+  @HttpCode(HttpStatus.OK)
+  async resolveDuplicateOrders(): Promise<unknown> {
+    return this.duplicateOrders.resolveDuplicates(new Date().toISOString());
+  }
+
+  /**
+   * Every alert this process raised, resolved ones included.
+   *
+   * The complement to `GET /status`'s active-only list. The soak signs a day
+   * off against the faults it saw *and* their recovery — "stale at 19:55,
+   * resumed at 09:35" — so resolving an alert must not make it unreadable.
+   * Read-only; nothing here changes engine state.
+   */
+  @Get('alerts')
+  getAlerts(): unknown {
+    return { alerts: this.engine.alertHistory() };
   }
 
   @Get('halts')

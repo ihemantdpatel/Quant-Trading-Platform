@@ -88,6 +88,16 @@ export function resolveSpacing(
   config: DipLadderConfig,
   dailyBars: Bar[] = [],
 ): SpacingResult {
+  // Checked before ATR because it consults no history and cannot fall back:
+  // the distance is stated outright rather than derived from market data.
+  if (config.spacingMode === SpacingMode.FIXED_DOLLAR) {
+    return {
+      distance: roundToCents(config.spacingDollars),
+      mode: SpacingMode.FIXED_DOLLAR,
+      fellBack: false,
+    };
+  }
+
   if (config.spacingMode === SpacingMode.ATR) {
     const atr = computeAtr(dailyBars, config.atrPeriod);
 

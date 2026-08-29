@@ -41,7 +41,7 @@ All backend commands run from `backend/`.
 
 | Command | Purpose |
 |---|---|
-| `npm test` | Full suite (1494 tests), no database required |
+| `npm test` | Full suite (1568 tests), no database required |
 | `npm run test:cov` | Suite + coverage thresholds — what CI gates on |
 | `npm run test:db` | The Prisma suites; needs `DATABASE_URL` |
 | `npm run test:watch` | Watch mode |
@@ -211,18 +211,116 @@ pure modules, not the adapter.** `replay-ladder.ts` is a test harness, not the p
 
 Rules that are easy to break by accident:
 
-- Each lot exits at **its own** fill price +5%, never the blended average. Blended cost is display-only.
+- Each lot exits at **its own** fill price plus the configured take-profit, never the blended
+  average. Blended cost is display-only. The *amount* is geometry-dependent — see "Fixed-dollar
+  geometry" below; the per-lot derivation is the invariant, not the 5%.
 - **Lots only ever exit in profit.** No stop-loss, no loss-booking exit, at any level.
 - A rung re-arms at its **original** price and may fire again; re-armed empty rungs don't count
   against the 5-concurrent limit.
 - The hard floor at −25% stops adding but **never sells**.
 - Firing is 09:45–16:00 ET only; the anchor is still computed from the 09:30 open.
+- The bootstrap anchor is `max(previousClose, open)` **except on a gap down past
+  `gapRebasePercent`**, where it re-bases onto the open. Off by default (`null`), opted into at 1% in
+  `strategies.module.ts` — see "Gap re-basing" below.
 - The firing window governs **entries only**. A lot at its frozen take-profit target may exit at any
   point in the regular session, including the 09:30–09:45 opening auction — `onBar` runs `selectExit`
   before the window is consulted. Counting exits as window violations produced false anomalies; see
   the daily report section.
 
-### Resting limit orders (Story 13)
+### Fixed-dollar geometry — what the live engine actually trades
+
+**The live ladder is not the 5% ladder the fixtures describe.** `strategies.module.ts` selects
+`SpacingMode.FIXED_DOLLAR` with `spacingDollars: 1`, `takeProfitDollars: 1`, and
+`fixedQuantity: 50` — targeting **USD 50 per completed cycle** at any price level, since
+`spacingDollars × fixedQuantity` is price-independent where a percentage is not (1% of $72 and 1% of
+$100 are different amounts of money).
+
+| Field | Default (fixtures) | Live engine |
+|---|---|---|
+| `spacingMode` | `PERCENTAGE`, 5% | `FIXED_DOLLAR`, $1 |
+| take-profit | `takeProfitPercent` 5% | `takeProfitDollars` $1 |
+| quantity | `floor(symbolCapital × sizePerRung / price)` | `fixedQuantity` 50 |
+
+All three are **opt-in**, for the same reason `orderPlacement` is: the committed fixtures' expected
+intents were computed under the percentage rule, and changing a default would silently invalidate
+them. `takeProfitDollars` and `fixedQuantity` are `null` by default and *supersede* their percentage
+counterparts when set.
+
+- **`takeProfitDollars` is set equal to `spacingDollars` deliberately**, so a lot's target lands
+  exactly on the rung above it and a rung freed by an exit is the level the next entry re-arms at.
+- **`fixedQuantity` bypasses `symbolCapital` entirely** — sizing no longer consults the allocation.
+  It does *not* bypass the risk layer: every intent still crosses `RiskManagerService`, so a fixed
+  quantity is a request, not a guarantee. A full 5-rung ladder deploys ~$17,250 against the 40,000
+  allocation.
+- **The hard floor stops binding.** Five $1 rungs span $5 while a 25% floor sits ~$18 below a $72
+  anchor, so the ladder exhausts `maxConcurrentRungs` long before the floor is consulted. The rung
+  count is the binding constraint now, not the floor. `live-geometry.spec.ts` pins this.
+
+**The backtest evidence argues against this geometry, and it was overridden deliberately.** Over the
+committed drawdown scenarios, $1 rungs fill the whole ladder within $5 of price and leave nothing to
+cycle: the 2020 crash-and-recovery scenario completes 4 cycles for **+$1,477** under 5% spacing and
+**zero** under this one, sitting fully extended 94.9% of the time against 73.2%. The ladder earns by
+cycling upper rungs while lower ones hold, and one that is always fully extended has nothing to
+cycle. Accepted for a **paper** account, where the purpose is observing live mechanics rather than
+return. `fixed-dollar-comparison.spec.ts` regenerates the comparison. **Story 15 must revisit this
+alongside the capital figures before `LIVE`.**
+
+**One known reporting gap follows from it.** The daily report's rung recomputation seeds
+`knownRungs` only from lots held entering the session plus levels its own walk derives — so a rung
+established in an earlier session, re-armed and still empty at the open, is invisible to it and the
+engine's legitimate re-arm is reported as `RUNG_VERIFICATION_UNEXPLAINED`. The gap predates this
+geometry; $1 spacing merely makes the ladder revisit levels often enough to reach it. The seeding is
+deliberate — the service refuses to read the ladder's own rung ledger back, because that readback is
+the comparison it exists to avoid — so closing it means finding a rung source that is not the
+ladder's own ledger. **Relevant to the soak: this anomaly is expected and does not by itself
+invalidate a week**, unlike every other anomaly code.
+
+### Gap re-basing — why a stale anchor stops the live ladder
+
+`max(previousClose, open)` implements "wait rather than chase" (`PRD.md:67`): on a gap down the
+previous close wins, so the first rung sits a spacing unit below a level price has already left.
+Under `IMMEDIATE` that only delays an entry. **Under `RESTING` it prevents one entirely** — the rung
+is above the market, `isRestable` refuses to place a marketable BUY limit there, and the ladder
+places *nothing* for as long as the gap holds.
+
+The fixed-dollar geometry turned that from tolerable into acute. A $1 rung is ~1.4% at a $72 price,
+while an ordinary 2% TQQQ gap is ~$1.44 — wider than a rung — so the whole ladder can sit stranded
+above the market on exactly the down days it exists to work.
+
+`gapRebasePercent` re-bases the bootstrap anchor onto the session open past a threshold, putting
+rungs where the market can reach them.
+
+- **It changes where levels sit, not how they are ordered.** Entries remain resting limit orders
+  below the market; nothing here emits a market order. That matters because a lot has **no stop-loss
+  underneath it** — a market order into a gapped-open 3x ETF book is a fill price the ladder must
+  then hold until it reaches take-profit, however long that takes.
+- **Bootstrap only.** Progression takes precedence whenever anything is held, so a ladder holding
+  through a gap keeps extending below its own exposure rather than re-basing above it.
+- **One-directional.** A gap *up* already re-bases through the max rule; the threshold applies only
+  to gaps down, where the max rule is what strands the anchor.
+- **Default `null`, opted in at 1%** in `strategies.module.ts`, for the same reason as
+  `orderPlacement` and `fixedQuantity`: `scenarios.spec.ts` pins the `gap-down-open` fixture's first
+  rung at 95.00 under the plain max rule, and a default would silently invalidate it. 1% sits just
+  above the $1 spacing so the rule fires when a gap has consumed roughly a rung's worth of distance.
+- **Not runtime-editable**, alongside `orderPlacement`: editing it while orders rest at levels the
+  old rule chose would desynchronize the working orders from the rule that placed them.
+- **The daily report must be passed the config.** `reconcileRungs` recomputes anchors via
+  `resolveAnchor`, so omitting it would anchor every gap-down session on the previous close while the
+  engine used the open — a full session of false `RUNG_VERIFICATION_UNEXPLAINED`. This stays a
+  recomputation, not a readback: the config supplies the rule, exactly as spacing already does.
+- Operator-chosen, not backtest-derived. **Story 15 must revisit it with the capital figures and the
+  fixed-dollar geometry before `LIVE`.**
+
+### Resting limit orders (Stories 13 and 14a)
+
+**Story 13 rested entries; Story 14a rested exits.** For a while only half the path was converted,
+and the asymmetry was the defect: `isRestingEntry` returned false for any SELL, so an exit was
+submitted with no working-order registration and no persistent fill routing, and `applyExit` closed
+the lot and re-armed its rung when the *intent* was created. A rejected or expired sell therefore
+left the ladder believing it was flat at a level it still held — free to buy there again against
+exposure it had never released — and booked the close at the assumed target rather than a real fill
+price. Both sides now rest; `isRestingOrder` is the general test and `isRestingEntry` the narrower
+one kept for rung bookkeeping, which is meaningful only for entries.
 
 **`OrderPlacement` selects when an order is created, and it changes what a rung means.**
 
@@ -271,6 +369,42 @@ no lot but **must not fire again** — otherwise every bar stacks another order 
   carries only broker vocabulary and nothing identifying which rung placed it, so the map is where
   `rungPrice` is kept between placement and fill.
 
+**On the exit side the same rules hold, keyed to the lot rather than the rung:**
+
+- **`Lot.workingOrderId` is the durable record**, the counterpart to `Rung.workingOrderId`.
+  `selectExit` and `selectRestingExits` both skip a lot that has one — without it every bar stacks
+  another sell against shares one order already covers, which is the bug `RungStatus.WORKING`
+  prevents on the entry side.
+- **A sell is placed as soon as the lot opens**, not when price approaches the target. `exitTarget`
+  is frozen above `fillPrice` at open, so the limit is non-marketable on arrival by construction —
+  this is why `isRestableExit` (the mirror of `isRestable`) always passes in normal operation. It
+  earns its place on the one case where the premise fails: a lot reconstructed by `recover:lots`
+  whose target is already below the market, where the right action is to place nothing rather than
+  dump shares into a marketable sell.
+- **Waiting for price to approach the target was considered and rejected.** The arming decision could
+  only be made from bar closes, so a rally crossing the arm distance *and* the target inside one bar
+  would arrive with no order resting — the intra-bar miss the whole change exists to remove.
+- **A partial sell splits the lot** rather than shrinking it: the filled portion closes at the real
+  fill price, the remainder stays `HELD` with the **same `fillPrice`, `exitTarget`, and `openedAt`**
+  and a fresh id. Shrinking would change a lot's composition after open (`PRD.md:386`) and there is
+  nowhere to record profit already taken — `realizedPnl` multiplies by a lot's whole quantity. The
+  split keeps `sold + remainder == original`, so the lot-sum assertion is unaffected. The rung
+  deliberately does **not** re-arm while the remainder is held.
+- **The duplicate guard must not consult `Lot.workingOrderId`.** `selectRestingExits` already filters
+  on it, so a duplicate sell can only arise when that field is *wrong* — state restored from a write
+  that predates the mark, an adopted order, a fill router that has not run. A guard re-reading it
+  agrees with it and lets the duplicate through, which is what it did. `restingSellIdFor` asks the
+  broker and matches on **price and quantity**. That is coarser than the entry guard's price match,
+  so a legitimate second exit at a shared target can be declined and retried next bar — deliberate,
+  because a declined exit is recoverable and a position sold twice is not.
+- **A bar that submits must persist before returning.** `Lot.workingOrderId` and `Rung.workingOrderId`
+  are written by the submit path and by nothing else on that bar. Without the write, a crash between
+  placement and the next fill left the database holding a lot with no working order while a live sell
+  rested at IB — the entry-side crash window Story 13 closed, reopened on the exit side.
+- **`selectRestingExits` returns every unprotected lot, not one per bar.** `selectExit`'s one-per-bar
+  limit exists because each intent becomes an order immediately; here the orders enforce decisions
+  the ladder already made, and a session opening with four held lots needs four sells resting.
+
 **Restart safety is the reason `getOpenOrders()` exists on `BrokerAdapter`.** An order placed before
 a restart is still live at IB afterwards, and nothing in the database can confirm that — only the
 broker knows. Reconciliation resolves the two directions of divergence:
@@ -286,6 +420,16 @@ not destroyed — cancelling one an operator placed by hand would be the system 
 decision it does not understand. And `getOpenOrders()` throwing is **not** `[]`: "cannot ask" leaves
 the ledger exactly as persisted, because collapsing it to "nothing resting" would release every
 `WORKING` rung and duplicate live orders.
+
+**The one exception is an unambiguous duplicate**, via `POST /orders/resolve-duplicates` — never on
+the reconciliation path, and never automatically. The rule above turns on *inexplicability*, which
+is precisely what a duplicate is not: when two orders share a symbol, side, and price and exactly
+one is tied to a rung or lot through `workingOrderId`, the ladder is demonstrably depending on that
+one and the others are surplus exposure at a level already covered. Two orders at one rung both
+fill. The rule is preserved everywhere it still applies — only *untracked* extras are cancelled, the
+ladder's own claim always survives, a group with zero or several tracked orders is reported rather
+than guessed at, and a partially filled order is excluded from grouping entirely so a fill can never
+be stranded mid-flight. See "Checking, placing, and de-duplicating orders" below.
 
 ### Orders the engine could not learn the fate of
 
@@ -384,6 +528,61 @@ changed.
   nothing about the halt, and leaving its ledger stale would hand the operator a second, unrelated
   discrepancy to resolve.
 
+### Checking, placing, and de-duplicating orders
+
+Three operator controls sit beside Reconcile on the dashboard, backed by
+`OrderDiagnosisService` and `DuplicateOrderService`. They exist because the ladder and the broker can
+disagree in ways nothing on the bar path repairs, and because **asking reconciliation what is wrong
+changes the answer** — `reconcileAll` releases rungs, adopts orphans, restores state from the
+database, and can halt a symbol. An operator deciding whether to intervene needs to see the
+divergence before anything acts on it.
+
+**`GET /orders/diagnosis` is read-only and writes nothing.** It joins `getOpenOrders()` against live
+ladder state and classifies into four findings, each with a different repair:
+
+| Finding | Meaning | Repaired by |
+|---|---|---|
+| `MATCHED` | a rung or lot whose `workingOrderId` is present at the broker | nothing — the healthy case |
+| `UNBACKED` | the ladder holds a `workingOrderId` the broker does not list | `POST /reconcile` |
+| `ORPHAN` | an order at the broker no rung or lot claims | reported only, never cancelled |
+| `DUPLICATE` | two or more unfilled orders at one symbol, side, and price | `POST /orders/resolve-duplicates`, when unambiguous |
+
+A halted symbol is **skipped**, not diagnosed: a halt leaves live strategy state empty by design, so
+every one of its orders would read as an orphan and every rung as missing — findings that describe
+the halt rather than the orders.
+
+**`POST /orders/place-missing` is the only route that creates an order outside a bar**, and the two
+things a bar supplies are replaced rather than skipped:
+
+- **The decision** is replaced by a diagnosis, re-run *inside* the call so a stale preview cannot
+  place an order the ladder no longer wants. Candidates come from a specific claim the ladder makes
+  and the broker contradicts — a HELD lot with no resting sell, or a fireable rung with no resting
+  buy. **Never from an empty book**: a ladder resting nothing is not evidence of a fault, since a
+  flat ladder with no fireable rung correctly rests nothing, and placing there would open a position
+  the ladder never decided to open.
+- **The price** is replaced by `lastBarClose`. Without it `isRestable`/`isRestableExit` cannot be
+  evaluated, so a null close refuses *everything* — an order that cannot be proven non-marketable is
+  not placed. A marketable order into a 3x ETF book is a fill price the ladder must then hold with no
+  stop underneath it.
+
+It **bypasses nothing**: every candidate crosses `RiskManagerService.evaluate()` exactly as a
+bar-generated intent does (via `evaluateBatch`, so several are measured against one running capital
+total), the entry halt still blocks BUYs while exits stay permitted, and the submit path persists
+`Lot.workingOrderId` / `Rung.workingOrderId` before returning — the same crash window `processBar`
+closes after its own submissions. A `WORKING` rung whose order is gone is deliberately **not** a
+placement candidate: releasing it is reconciliation's job, and re-placing at a level still marked
+`WORKING` would race that release.
+
+**`POST /orders/resolve-duplicates` is the only route that destroys an order** — see the exception
+noted under "Orders are never cancelled by reconciliation" above for why that is allowed here and
+nowhere else.
+
+**On the dashboard, both acting buttons stay disabled until a check has run.** That is the
+interaction design rather than a convenience: placing against an unexamined book is how duplicates
+are created, and cancelling without having seen which order the ladder depends on is how a working
+order is destroyed. Acting also clears the findings, so a second action needs a fresh check —
+acting twice on one diagnosis is itself a way to place a duplicate.
+
 ### Parameter edits apply to future rungs only
 
 `POST /parameters/:strategyId` edits ladder parameters at runtime. **A held lot's exit target is
@@ -438,6 +637,16 @@ with the exact lot structure. Anything else → halt the symbol.
   FIFO would pick from records that disagree with reality. Positions are held, never liquidated.
 - A halt also **suppresses persistence for that symbol**, so the empty in-memory ladder cannot
   overwrite the stored lots an operator needs to resolve it.
+- **Only trading stops — the dashboard keeps showing the position.** Because a halt restores nothing
+  into strategy state, `GET /lots` and `GET /rungs` served an *empty ladder* for a halted symbol:
+  they read live state, and live state is empty by design. That blanked the panels an operator opens
+  to compare the database against the broker, during the one event that requires exactly that
+  comparison. Both endpoints now fall back to the persisted rows for a halted symbol, flagged
+  `unverified: true`. This is read-only and reaches no strategy — nothing is written back into the
+  coordinator, so `processBar` still returns before `dispatchBar`. The persisted rows **replace** a
+  halted symbol's live rows rather than adding to them: a halt raised mid-session leaves the ladder
+  populated in memory, and appending would render every lot twice. `fireable` is forced false on an
+  unverified rung — a halted symbol has nothing armed, whatever the stored status says.
 - Halts clear only via `POST /halts/:symbol/release`. `POST /engine/reset` deliberately does not.
 - An unreachable broker is `null`, not `[]` — "unknown" must halt where "flat" may reconcile.
 
@@ -751,7 +960,7 @@ running on in-memory state, and reconciliation catches a persistent divergence o
 ### HTTP API
 
 Read: `GET /health` `/status` `/intents` `/orders` `/fills` `/lots` `/rungs` `/positions`
-`/risk-events` `/strategies` `/halts` `/reports/daily`
+`/risk-events` `/strategies` `/halts` `/reports/daily` `/orders/diagnosis`
 
 `GET /status` gains `broker.pacing`, `broker.dataStale`, `broker.lastBarAt`, and `broker.dataErrors`
 when IB is bound. Pacing is reported because breaching IB's limits produces no error of its own — a
@@ -762,6 +971,15 @@ to the fact that it is.
 has fired. An operator must be able to tell "scheduled but not yet due" from "ran and found nothing",
 which absence alone cannot express.
 
+`GET /lots` and `GET /rungs` carry `unverified`, true when the row was read from the database
+because its symbol is halted rather than from live strategy state — see "Reconciliation" above. The
+dashboard labels those panels so a last-recorded position is never mistaken for a confirmed one.
+
+`GET /positions` answers **503** when the broker cannot be asked, rather than `[]`. Unknown and flat
+must never look alike; `[]` would report a flat account during an outage. It also guards on
+`isConnected()` before calling IB — an unauthenticated Gateway accepts the socket and then never
+replies, so without the guard every dashboard poll paid a 10s timeout.
+
 `GET /rungs` gains `workingOrderId`, so the dashboard can join a working rung to its row in
 `GET /orders`. Its `fireable` field is derived as `lotId === null && !workingOrderId`, mirroring
 `selectFireableRung` — deriving it from `status !== HELD` alone would report a `WORKING` rung as
@@ -771,7 +989,8 @@ Read: `GET /parameters` `/parameters/changes` `/parameters/:strategyId`
 
 Control: `POST /engine/replay` `{fixture}` · `/engine/reset` · `/engine/clear-halt` · `/reconcile` ·
 `/broker/reconnect` · `/kill-switch` `{engaged, reason}` · `/strategies/:id/enable|disable` ·
-`/mode` `{mode}` · `/parameters/:strategyId` `{parameters, reason}` · `/halts/:symbol/release`
+`/mode` `{mode}` · `/parameters/:strategyId` `{parameters, reason}` · `/halts/:symbol/release` ·
+`/orders/place-missing` · `/orders/resolve-duplicates`
 
 `POST /reconcile` takes no body and runs the **full** startup reconciliation — it can halt symbols
 and it restores persisted state over live memory. See "Reconciliation on demand and after the close"
@@ -804,7 +1023,7 @@ curl localhost:3000/lots
 
 ## Testing
 
-1494 backend tests across 73 suites, plus database tests (`npm run test:db`, needs MySQL) and 119 UI
+1568 backend tests across 77 suites, plus database tests (`npm run test:db`, needs MySQL) and 119 UI
 component tests. Coverage thresholds are enforced in CI: **80% global, 95% on
 `src/strategies/**` and `src/risk/**`** — those are pure functions where a bug costs real money.
 
@@ -818,13 +1037,23 @@ Because a skipped suite looks exactly like a passing one, CI sets `REQUIRE_DATAB
 - Replay is deterministic — the same fixture always produces identical intents. Tests depend on this.
 - The mock broker is deterministic too (no clock, no randomness) and models partial fills,
   rejections, disconnects, and exponential-backoff reconnect.
+- **`FillMode.MARKET_AWARE` is what makes a resting order testable**, and the assembled app selects
+  it (`engine.module.ts`). The `IMMEDIATE` default fills every order on submission at its limit
+  price whatever the market is doing — tolerable for an entry, which rests below the market, and
+  wrong for an exit, which rests above it: every lot opened and closed on the same bar. Market-aware
+  fills are driven per bar by `EngineService.advanceSimulatedMarket`, and a fill carries **the
+  timestamp of the bar that filled it**, not of the order that placed it. Stamping the order's own
+  time backdated a lot's open and close to submission, which the daily report — walking a session's
+  lots in timestamp order — reported as `RUNG_PRICE_MISMATCH`. The default stays `IMMEDIATE` so
+  existing suites keep the rule their expectations were computed under.
 - Integration tests drive the assembled app over Supertest. **The app now boots in `PAPER` against
   the mock broker**, so replay exercises the real submission path rather than stopping short of it —
   the separate `EngineService`-in-`PAPER` construction that used to be the only way to reach
   submission is no longer the only route. Mode safety is asserted the other way round now: `POST
   /mode` must *refuse* `SHADOW`.
 - **Resting-order behavior is not covered by the fixtures.** They run `IMMEDIATE`; see
-  `resting-orders.spec.ts` and the reconciliation suites for the `RESTING` path.
+  `resting-orders.spec.ts` (entries), `resting-exits.spec.ts` (exits), and the reconciliation suites
+  for the `RESTING` path.
 - Prefer adding a case to an existing scenario suite over a new bespoke harness.
 
 **Do not write a test that can never fail.** `architecture.spec.ts` tests its own detector for this

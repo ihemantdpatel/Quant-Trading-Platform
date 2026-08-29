@@ -38,9 +38,9 @@ import {
   TimeInForce,
 } from '../types';
 import { DipLadderConfig, OrderPlacement } from './config';
-import { ExitIntent, selectExit } from './exits';
+import { ExitIntent, selectExit, selectRestingExits } from './exits';
 import { evaluateBar } from './ladder';
-import { closeLot, Lot, LotStatus, openLot } from './lot';
+import { closeLot, Lot, LotStatus, openLot, splitLot } from './lot';
 import { clearWorking, createRung, findRung, markHeld, markWorking, reArm, Rung } from './rung';
 import { isSessionOpenBar, sessionDateOf } from './session-window';
 import { EntryIntent, LadderPosition } from './types';
@@ -148,11 +148,35 @@ export class DipLadderStrategy implements Strategy {
     this.trackSession(bar, data);
 
     // ---- Exits first, so this bar's entry sees the freed rung ----
-    const exit = selectExit(data.lots, bar.close, bar.timestamp, this.config.symbol);
+    //
+    // The two placement modes ask different questions here, mirroring the split
+    // on the entry side. IMMEDIATE asks which lot has *reached* its target — a
+    // question only a closed bar can answer, and one that therefore misses a
+    // rally spiking through the target and retracing. RESTING asks which lot has
+    // no order protecting its target yet, and leaves the watching to the
+    // exchange.
+    //
+    // Under RESTING no lot is closed here. The order goes to the broker and
+    // waits; the lot closes only when a fill arrives, because until then the
+    // shares are still held and a lot closed against an unfilled order would
+    // misreport the position to reconciliation — and re-arm a rung against
+    // shares that were never sold.
+    if (this.config.orderPlacement === OrderPlacement.RESTING) {
+      for (const exit of selectRestingExits(
+        data.lots,
+        bar.close,
+        bar.timestamp,
+        this.config.symbol,
+      )) {
+        intents.push(this.toExitIntent(exit));
+      }
+    } else {
+      const exit = selectExit(data.lots, bar.close, bar.timestamp, this.config.symbol);
 
-    if (exit) {
-      this.applyExit(exit, data, bar.timestamp);
-      intents.push(this.toExitIntent(exit));
+      if (exit) {
+        this.applyExit(exit, data, bar.timestamp);
+        intents.push(this.toExitIntent(exit));
+      }
     }
 
     // ---- Then the entry decision ----
@@ -303,6 +327,97 @@ export class DipLadderStrategy implements Strategy {
     data.rungs = data.rungs.map((rung) =>
       rung.workingOrderId === clientOrderId ? clearWorking(rung) : rung,
     ) as DipLadderStateData['rungs'];
+
+    // A resting SELL that went away leaves its lot held with nothing protecting
+    // its target. Clearing the id is what makes the lot eligible for a fresh
+    // order on the next bar — the exit-side equivalent of a rung becoming
+    // fireable again, and the reason a DAY-expired sell re-places itself
+    // without any separate scheduling.
+    data.lots = data.lots.map((lot) =>
+      lot.workingOrderId === clientOrderId ? { ...lot, workingOrderId: null } : lot,
+    ) as DipLadderStateData['lots'];
+  }
+
+  /**
+   * Records that a SELL is now resting against `lotId`.
+   *
+   * Called by the engine after the broker acknowledges the order, for the same
+   * reason as `recordWorkingOrder`: a lot must not be marked as protected by an
+   * order that was rejected or never reached IB, or `selectRestingExits` would
+   * skip it forever and its target would go unwatched.
+   */
+  static recordWorkingExit(state: StrategyState, lotId: string, clientOrderId: string): void {
+    const data = ladderData(state);
+
+    data.lots = data.lots.map((lot) =>
+      lot.id === lotId ? { ...lot, workingOrderId: clientOrderId } : lot,
+    ) as DipLadderStateData['lots'];
+  }
+
+  /**
+   * Closes a lot from a broker fill on a resting SELL, re-arming its rung.
+   *
+   * The RESTING-mode counterpart to `applyExit`, and the difference is the whole
+   * point of Story 14a: the lot closes at the **actual** fill price rather than
+   * at the target it assumed, and the rung re-arms only now — when the shares
+   * have genuinely been sold — rather than when the intent was created.
+   *
+   * **A partial fill splits the lot** rather than shrinking it; see `splitLot`
+   * for why. The sold portion closes and the remainder stays held at the same
+   * basis, keeping its place in the FIFO queue. The rung deliberately does
+   * **not** re-arm in that case: it still holds shares, and re-arming a level
+   * that is still occupied would let the ladder place an entry against exposure
+   * it has not actually released.
+   *
+   * Returns the closed portion so the engine can persist and report it.
+   */
+  static closeLotFromFill(
+    state: StrategyState,
+    fill: { lotId: string; price: number; quantity: number; at: string },
+  ): { closed: Lot; remainder: Lot | null } | null {
+    const data = ladderData(state);
+    const index = data.lots.findIndex((lot) => lot.id === fill.lotId);
+
+    // Unlike `applyExit`, this lookup genuinely can miss: the fill arrives from
+    // the broker long after the intent, across restarts and reconciliation, so
+    // the lot it names may have been closed by another path already. Returning
+    // null lets the engine treat it as an unattributable fill rather than
+    // throwing on the fill router.
+    if (index === -1 || data.lots[index].status !== LotStatus.HELD) {
+      return null;
+    }
+
+    const lot = data.lots[index];
+
+    if (fill.quantity < lot.quantity) {
+      data.lotSequence += 1;
+      const { sold, remainder } = splitLot(
+        lot,
+        fill.quantity,
+        fill.price,
+        fill.at,
+        `${lot.id}-r${data.lotSequence}`,
+      );
+
+      data.lots = [
+        ...data.lots.slice(0, index),
+        sold,
+        remainder,
+        ...data.lots.slice(index + 1),
+      ] as DipLadderStateData['lots'];
+
+      return { closed: sold, remainder };
+    }
+
+    const closed = closeLot(lot, fill.price, fill.at);
+    data.lots = data.lots.map((candidate) =>
+      candidate.id === lot.id ? closed : candidate,
+    ) as DipLadderStateData['lots'];
+    data.rungs = data.rungs.map((rung) =>
+      rung.lotId === closed.id ? reArm(rung, fill.at) : rung,
+    ) as DipLadderStateData['rungs'];
+
+    return { closed, remainder: null };
   }
 
   /**
@@ -332,6 +447,7 @@ export class DipLadderStrategy implements Strategy {
       quantity: fill.quantity,
       openedAt: fill.at,
       takeProfitPercent: config.takeProfitPercent,
+      takeProfitDollars: config.takeProfitDollars,
     });
 
     data.lots.push(lot);
@@ -363,6 +479,7 @@ export class DipLadderStrategy implements Strategy {
       quantity: entry.quantity,
       openedAt: at,
       takeProfitPercent: this.config.takeProfitPercent,
+      takeProfitDollars: this.config.takeProfitDollars,
     });
 
     data.lots.push(lot);

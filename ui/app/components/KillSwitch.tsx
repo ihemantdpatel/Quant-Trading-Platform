@@ -3,26 +3,41 @@
 /**
  * The global kill switch — **always visible** (`PRD.md:383`).
  *
- * Rendered in the dashboard header, so it is present on every route rather than
+ * Rendered in the dashboard shell, so it is present on every route rather than
  * living inside a panel that could be scrolled past or collapsed. It is the one
  * control an operator reaches for when something is wrong, and hunting for it
  * is not acceptable at that moment.
  *
  * A Client Component because it owns pending state and a confirmation step.
  * The mutation itself is the `setKillSwitch` Server Action.
+ *
+ * **The live price is centred in this box** rather than sitting in the page
+ * header, because this is the one panel guaranteed to be on screen on every
+ * route — the same reason the kill switch itself is here. An operator deciding
+ * whether to engage it is reading the price at that moment, so the number and
+ * the control belong in one glance. It is passed in as a prop, so this
+ * component still owns no fetching of its own.
  */
 
 import { useState, useTransition } from 'react';
 import { setKillSwitch, type ActionResult } from '../actions';
+import { LivePrice } from './LivePrice';
+import type { LastPrice } from '../lib/api';
 
 export function KillSwitch({
   engaged,
   reason,
   changedAt,
+  symbol = 'TQQQ',
+  lastPrice = null,
 }: {
   engaged: boolean;
   reason: string | null;
   changedAt: string | null;
+  /** Instrument label for the centred price. */
+  symbol?: string;
+  /** The feed's last bar, or null when nothing has arrived. */
+  lastPrice?: LastPrice | null;
 }) {
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
@@ -58,6 +73,15 @@ export function KillSwitch({
               ? 'All new order submission is halted.'
               : 'Submission permitted by this control.'}
           </p>
+        </div>
+
+        {/*
+          Centred between the status and the controls. `order` keeps it in the
+          middle on a wide row but drops it below on a narrow one, where a
+          three-way split would squeeze the price into an unreadable column.
+        */}
+        <div className="order-last w-full text-center sm:order-none sm:w-auto sm:flex-1">
+          <LivePrice symbol={symbol} last={lastPrice} />
         </div>
 
         <div className="flex items-center gap-2">
