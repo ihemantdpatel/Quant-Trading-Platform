@@ -45,16 +45,22 @@ function parametersData(overrides: Partial<ParametersData> = {}): ParametersData
       {
         strategyId: 'dip-ladder:TQQQ',
         parameters: {
-          spacingMode: 'PERCENT',
+          // A valid `SpacingMode` and a positive floor fraction: this fixture
+          // previously carried 'PERCENT' and a negative floor, neither of which
+          // the backend would accept.
+          spacingMode: 'PERCENTAGE',
           spacingPercent: 0.03,
+          spacingDollars: 1,
           takeProfitPercent: 0.05,
+          takeProfitDollars: null,
           sizePerRung: 0.2,
-          hardFloorPercent: -0.25,
+          fixedQuantity: null,
+          hardFloorPercent: 0.25,
           maxConcurrentRungs: 5,
           escalationFactor: 1,
           atrMultiple: 1,
           atrPeriod: 14,
-          symbol: 'TQQQ',
+          exitMode: 'PER_LOT',
         },
       },
     ],

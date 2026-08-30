@@ -88,7 +88,8 @@ something observable — a passing scenario suite, an HTTP response, a browser v
 | 11 | Backtester | 2022 drawdown examined explicitly | 10 |
 | 12 | ~~SHADOW soak~~ **superseded** | Instrumentation built and kept; the week itself never ran — the mode was retired first | 10 |
 | 13 | PAPER enablement + resting orders | Capital + loss threshold set; `SHADOW` retired; entries rest at IB | 11 |
-| 14 | PAPER soak + fix loop | ≥1 complete lot cycle; kill switch verified live | 13 |
+| 14a | Resting exit orders — **built** | Exits rest at IB; a lot closes on a real fill, not an assumption | 13 |
+| 14 | PAPER soak + fix loop | ≥1 complete lot cycle; kill switch verified live | 14a |
 | 15 | LIVE enablement | Explicit flag; 25% nominal for two weeks | 14 |
 | 16 | Phase 4 handoff | Grid / Wheel / LEAPs on the proven engine | 15 |
 
@@ -903,7 +904,8 @@ daily logout silently ended the feed for the life of the process until re-subscr
 **Goal:** Run on paper until the full lifecycle — including exits and re-arming — has demonstrably
 executed against a real broker.
 
-**Depends on:** Story 13
+**Depends on:** Story 13, **Story 14a** — the soak's exit criterion requires a complete lot
+cycle, and until 14a lands an exit closes its lot on an unfilled order rather than on a broker fill.
 **PRD refs:** §12 (`PRD.md:486`), rollout decisions above
 
 > **This story now absorbs Story 12's soak week**, which was superseded before it ran. The daily
@@ -954,6 +956,238 @@ executed against a real broker.
 **Exit criterion:** four weeks minimum **and** ≥1 complete lot cycle executed, **and** zero unexplained
 reconciliation halts, **and** kill switch verified live, **and** no duplicated order across any
 restart.
+
+---
+
+## Story 14a — Resting exit orders — **BUILT**
+
+**Goal:** Make an exit rest at the broker the way an entry does, so a lot closes on a real fill
+rather than on an assumption.
+
+**Depends on:** Story 13
+**PRD refs:** §1 per-lot exits (`PRD.md:127`), FIFO disposal (`PRD.md:134`), state & recovery
+(`PRD.md:343`)
+
+### The defect
+
+Story 13 converted **entries** to resting limit orders and left **exits** on the pre-Story-13 rule.
+`OrderPlacement` is consulted in exactly one place — the entry branch of `onBar`
+(`dip-ladder.strategy.ts:182`) — and `isRestingEntry` (`engine.service.ts:821`) returns false for
+anything that is not a BUY. So under the live engine's `RESTING` config, entries rest and exits do
+not.
+
+A SELL *is* still submitted — it is not dropped. What is missing is everything that makes a resting
+order survivable: no `workingOrders` registration, no `WORKING` marker, no duplicate guard against
+`getOpenOrders()`, and no persistent fill router. `submitOrder` takes the non-resting branch, whose
+`onFill` subscription is torn down in its own `finally` — the exact teardown Story 13 identified as
+insufficient once orders outlive the submit call.
+
+Three consequences, in increasing order of seriousness:
+
+**1. The lot is closed before the order is.** `applyExit` (`dip-ladder.strategy.ts:254`) closes the
+lot and re-arms the rung inside `onBar`, before submission. If the sell is rejected, or rests
+unfilled and expires as a DAY order, the ladder believes it is flat at that rung while IB still holds
+the shares. Nothing repairs this: `routeOrderStatus` returns early because `workingOrders` has no
+entry for a sell. The next `reconcileAll` compares fewer lots against a real position and halts the
+symbol — the same recoverable-gap-becomes-an-operator-problem shape that `recoverWorkingOrder` was
+written to close on the buy side.
+
+**2. The rung re-arms against shares that were never sold**, so a new BUY can be placed at a level
+whose position is still held — breaching `maxConcurrentRungs` in substance while satisfying it on
+paper.
+
+**3. The close is booked at the target price, not the fill price.** `closeLot(lots[index],
+exit.limitPrice, at)` feeds `realizedPnl` a price no broker confirmed. On the entry side the
+equivalent shortcut is explicitly corrected — `applyFill` recomputes a lot's target from the real
+fill price precisely because an assumed price is not a fact.
+
+**And the original motivation for Story 13 applies unchanged.** `selectExit` triggers on
+`close >= lot.exitTarget`, so a rally that spikes through the target intra-bar and retraces sells
+nothing. The ladder sells the close, not the rally — the mirror of buying the close rather than the
+dip.
+
+### Why the fixtures did not catch it
+
+They run `IMMEDIATE`, where `selectExit`'s close-based trigger makes both sides consistent. The
+asymmetry exists only on the live `RESTING` path, which CLAUDE.md already warns the fixtures are not
+evidence about. `resting-orders.spec.ts` covers the entry half only.
+
+### The placement decision: at open, not at a proximity threshold
+
+A resting sell is placed **when the lot opens**, not when price approaches the target. The
+alternative — arming only within some distance of the target — was considered and rejected.
+
+**It is safe at open because `exitTarget` is always above `fillPrice` by construction**
+(`exits.ts:15`). At the instant a BUY fills the market is at the fill price, so the sell limit is
+non-marketable on arrival and stays so until price rallies to it. This is the exact mirror of
+`isRestable` (`ladder.ts:112`) on the buy side, and the reason that guard never binds for an exit.
+
+**A proximity gate would reintroduce the bug being fixed.** The arming decision could only be made
+from bar closes, so a rally that crosses the arm distance *and* the target inside one bar arrives
+with no order resting — the intra-bar miss again, through a narrower window. The point of resting is
+that the exchange watches the price, not the ladder.
+
+It would also need arm/disarm state with no precedent here, and it would buy nothing: a resting sell
+against shares already held reserves no capital, and IB's pacing limits govern historical data
+requests, not order placement.
+
+**The accepted cost is re-placement each session.** DAY orders expire at the close, so every held lot
+needs its sell re-placed on the first bar of the next session. This is the same shape as
+`PostCloseReconcileService` and the live feed's re-subscription on every `CONNECTED`. If open-order
+count ever becomes a real constraint, restricting placement to lots within the session's plausible
+range is the lever — to be measured during the soak, not designed around now.
+
+**In scope**
+- `isRestableExit(target, close)` in `ladder.ts`, mirroring `isRestable`. Under normal operation it
+  always passes; it earns its place on the one case where it does not — `recover:lots` reconstructing
+  a lot whose target is already below the market. That case must place nothing and report, never dump
+  shares into a marketable sell.
+- `Lot.workingOrderId`, mirroring `Rung.workingOrderId` as the durable record. `selectExit` skips a
+  lot that already has one — without it every bar stacks another sell against the same lot, which is
+  the bug `RungStatus.WORKING` exists to prevent on the entry side.
+- Resting-exit branch in `onBar`, guarded on `orderPlacement === RESTING`. `applyExit`'s eager close
+  moves off the intent.
+- `isRestingEntry` → `isRestingOrder`, with a `kind: 'ENTRY' | 'EXIT'` discriminant on
+  `WorkingOrder`; exits carry `lotId`.
+- `routeFill` branches on side: BUY opens a lot as today; SELL closes the lot **at the real fill
+  price** and re-arms the rung only then.
+- **Partial sell fills: split the lot and cancel the remainder.** *Decided — see below.*
+- Reconciliation: `recoverWorkingOrder` is explicitly narrowed to BUY (`engine.service.ts:755`) and
+  must learn exits, matched through `Lot.workingOrderId`. `adoptWorkingOrders` likewise, or a restart
+  orphans a resting sell at IB.
+- Session re-placement of resting sells for lots held across a close.
+- Prisma migration for `Lot.workingOrderId`.
+
+### Partial sell fills — split, do not shrink
+
+A resting sell that fills 40 of 100 leaves a lot the `Lot` type cannot describe: partly realized,
+partly held. Two options were weighed.
+
+**Shrinking in place is rejected.** Reducing `quantity` and leaving the lot `HELD` changes a lot's
+composition after open, which `PRD.md:386` forbids for the frozen target, and there is no
+representation for realized-so-far — `realizedPnl` takes a whole lot and multiplies by its full
+quantity. Expressing it would need a new field that persistence, the lot-sum assertion, the daily
+report, and the dashboard would all have to learn.
+
+**The lot is split into two structurally ordinary lots:**
+
+- **sold portion** → `CLOSED`, `quantity` = filled, `exitPrice` = the **real fill price**
+- **remainder** → `HELD`, new `id`, and the **same `fillPrice`, `exitTarget`, `rungPrice`, and
+  `openedAt`** as the original
+
+Every downstream consumer then sees lots it already understands, and the lot-sum assertion is
+preserved exactly: `sold + remainder == original`, so held quantities still sum to the broker
+position. The remainder keeps the original `openedAt` deliberately — it holds its FIFO place rather
+than jumping to the back of the queue (`lot.ts:131` already breaks ties by `id`, so a new id is safe
+where a new timestamp would not be).
+
+The remainder is cancelled at the broker, mirroring `cancelRemainder` on the buy side and for the
+same reason: an order still working is exposure the ladder has not decided to carry. A failed cancel
+is `ORDER_FAULT` — halt entries, touch no position. The remainder lot then has no working order and
+becomes eligible for a fresh resting sell on the next bar, which is self-healing without new
+machinery.
+
+**Two accepted consequences.** The rung does **not** re-arm on a partial exit — it re-arms only when
+its lot is fully disposed, so a partially-sold level stops cycling until the remainder clears. That
+under-arms rather than over-arms, which is the safe direction and consistent with
+`committedRungCount` treating exposure as committed. And `lotSequence` now advances on exits as well
+as entries, since a split mints an id.
+
+**Out of scope**
+- **`IMMEDIATE` is left alone.** `applyExit`'s eager close is arguably wrong there too — a rejected
+  sell desyncs by the same mechanism, through a much shorter window — but changing it would move
+  every committed fixture's expected intents, and the fixtures are the evidence base for the ladder's
+  arithmetic. Fix the mode the live engine actually runs.
+- Changing `selectExit`'s FIFO or highest-rung-first ordering. Which lot exits is unchanged; only how
+  its order reaches the broker.
+
+**Files**
+- `backend/src/strategies/dip-ladder/exits.ts`, `lot.ts`, `ladder.ts`, `dip-ladder.strategy.ts`
+- `backend/src/engine/engine.service.ts`
+- `backend/src/engine/resting-exits.spec.ts` — new, mirroring `resting-orders.spec.ts`
+- `backend/prisma/migrations/…_lot_working_order/`
+
+**Tests**
+- a lot opening places a resting SELL at its target; none is placed twice across bars
+- a spike through target that retraces intra-bar still fills — the case `IMMEDIATE` misses
+- a rejected SELL leaves the lot **HELD** and the rung **not** re-armed
+- a SELL fill closes the lot at the **fill** price, not the target price
+- `isRestableExit` refuses a target below the market and places nothing
+- restart with a resting SELL: the order is adopted, not duplicated
+- a SELL fill arriving while the daemon was down is recovered, not dropped
+- DAY-expired SELL is re-placed on the next session's first bar
+- partial SELL fill follows whatever rule the design decision above settles on
+
+**Exit criterion:** a lot cycle — entry rests, fills, exit rests, fills — completes against the mock
+broker under `RESTING`, with the lot closed at the broker's fill price and the rung re-armed only
+after that fill. No lot closes on an unfilled order in any test.
+
+**Status:** built; suite green at 1568 tests / 77 suites, lint clean, coverage thresholds met.
+
+### Found while building: the mock broker could not express a resting order
+
+Not anticipated, and it invalidated more than this story. `MockBrokerAdapter`'s default
+`FillMode.IMMEDIATE` fills **every** order on submission at its limit price, regardless of where the
+market is. That was survivable while only entries rested — a rung sits below the market, so filling
+it on arrival is roughly what a marketable order would do — and completely wrong for an exit, which
+rests *above* the market by construction. Every lot opened and closed on the same bar, a cycle no
+exchange could produce.
+
+`FillMode.MARKET_AWARE` fills a resting order only once price reaches its limit, driven per bar by
+`EngineService.advanceSimulatedMarket` from `processBar`. It is selected for the mock in
+`engine.module.ts`; the default is left `IMMEDIATE` so existing suites keep the rule their
+expectations were computed under.
+
+**A second fidelity bug surfaced underneath it.** `fillResting` stamped every fill with the *order's*
+timestamp rather than the time it filled, so a resting order that waited hours backdated its lot's
+open and close to the moment of submission. The daily report walks a session's lots in timestamp
+order to reconstruct which rungs were free when, and a backdated close made it report legitimate
+re-entries as `RUNG_PRICE_MISMATCH`. Fills now carry the bar that filled them.
+
+Both were latent before this story and would have first shown up as a divergence between paper
+results and every fixture-driven expectation.
+
+### Found in review: a restart placed a **duplicate sell**
+
+Reported from a running instance, reproduced, and fixed. Two independent causes, either sufficient
+on its own to sell a position twice.
+
+**1. The working-order id was never persisted on the bar that placed the order.** `Lot.workingOrderId`
+is written by the submit path, and nothing else on that bar wrote it — fills and order statuses
+persist, but a bar that merely *places* orders did not. So the database held a lot with
+`workingOrderId: null` while a live sell rested at IB. On restart the lot looked unprotected,
+`selectRestingExits` emitted a second sell, and both could fill. This is precisely the crash window
+Story 13 closed for entries, reopened on the exit side. `processBar` now persists after any bar that
+submitted.
+
+**2. The duplicate guard consulted the field that was stale.** The first version of
+`restingSellIdFor` read `Lot.workingOrderId` and confirmed it against the broker — which is circular:
+`selectRestingExits` has *already* filtered on that field, so a duplicate can only arise when it is
+wrong, and a guard re-reading it agrees with it and passes the duplicate through. The guard now asks
+the **broker** and matches on **price and quantity**, the only facts a resting sell carries that tie
+it to the shares it would sell.
+
+This is coarser than the entry guard's price match — two lots at one rung across cycles can share a
+target, so a legitimate second exit can be declined and retried on the next bar once the first order
+clears. That asymmetry is deliberate: a declined exit is recoverable, a position sold twice is not.
+
+**A test that passed for the wrong reason was caught here too.** The first version of the regression
+used a bar stamped `09:60` — not a valid time, silently discarded, so no intent was ever generated
+and the guard was never reached. Both regressions are now mutation-tested: each fails with its fix
+reverted.
+
+### Three integration tests rested on the old fill behaviour
+
+Each was updated with its reason, not merely made to pass:
+
+- **`reports the position built up by a replay`** now replays `steady-decline` rather than
+  `chop-range`. Its premise — stated in its own comment — was "the mock fills on submit"; with
+  market-aware fills `chop-range` ends at its own high, cycles every lot to take-profit, and finishes
+  genuinely **flat**. A fixture ending at its low is the one that leaves shares held.
+- **`GET /rungs` distinguishes held, re-armed, and pending`** now also admits `WORKING`. An entry
+  placed at a level the fixture never traded down to is still resting at the end of the replay, which
+  is what a resting order does.
+- The daily-report cycle assertions pass unchanged once fills carry honest timestamps.
 
 ---
 
@@ -1066,11 +1300,11 @@ Every `PRD.md` section maps to at least one story:
 
 | PRD section | Stories |
 |---|---|
-| §1 Dip-buying ladder | 3, 4 |
+| §1 Dip-buying ladder | 3, 4, 14a |
 | §2 Strategy interface | 2 |
 | §3 Risk manager | 5 |
 | §4 Broker boundary | 6, 10 |
-| §5 State & recovery | 9 |
+| §5 State & recovery | 9, 14a |
 | §6 Persistence | 8 |
 | §7 Dashboard | 7 |
 | §8 Backtesting | 11 |

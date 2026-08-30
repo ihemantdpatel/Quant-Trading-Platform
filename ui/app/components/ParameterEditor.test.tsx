@@ -28,6 +28,9 @@ const PARAMETERS: LadderParameters = {
   atrMultiple: 1,
   atrPeriod: 14,
   takeProfitPercent: 0.05,
+  takeProfitDollars: null,
+  spacingDollars: 1,
+  fixedQuantity: null,
   exitMode: 'PER_LOT',
   sizePerRung: 0.25,
   escalationFactor: 1,
@@ -70,8 +73,8 @@ describe('ParameterEditor', () => {
   it('renders percentage parameters as percentages', () => {
     renderEditor();
 
-    expect(screen.getByLabelText(/take profit/i)).toHaveValue(5);
-    expect(screen.getByLabelText(/rung spacing/i)).toHaveValue(5);
+    expect(screen.getByLabelText('Take profit')).toHaveValue(5);
+    expect(screen.getByLabelText('Rung spacing')).toHaveValue(5);
     expect(screen.getByLabelText(/hard floor/i)).toHaveValue(25);
   });
 
@@ -79,7 +82,7 @@ describe('ParameterEditor', () => {
     const user = userEvent.setup();
     renderEditor();
 
-    const takeProfit = screen.getByLabelText(/take profit/i);
+    const takeProfit = screen.getByLabelText('Take profit');
     await user.clear(takeProfit);
     await user.type(takeProfit, '8');
     await user.click(screen.getByRole('button', { name: /apply to future rungs/i }));
@@ -172,5 +175,90 @@ describe('ParameterEditor', () => {
     expect(screen.getByText(/change log \(append-only\)/i)).toBeInTheDocument();
     expect(screen.getByText(/takeProfitPercent/)).toBeInTheDocument();
     expect(screen.getByText(/wider target in chop/)).toBeInTheDocument();
+  });
+});
+
+/**
+ * The fixed-dollar geometry the live engine runs.
+ *
+ * The failure this guards against is specific and was real: the form rendered a
+ * hardcoded percentage field list, so an operator saw `spacingPercent` at 5%
+ * while the ladder placed $1 rungs — and editing that 5% would have written an
+ * audit record for a value the engine does not read.
+ */
+describe('ParameterEditor with fixed-dollar parameters', () => {
+  const FIXED_DOLLAR: LadderParameters = {
+    ...PARAMETERS,
+    spacingMode: 'FIXED_DOLLAR',
+    spacingDollars: 1,
+    takeProfitDollars: 1,
+    fixedQuantity: 50,
+  };
+
+  function renderFixedDollar() {
+    return render(
+      <ParameterEditor
+        strategyId="dip-ladder:TQQQ"
+        parameters={FIXED_DOLLAR}
+        heldLotCount={0}
+        changes={[]}
+      />,
+    );
+  }
+
+  it('shows the absolute values the engine actually uses', () => {
+    renderFixedDollar();
+
+    expect(screen.getByLabelText('Rung spacing ($)')).toHaveValue(1);
+    expect(screen.getByLabelText('Take profit ($)')).toHaveValue(1);
+    expect(screen.getByLabelText('Fixed quantity')).toHaveValue(50);
+  });
+
+  it('disables the percentage fields those values supersede', () => {
+    renderFixedDollar();
+
+    expect(screen.getByLabelText('Rung spacing')).toBeDisabled();
+    expect(screen.getByLabelText('Take profit')).toBeDisabled();
+    expect(screen.getByLabelText('Size per rung')).toBeDisabled();
+    // The floor is not superseded by anything and stays editable.
+    expect(screen.getByLabelText('Hard floor')).toBeEnabled();
+  });
+
+  it('does not submit a superseded percentage, which the engine would ignore', async () => {
+    const user = userEvent.setup();
+    renderFixedDollar();
+
+    await user.click(screen.getByRole('button', { name: /apply to future rungs/i }));
+
+    const payload = editParameters.mock.calls[0][1] as Record<string, unknown>;
+
+    expect(payload).not.toHaveProperty('spacingPercent');
+    expect(payload).not.toHaveProperty('takeProfitPercent');
+    expect(payload).not.toHaveProperty('sizePerRung');
+    expect(payload.spacingDollars).toBe(1);
+    expect(payload.takeProfitDollars).toBe(1);
+    expect(payload.fixedQuantity).toBe(50);
+  });
+
+  it('sends null when an absolute field is cleared, restoring the percentage rule', async () => {
+    const user = userEvent.setup();
+    renderFixedDollar();
+
+    await user.clear(screen.getByLabelText('Take profit ($)'));
+    await user.clear(screen.getByLabelText('Fixed quantity'));
+    await user.click(screen.getByRole('button', { name: /apply to future rungs/i }));
+
+    const payload = editParameters.mock.calls[0][1] as Record<string, unknown>;
+
+    // Explicitly null rather than absent: omitting the key means "leave
+    // unchanged", which would make clearing the field impossible.
+    expect(payload.takeProfitDollars).toBeNull();
+    expect(payload.fixedQuantity).toBeNull();
+  });
+
+  it('offers FIXED_DOLLAR as a spacing mode', () => {
+    renderFixedDollar();
+
+    expect(screen.getByLabelText('Spacing mode')).toHaveValue('FIXED_DOLLAR');
   });
 });

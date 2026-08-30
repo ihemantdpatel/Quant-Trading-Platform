@@ -47,6 +47,7 @@ export default async function ExecutionPage() {
         positions={data.positions}
         deployed={totalDeployedCost(data.lots)}
         realized={totalRealized(data.lots)}
+        positionsUnavailable={data.unavailable?.positions ?? false}
       />
 
       <div className={`grid gap-4 ${replayable ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
@@ -56,8 +57,8 @@ export default async function ExecutionPage() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
-        <LadderView rungs={data.rungs} mark={mark} />
-        <LotTable lots={data.lots} mark={mark} />
+        <LadderView rungs={data.rungs} mark={mark} unavailable={data.unavailable?.rungs ?? false} />
+        <LotTable lots={data.lots} mark={mark} unavailable={data.unavailable?.lots ?? false} />
       </div>
 
       <ActivityLog

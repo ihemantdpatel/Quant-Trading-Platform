@@ -1,4 +1,5 @@
-import { Lot, heldLots, oldestHeldLotAtRung } from './lot';
+import { Lot, heldLots, isHeld, oldestHeldLotAtRung } from './lot';
+import { isRestableExit } from './ladder';
 
 /**
  * Per-lot take-profit evaluation.
@@ -89,6 +90,15 @@ export function selectExit(
     // lot that happens to be in profit does not jump the queue.
     const candidate = oldestHeldLotAtRung(lots, rungPrice);
 
+    // A lot with a sell already resting at the broker is not a disposal
+    // candidate: the order covering these shares exists, and emitting a second
+    // intent would stack another sell against a position one order already
+    // covers. This is the exit-side counterpart of `RungStatus.WORKING`
+    // excluding a rung from `isFireable`.
+    if (candidate?.workingOrderId) {
+      continue;
+    }
+
     if (candidate && hasReachedTarget(candidate, close)) {
       return {
         symbol,
@@ -107,4 +117,49 @@ export function selectExit(
   }
 
   return null;
+}
+
+/**
+ * Lots that should have a resting SELL placed against them on this bar.
+ *
+ * The `RESTING` counterpart to `selectExit`. Where that function asks "which
+ * lot has *reached* its target" — a question only a bar close can answer, and
+ * therefore one that misses a rally spiking through the target and retracing —
+ * this one asks "which lot has no order protecting its target yet". The
+ * exchange then does the watching, which is the whole reason entries were moved
+ * to resting orders in Story 13.
+ *
+ * Unlike `selectExit` this is **not** limited to one lot per bar. That limit
+ * exists there because each emitted intent becomes an order immediately, and
+ * one decision per rung per bar keeps intents mapping one-to-one onto orders.
+ * Here the orders are what make the ladder's *existing* decisions enforceable,
+ * and a session opening with four held lots needs four sells resting — placing
+ * one per bar would leave the other three unprotected for no reason.
+ *
+ * FIFO is not consulted for the same reason: every held lot gets its own order
+ * at its own target, so there is no queue to arbitrate. Which lot sells first is
+ * decided by the market reaching its target, which is what per-lot exits mean.
+ */
+export function selectRestingExits(
+  lots: Lot[],
+  close: number,
+  barTimestamp: string,
+  symbol: string,
+): ExitIntent[] {
+  return lots
+    .filter((lot) => isHeld(lot) && lot.workingOrderId === null)
+    .filter((lot) => isRestableExit(lot.exitTarget, close))
+    .map((lot) => ({
+      symbol,
+      side: 'SELL' as const,
+      quantity: lot.quantity,
+      limitPrice: lot.exitTarget,
+      lotId: lot.id,
+      rungPrice: lot.rungPrice,
+      timestamp: barTimestamp,
+      reason:
+        `resting exit for lot ${lot.id} at rung ${lot.rungPrice.toFixed(2)}: ` +
+        `target ${lot.exitTarget.toFixed(2)} from fill ${lot.fillPrice.toFixed(2)} ` +
+        `(close ${close.toFixed(2)})`,
+    }));
 }

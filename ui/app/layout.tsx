@@ -21,6 +21,7 @@ import { AlertBanner } from './components/AlertBanner';
 import { AutoRefresh } from './components/AutoRefresh';
 import { KillSwitch } from './components/KillSwitch';
 import { ReconcileButton } from './components/ReconcileButton';
+import { PendingOrders } from './components/PendingOrders';
 import { Tabs } from './components/Tabs';
 import { loadStatus } from './lib/api';
 
@@ -32,6 +33,20 @@ export const metadata: Metadata = {
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const { status, error } = await loadStatus();
   const killSwitch = status?.halts.killSwitch;
+
+  /*
+    The shell fetches only `/status`, which reports strategy ids but not the
+    symbols they trade — so the instrument shown is the one the feed is
+    actually delivering, read straight from the broker's last bar. `TQQQ` is
+    the label used before any bar has arrived (and under the mock broker,
+    which has no live feed); it names what the ladder trades rather than
+    implying a price exists.
+
+    Passed down to `KillSwitch`, which renders it centred: that panel is on
+    screen on every route, so the price rides along with the guarantee the
+    kill switch already has rather than needing one of its own.
+  */
+  const last = status?.broker.lastPrices?.[0] ?? null;
 
   return (
     <html lang="en">
@@ -54,9 +69,20 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             engaged={killSwitch?.engaged ?? false}
             reason={killSwitch?.reason ?? null}
             changedAt={killSwitch?.changedAt ?? null}
+            symbol={last?.symbol ?? 'TQQQ'}
+            lastPrice={last}
           />
 
-          <ReconcileButton lastRun={status?.orderReconciliation ?? null} />
+          {/*
+            Beside Reconcile, in the header rather than in `EngineControls`, for
+            the same reason: these controls are least useful against fixtures
+            and most useful against a live Gateway, so they must not share that
+            component's hidden-when-IB-is-bound gate.
+          */}
+          <div className="grid gap-4 lg:grid-cols-2">
+            <ReconcileButton lastRun={status?.orderReconciliation ?? null} />
+            <PendingOrders />
+          </div>
 
           <Tabs />
 

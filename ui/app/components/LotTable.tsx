@@ -31,16 +31,30 @@ export function LotTable({
   lots,
   mark,
   now,
+  unavailable = false,
 }: {
   lots: Lot[];
   /** Last traded price, or null when the engine has seen no fills. */
   mark: number | null;
   /** Injectable clock so age rendering is deterministic under test. */
   now?: number;
+  /**
+   * True when the `/lots` read failed on this load.
+   *
+   * Rendered distinctly from an empty ladder: both produce zero rows, but
+   * "could not read" and "holding nothing" are opposite facts, and showing the
+   * flat-ladder copy during an outage would tell an operator they have no
+   * position when they may be fully extended.
+   */
+  unavailable?: boolean;
 }) {
   const held = lots.filter((lot) => lot.status === 'HELD');
   const closed = lots.filter((lot) => lot.status === 'CLOSED');
   const blended = blendedAverageCost(lots);
+  // Any row served from the database because its symbol is halted. The banner
+  // is per-table rather than per-row: the caveat is about the whole reading,
+  // and repeating it on every row would bury it.
+  const unverified = lots.some((lot) => lot.unverified);
 
   return (
     <section aria-label="Per-lot table" className="rounded-lg border border-slate-800 bg-slate-900">
@@ -51,7 +65,19 @@ export function LotTable({
         </p>
       </header>
 
-      {lots.length === 0 ? (
+      {unverified && (
+        <p className="border-b border-amber-800/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
+          Some lots are shown from the <strong>database</strong> because their symbol is halted.
+          They have not been verified against the broker — that is why the symbol is halted. Treat
+          them as the last recorded state, not as confirmed positions.
+        </p>
+      )}
+
+      {unavailable ? (
+        <p className="px-4 py-6 text-sm text-amber-300">
+          Lots unavailable — this read failed. The engine is unaffected; positions are untouched.
+        </p>
+      ) : lots.length === 0 ? (
         <p className="px-4 py-6 text-sm text-slate-500">
           No lots yet. Replay a fixture to drive the ladder.
         </p>

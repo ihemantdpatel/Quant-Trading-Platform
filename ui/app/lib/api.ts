@@ -52,6 +52,16 @@ export interface Lot {
   exitPrice: number | null;
   /** Realized P&L for a closed lot; null while held. */
   realized: number | null;
+  /**
+   * True when this row was read from the database because its symbol is
+   * halted, rather than from live strategy state.
+   *
+   * A halt restores nothing into the ladder, so these are the only records of
+   * the position that remain — and they have **not** been verified against the
+   * broker, which is the whole reason the symbol is halted. Optional so an
+   * older backend omitting the field reads as verified.
+   */
+  unverified?: boolean;
 }
 
 export interface Rung {
@@ -64,6 +74,8 @@ export interface Rung {
   lastExitAt: string | null;
   held: boolean;
   fireable: boolean;
+  /** As on `Lot` — persisted rather than live, because the symbol is halted. */
+  unverified?: boolean;
 }
 
 export interface Position {
@@ -110,6 +122,22 @@ export interface EngineAlert {
   code: string;
   detail: string;
   timestamp: string;
+  /**
+   * When the reported condition ended, or `null` while it still holds.
+   *
+   * Optional because an older backend omits the field entirely; absent is read
+   * as unresolved, which keeps such an alert visible rather than silently
+   * hiding a live fault.
+   */
+  resolvedAt?: string | null;
+}
+
+/** The most recent bar close for one symbol, with the epoch ms it arrived. */
+export interface LastPrice {
+  symbol: string;
+  price: number;
+  /** Epoch ms the bar arrived — the basis for showing the price's age. */
+  at: number;
 }
 
 export interface Status {
@@ -120,6 +148,12 @@ export interface Status {
     state: ConnectionState;
     reconnectAttempts: number;
     lastError: string | null;
+    /**
+     * The last bar close per symbol. Present only when IB is the bound broker
+     * — the mock broker has no live feed, and an absent field must render as
+     * "no price" rather than as a zero.
+     */
+    lastPrices?: LastPrice[];
   };
   halts: {
     killSwitch: { engaged: boolean; reason: string | null; changedAt: string | null };
@@ -192,13 +226,23 @@ export interface StrategySummary {
 }
 
 export interface LadderParameters {
-  spacingMode: 'PERCENTAGE' | 'ATR';
+  spacingMode: 'PERCENTAGE' | 'ATR' | 'FIXED_DOLLAR';
   spacingPercent: number;
   atrMultiple: number;
   atrPeriod: number;
+  /** Absolute rung distance. Used when `spacingMode` is FIXED_DOLLAR. */
+  spacingDollars: number;
   takeProfitPercent: number;
+  /**
+   * Absolute per-lot take-profit. **Supersedes `takeProfitPercent` when set**,
+   * so the percentage field is inert while this holds a value — which is why
+   * the editor greys it out rather than showing a number that does nothing.
+   */
+  takeProfitDollars: number | null;
   exitMode: 'PER_LOT' | 'AVERAGE_COST';
   sizePerRung: number;
+  /** Fixed shares per rung. Supersedes `sizePerRung` when set. */
+  fixedQuantity: number | null;
   escalationFactor: number;
   maxConcurrentRungs: number;
   hardFloorPercent: number;
@@ -233,6 +277,24 @@ export interface StatusData {
   error: string | null;
 }
 
+/**
+ * Which reads failed on this load, keyed by the data they supply.
+ *
+ * Distinguishes "unavailable" from "empty" — an empty array renders the same
+ * as a successful read of nothing, which during an outage tells an operator
+ * the ladder is flat when it may be fully extended.
+ */
+export interface Unavailable {
+  status: boolean;
+  lots: boolean;
+  rungs: boolean;
+  positions: boolean;
+  orders: boolean;
+  fills: boolean;
+  riskEvents: boolean;
+  strategies: boolean;
+}
+
 /** What the Execution tab renders: current engine state, no configuration. */
 export interface ExecutionData {
   status: Status | null;
@@ -243,8 +305,10 @@ export interface ExecutionData {
   fills: Fill[];
   riskEvents: RiskEvent[];
   strategies: StrategySummary[];
-  /** Set when the backend could not be reached at all. */
+  /** Set only when **every** read failed — a total backend outage. */
   error: string | null;
+  /** Per-endpoint failure flags; absent on loaders that fetch as one unit. */
+  unavailable?: Unavailable;
 }
 
 /** What the Parameters tab renders. `lots` is only for the held-lot count. */
@@ -274,6 +338,74 @@ async function get<T>(path: string): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+/**
+ * What rests at the broker versus what the ladder believes rests there.
+ *
+ * Read-only: produced by `GET /orders/diagnosis`, which writes nothing and can
+ * halt nothing. This is what an operator reads *before* deciding whether to
+ * place or cancel anything.
+ */
+export interface OrderDiagnosis {
+  ranAt: string;
+  /**
+   * False when the broker could not be asked.
+   *
+   * Every list below is empty in that case and must not be read as findings —
+   * "cannot ask" and "nothing resting" lead to opposite actions.
+   */
+  brokerReachable: boolean;
+  reason: string | null;
+  matched: {
+    clientOrderId: string;
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    quantity: number;
+    filledQuantity: number;
+    limitPrice: number;
+    claimedBy: string;
+  }[];
+  unbacked: {
+    symbol: string;
+    clientOrderId: string;
+    rungPrice: number | null;
+    lotId: string | null;
+    side: 'BUY' | 'SELL';
+  }[];
+  orphans: {
+    clientOrderId: string;
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    quantity: number;
+    filledQuantity: number;
+    limitPrice: number;
+  }[];
+  duplicates: {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    limitPrice: number;
+    tracked: string[];
+    untracked: string[];
+    /** True when exactly one order is tracked, so the extras are unambiguous. */
+    resolvable: boolean;
+  }[];
+  missing: {
+    symbol: string;
+    strategyId: string;
+    side: 'BUY' | 'SELL';
+    quantity: number;
+    limitPrice: number;
+    reason: string;
+    lotId: string | null;
+    rungPrice: number | null;
+  }[];
+  skippedSymbols: string[];
+}
+
+/** Reads the order diagnosis. Nothing about this call changes engine state. */
+export async function loadOrderDiagnosis(): Promise<OrderDiagnosis> {
+  return get<OrderDiagnosis>('/orders/diagnosis');
 }
 
 export class ApiError extends Error {
@@ -370,37 +502,77 @@ export async function loadStatus(): Promise<StatusData> {
   }
 }
 
-/** Current engine state for the Execution tab (`/`). */
+/**
+ * Current engine state for the Execution tab (`/`).
+ *
+ * **Every endpoint is its own failure domain.** These reads were a single
+ * `Promise.all`, which meant one rejection discarded the seven results that had
+ * already resolved and blanked the whole tab. `/positions` is the one that
+ * fails in normal operation — it is the only read here that needs the broker,
+ * and a Gateway that is down or not logged in rejects it — so a broker outage
+ * emptied the lots, rungs, orders, fills, and risk events that were all sitting
+ * there in hand and needed no broker at all.
+ *
+ * That is the same coupling the per-tab loader split exists to remove, and it
+ * was still present *inside* this loader. `allSettled` keeps whatever answered:
+ * a failed panel reports itself while the rest of the dashboard stays readable,
+ * which is what an operator needs during exactly this kind of event.
+ *
+ * `error` is now reserved for a **total** outage — every read failing — so the
+ * BACKEND_UNREACHABLE banner keeps meaning what it says rather than firing
+ * whenever a single endpoint is unavailable.
+ */
 export async function loadExecution(): Promise<ExecutionData> {
-  const empty: ExecutionData = {
-    status: null,
-    lots: [],
-    rungs: [],
-    positions: [],
-    orders: [],
-    fills: [],
-    riskEvents: [],
-    strategies: [],
-    error: null,
+  const [status, lots, rungs, positions, orders, fills, riskEvents, strategies] =
+    await Promise.allSettled([
+      get<Status>('/status'),
+      get<Lot[]>('/lots'),
+      get<Rung[]>('/rungs'),
+      get<Position[]>('/positions'),
+      get<Order[]>('/orders'),
+      get<Fill[]>('/fills'),
+      get<RiskEvent[]>('/risk-events'),
+      get<StrategySummary[]>('/strategies'),
+    ]);
+
+  const settled = [status, lots, rungs, positions, orders, fills, riskEvents, strategies];
+  const allFailed = settled.every((result) => result.status === 'rejected');
+
+  return {
+    status: valueOr(status, null),
+    lots: valueOr(lots, []),
+    rungs: valueOr(rungs, []),
+    positions: valueOr(positions, []),
+    orders: valueOr(orders, []),
+    fills: valueOr(fills, []),
+    riskEvents: valueOr(riskEvents, []),
+    strategies: valueOr(strategies, []),
+    // Only when nothing at all answered. A single failed endpoint is reported
+    // by its own panel, not as "the backend is unreachable" — that banner
+    // would be wrong, and a wrong banner on a control surface is worse than a
+    // missing one.
+    error: allFailed ? failure(reasonOf(status)) : null,
+    // Which reads failed, so a panel can say "unavailable" rather than
+    // rendering an empty list that looks exactly like "nothing here".
+    unavailable: {
+      status: status.status === 'rejected',
+      lots: lots.status === 'rejected',
+      rungs: rungs.status === 'rejected',
+      positions: positions.status === 'rejected',
+      orders: orders.status === 'rejected',
+      fills: fills.status === 'rejected',
+      riskEvents: riskEvents.status === 'rejected',
+      strategies: strategies.status === 'rejected',
+    },
   };
+}
 
-  try {
-    const [status, lots, rungs, positions, orders, fills, riskEvents, strategies] =
-      await Promise.all([
-        get<Status>('/status'),
-        get<Lot[]>('/lots'),
-        get<Rung[]>('/rungs'),
-        get<Position[]>('/positions'),
-        get<Order[]>('/orders'),
-        get<Fill[]>('/fills'),
-        get<RiskEvent[]>('/risk-events'),
-        get<StrategySummary[]>('/strategies'),
-      ]);
+function valueOr<T>(result: PromiseSettledResult<T>, fallback: T): T {
+  return result.status === 'fulfilled' ? result.value : fallback;
+}
 
-    return { status, lots, rungs, positions, orders, fills, riskEvents, strategies, error: null };
-  } catch (error) {
-    return { ...empty, error: failure(error) };
-  }
+function reasonOf(result: PromiseSettledResult<unknown>): unknown {
+  return result.status === 'rejected' ? result.reason : null;
 }
 
 /**
@@ -487,6 +659,36 @@ export function totalDeployedCost(lots: Lot[]): number {
  */
 export function lastMarkPrice(fills: Fill[]): number | null {
   return fills.length > 0 ? fills[fills.length - 1].price : null;
+}
+
+/**
+ * The live bar price for one symbol, or null when there is none.
+ *
+ * Distinct from `lastMarkPrice`, which reports the last *fill* — a price that
+ * can be hours old and is absent entirely on a flat ladder. This is what the
+ * feed last delivered, which is what the ladder is evaluating against.
+ */
+export function livePrice(status: Status | null, symbol: string): LastPrice | null {
+  return status?.broker.lastPrices?.find((p) => p.symbol === symbol) ?? null;
+}
+
+/**
+ * A compact age for a live price, e.g. `12s` or `4m`.
+ *
+ * Rendered beside the price rather than suppressing a stale one: a blank tells
+ * an operator nothing, while a price labelled five minutes old tells them both
+ * the number and how far to trust it.
+ */
+export function priceAge(at: number, now: number = Date.now()): string {
+  const seconds = Math.max(0, Math.floor((now - at) / 1000));
+
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h`;
 }
 
 /** Lot age as a human string, relative to now. */

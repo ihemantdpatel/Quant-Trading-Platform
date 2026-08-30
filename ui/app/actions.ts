@@ -23,7 +23,7 @@
  */
 
 import { revalidatePath } from 'next/cache';
-import { post } from './lib/api';
+import { loadOrderDiagnosis, post, type OrderDiagnosis } from './lib/api';
 
 export interface ActionResult {
   ok: boolean;
@@ -136,7 +136,10 @@ export async function setStrategyEnabled(id: string, enabled: boolean): Promise<
  */
 export async function editParameters(
   strategyId: string,
-  parameters: Record<string, number | string>,
+  // `null` is a meaningful value, not an absent one: it clears an optional
+  // parameter back to its percentage-based fallback. Omitting a key means
+  // "leave unchanged", which is a different request.
+  parameters: Record<string, number | string | null>,
   reason?: string,
 ): Promise<ActionResult> {
   const result = await post<{ changes: unknown[] }>(
@@ -242,6 +245,155 @@ export async function reconcileNow(): Promise<ActionResult> {
     message:
       `Reconciled ${result.data?.symbols?.length ?? 0} symbol(s) against the broker — clean.` +
       orderNote,
+  };
+}
+
+/**
+ * Reads what rests at the broker against what the ladder believes rests there.
+ *
+ * **Read-only, and deliberately not `POST /reconcile`.** Asking reconciliation
+ * what is wrong changes the answer — it releases rungs, adopts orphans,
+ * restores state, and can halt a symbol. An operator deciding whether to
+ * intervene needs to see the divergence before anything acts on it.
+ *
+ * No `revalidatePath`: nothing changed, so there is nothing to re-read.
+ */
+export async function checkPendingOrders(): Promise<ActionResult & { diagnosis?: OrderDiagnosis }> {
+  try {
+    const diagnosis = await loadOrderDiagnosis();
+
+    if (!diagnosis.brokerReachable) {
+      // Reported as a failure rather than as an empty book. An operator reading
+      // "nothing is resting" during an outage would conclude the ladder is
+      // unprotected and act on it.
+      return {
+        ok: false,
+        message: `The broker could not be reached, so nothing could be checked.`,
+        failures: diagnosis.reason ? [diagnosis.reason] : undefined,
+        diagnosis,
+      };
+    }
+
+    const problems =
+      diagnosis.unbacked.length + diagnosis.orphans.length + diagnosis.duplicates.length;
+
+    return {
+      ok: true,
+      message:
+        problems === 0 && diagnosis.missing.length === 0
+          ? `${diagnosis.matched.length} resting order(s) — all accounted for.`
+          : `${diagnosis.matched.length} matched · ${diagnosis.missing.length} missing · ` +
+            `${diagnosis.duplicates.length} duplicate group(s) · ${diagnosis.unbacked.length} unbacked · ` +
+            `${diagnosis.orphans.length} orphan(s).`,
+      diagnosis,
+    };
+  } catch (error) {
+    const { message } = describe(error);
+    return { ok: false, message };
+  }
+}
+
+/**
+ * Places resting orders for the gaps the check identified.
+ *
+ * **The only control on this dashboard that creates an order.** It acts on
+ * diagnosed gaps only — a held lot with no resting sell, or a fireable rung
+ * with no resting buy — never on an empty book, because a ladder resting
+ * nothing is not by itself evidence of a fault. Every candidate still crosses
+ * the risk manager, so the capital caps, the loss breaker, and the kill switch
+ * all still apply, and an order that would be marketable against the last close
+ * is refused rather than sent to cross the spread.
+ */
+export async function placeMissingOrders(): Promise<ActionResult> {
+  const result = await post<{
+    placed: { candidate: { side: string; limitPrice: number }; quantity: number }[];
+    declined: { candidate: { side: string; limitPrice: number }; reason: string }[];
+  }>('/orders/place-missing', {});
+
+  revalidatePath('/', 'layout');
+
+  if (!result.ok) {
+    const { message, failures } = describe(result.error);
+    return { ok: false, message, failures };
+  }
+
+  const placed = result.data?.placed ?? [];
+  const declined = result.data?.declined ?? [];
+
+  // Declined candidates are surfaced, never swallowed: an operator who pressed
+  // this needs to know which gaps remain open.
+  const failures = declined.map(
+    (d) => `${d.candidate.side} @ ${d.candidate.limitPrice.toFixed(2)} — ${d.reason}`,
+  );
+
+  if (placed.length === 0) {
+    return {
+      ok: false,
+      message:
+        declined.length === 0
+          ? 'No missing orders were found, so nothing was placed.'
+          : `Nothing was placed — ${declined.length} candidate(s) refused.`,
+      failures: failures.length > 0 ? failures : undefined,
+    };
+  }
+
+  return {
+    ok: true,
+    message:
+      `Placed ${placed.length} order(s).` +
+      (declined.length > 0 ? ` ${declined.length} refused.` : ''),
+    failures: failures.length > 0 ? failures : undefined,
+  };
+}
+
+/**
+ * Cancels the redundant order in each unambiguous duplicate group.
+ *
+ * **The only control that destroys an order**, and it is deliberately narrow:
+ * only an *untracked* extra at a price where exactly one order is tied to a
+ * rung or lot is cancelled, so the ladder's own claim always survives. A group
+ * where no order is tracked, or several are, is reported for an operator to
+ * resolve in TWS rather than guessed at. A partially filled order is never
+ * eligible.
+ */
+export async function resolveDuplicateOrders(): Promise<ActionResult> {
+  const result = await post<{
+    cancelled: { clientOrderId: string; limitPrice: number; side: string }[];
+    skipped: { limitPrice: number; side: string; reason: string }[];
+    failed: { clientOrderId: string; reason: string }[];
+  }>('/orders/resolve-duplicates', {});
+
+  revalidatePath('/', 'layout');
+
+  if (!result.ok) {
+    const { message, failures } = describe(result.error);
+    return { ok: false, message, failures };
+  }
+
+  const cancelled = result.data?.cancelled ?? [];
+  const skipped = result.data?.skipped ?? [];
+  const failed = result.data?.failed ?? [];
+
+  const notes = [
+    ...skipped.map((s) => `@ ${s.limitPrice.toFixed(2)} left alone — ${s.reason}`),
+    ...failed.map((f) => `${f.clientOrderId} could not be cancelled — ${f.reason}`),
+  ];
+
+  if (cancelled.length === 0) {
+    return {
+      ok: skipped.length === 0 && failed.length === 0,
+      message:
+        skipped.length === 0 && failed.length === 0
+          ? 'No duplicate orders were found.'
+          : 'No order was cancelled.',
+      failures: notes.length > 0 ? notes : undefined,
+    };
+  }
+
+  return {
+    ok: failed.length === 0,
+    message: `Cancelled ${cancelled.length} duplicate order(s).`,
+    failures: notes.length > 0 ? notes : undefined,
   };
 }
 

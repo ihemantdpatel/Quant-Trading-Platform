@@ -405,6 +405,7 @@ function lotData(lot: Lot, symbol: string) {
     status: lot.status,
     closedAt: lot.closedAt,
     exitPrice: toDecimalOrNull(lot.exitPrice),
+    workingOrderId: lot.workingOrderId,
   };
 }
 
@@ -418,6 +419,7 @@ function toLot(row: {
   status: string;
   closedAt: string | null;
   exitPrice: Prisma.Decimal | null;
+  workingOrderId: string | null;
 }): Lot {
   return {
     id: row.id,
@@ -429,6 +431,7 @@ function toLot(row: {
     status: row.status as LotStatus,
     closedAt: row.closedAt,
     exitPrice: toNumberOrNull(row.exitPrice),
+    workingOrderId: row.workingOrderId,
   };
 }
 

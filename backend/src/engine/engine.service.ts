@@ -37,6 +37,7 @@ import {
   OrderStatus,
 } from '../broker/broker-adapter.interface';
 import { ExecutionMode } from '../config/execution-mode';
+import { Contract, equityContract } from '../domain/contract';
 import { ReplayService } from '../market-data/mock/replay.service';
 import { Bar } from '../market-data/types';
 import { AccountSnapshot, RiskManagerService } from '../risk/risk-manager.service';
@@ -47,9 +48,10 @@ import {
   DIP_LADDER_ID_PREFIX,
   DipLadderStrategy,
 } from '../strategies/dip-ladder/dip-ladder.strategy';
+import { isRestable, isRestableExit } from '../strategies/dip-ladder/ladder';
 import { Lot } from '../strategies/dip-ladder/lot';
 import { Rung } from '../strategies/dip-ladder/rung';
-import { OrderIntent, StrategyState } from '../strategies/types';
+import { OrderIntent, OrderType, StrategyState, TimeInForce } from '../strategies/types';
 import {
   FILL_REPOSITORY,
   FillRepository,
@@ -64,6 +66,36 @@ import {
   StrategyStateSnapshotRepository,
 } from '../repositories/repository.interfaces';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
+
+/**
+ * A gap an operator asked to be filled.
+ *
+ * Deliberately not the diagnosis type: this carries only what is needed to
+ * build an intent, so nothing about the *finding* (which rung was unbacked,
+ * which order was orphaned) can leak into a decision to trade. The placement
+ * path re-derives its own candidates and never trusts a caller's quantity for
+ * an entry — see `placeMissingOrders`.
+ */
+export interface MissingOrderCandidate {
+  strategyId: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  quantity: number;
+  limitPrice: number;
+  reason: string;
+  lotId: string | null;
+}
+
+export interface PlacementResult {
+  placed: {
+    candidate: MissingOrderCandidate;
+    /** What the risk manager approved, which may be less than requested. */
+    quantity: number;
+    resized: boolean;
+  }[];
+  /** Every candidate not placed, each with the reason it was refused. */
+  declined: { candidate: MissingOrderCandidate; reason: string }[];
+}
 
 export interface ReplayResult {
   fixture: string;
@@ -80,12 +112,44 @@ export interface ReplayResult {
   haltReason: string | null;
 }
 
-/** An alert an operator must see — surfaced on `GET /status` and the dashboard. */
+/**
+ * An alert an operator must see — surfaced on `GET /status` and the dashboard.
+ *
+ * ## Why `resolvedAt` exists
+ *
+ * Alerts divide into two kinds, and conflating them made a recovered engine
+ * look permanently broken. A rejection (`ORDER_REJECTED`) is a point-in-time
+ * event: it happened, it is over, and there is nothing left to recover from.
+ * An `ENTRY_HALT` reports an *ongoing condition* — and that condition ends,
+ * either because a bar proved the feed recovered or because an operator
+ * cleared it.
+ *
+ * Without a way to express "this ended", the halt alert outlived the halt.
+ * `entryHalt.halted` went back to `false` while the alert row stayed in the
+ * list forever, so the dashboard rendered three nights of long-since-recovered
+ * staleness halts as though the engine were still down. That also broke the
+ * standing rule that no fault may latch with no way out: the halt had an exit,
+ * its alert did not, and the only thing that emptied the list was
+ * `engine.reset()` — which discards ladder state and is not a way to dismiss a
+ * banner.
+ *
+ * `null` means still active. A timestamp means the condition ended at that
+ * point, and the row survives as history rather than as a live warning.
+ */
 export interface EngineAlert {
   severity: 'WARNING' | 'CRITICAL';
   code: string;
   detail: string;
   timestamp: string;
+  /**
+   * When the reported condition ended, or `null` while it still holds.
+   *
+   * Only alerts that *track* a condition are ever resolved. A point-in-time
+   * event is born with this `null` and keeps it: there is no moment at which a
+   * past rejection stops having happened, and stamping one "resolved" would
+   * claim a recovery nothing observed.
+   */
+  resolvedAt: string | null;
 }
 
 /**
@@ -114,12 +178,20 @@ export enum EntryHaltCode {
  * and nothing identifying which rung placed the order, so the link between the
  * two is kept here between placement and fill.
  */
-interface WorkingOrder {
+/**
+ * An order resting at the broker that this engine placed.
+ *
+ * `kind` discriminates the two directions, because a fill means opposite things
+ * for each: an ENTRY fill opens a lot at `rungPrice`, an EXIT fill closes the
+ * lot named by `lotId`. Without the discriminant a sell fill would be routed
+ * into `openLotFromFill` and *double* the position it was meant to reduce.
+ */
+type WorkingOrder = {
   strategyId: string;
   rungPrice: number;
   quantity: number;
   symbol: string;
-}
+} & ({ kind: 'ENTRY'; lotId?: undefined } | { kind: 'EXIT'; lotId: string });
 
 /**
  * What the broker says is already resting, resolved once per bar.
@@ -130,7 +202,30 @@ interface WorkingOrder {
  * The same distinction `getOpenOrders()` throwing carries in reconciliation.
  */
 type RestingOrderSnapshot =
-  { status: 'OK'; limitPrices: Set<number> } | { status: 'UNAVAILABLE'; reason: string };
+  | {
+      status: 'OK';
+      /** Prices of resting BUYs — the levels an entry must not duplicate. */
+      limitPrices: Set<number>;
+      /**
+       * Resting SELLs, as the broker reports them.
+       *
+       * Carried in full rather than as a set of ids because the exit guard
+       * matches on price *and* quantity: the in-memory `Lot.workingOrderId` is
+       * precisely the fact that can be stale when a duplicate arises, so it
+       * cannot be the thing the guard consults.
+       */
+      sells: { clientOrderId: string; limitPrice: number; quantity: number }[];
+    }
+  | { status: 'UNAVAILABLE'; reason: string };
+
+/**
+ * How many alerts are retained.
+ *
+ * Generous enough to cover a soak week's worth of overnight staleness halts,
+ * bounded so a daemon left running for months cannot grow this without limit.
+ * Only ever trims *resolved* alerts — see `raiseAlert`.
+ */
+const MAX_ALERT_HISTORY = 200;
 
 /**
  * Rounds to cents, so a price from the broker and one from the ladder compare
@@ -160,6 +255,14 @@ export class EngineService {
    * one reworded log line away from resuming trading against a dead broker.
    */
   private entryHalt: { reason: string; at: string; code: EntryHaltCode } | null = null;
+  /**
+   * Every alert raised this process, newest last — active and resolved alike.
+   *
+   * Bounded by `MAX_ALERT_HISTORY`. This is a long-lived daemon and an
+   * unbounded array that only `reset()` empties is a slow leak; resolved rows
+   * are evicted first so a trimmed history never drops an alert that is still
+   * reporting a live condition.
+   */
   private readonly alerts: EngineAlert[] = [];
   /**
    * High-water mark behind `co-N` client order ids.
@@ -178,6 +281,28 @@ export class EngineService {
    */
   private clientOrderSequence = 0;
   private lastBarTimestamp: string | null = null;
+
+  /**
+   * Distinguishes operator-placed intent records from bar-placed ones.
+   *
+   * Separate from `clientOrderSequence` because these records are created
+   * outside a bar and their ids must not collide with `intent-<barTs>-<i>`,
+   * which is unique only within one bar.
+   */
+  private operatorIntentSequence = 0;
+
+  /**
+   * Close of the most recent bar, or null before any has arrived.
+   *
+   * Held for the operator placement path (`placeMissingOrders`), which has no
+   * bar of its own and still must honour `isRestable`/`isRestableExit` — a
+   * limit placed on the wrong side of the market is marketable, and a
+   * marketable order into a 3x ETF book is a fill price the ladder must then
+   * hold with no stop underneath it. A null close means *no* placement is
+   * allowed rather than an unguarded one: with no reference price there is
+   * nothing to prove the order would rest.
+   */
+  private lastBarClose: number | null = null;
 
   /**
    * Orders currently resting at the broker, keyed by `clientOrderId`.
@@ -299,6 +424,7 @@ export class EngineService {
    */
   async processBar(bar: Bar): Promise<Omit<ReplayResult, 'fixture' | 'barsProcessed'>> {
     this.lastBarTimestamp = bar.timestamp;
+    this.lastBarClose = bar.close;
 
     // Before the outcome is snapshotted below, so the bar that proves the feed
     // recovered is itself allowed to trade. Deferring to the *next* bar would
@@ -334,6 +460,19 @@ export class EngineService {
     if (this.symbolHalts.isHalted(bar.symbol)) {
       return outcome;
     }
+
+    // **Resting orders settle before the strategy sees the bar.**
+    //
+    // An order placed on an earlier bar is filled by the exchange the moment
+    // price reaches it, so by the time the ladder evaluates this bar those
+    // fills have already happened. Advancing afterwards would let the strategy
+    // decide against a position it does not yet know it holds — and would let a
+    // lot be re-selected for an exit whose order had in fact already filled.
+    //
+    // Only the mock needs telling; a real broker has its own market. The check
+    // is structural rather than a mode flag: an adapter that models a market is
+    // the one that exposes a way to move it.
+    this.advanceSimulatedMarket(bar.close, bar.timestamp);
 
     const intents = this.coordinator.dispatchBar(bar);
     outcome.intentsGenerated = intents.length;
@@ -421,6 +560,37 @@ export class EngineService {
         }
       }
 
+      // **The same duplicate guard, for exits.**
+      //
+      // `Lot.workingOrderId` is the in-memory answer to "is this lot already
+      // covered", and `selectRestingExits` filters on it — but it can disagree
+      // with IB in exactly the ways the entry guard exists for: a crash between
+      // placement and persistence, an order adopted by reconciliation, a fill
+      // router that has not yet run. A second sell against a lot that already
+      // has one resting is the failure that costs real money here, because both
+      // can fill and the position is sold twice.
+      if (this.isRestingExit(intent)) {
+        const resting = await this.restingOrdersThisBar(restingSnapshot);
+        restingSnapshot = resting;
+
+        if (resting.status === 'UNAVAILABLE') {
+          this.logger.warn(
+            `skipping exit for lot ${String(intent.metadata?.lotId)} — cannot read open orders: ` +
+              resting.reason,
+          );
+          continue;
+        }
+
+        const covered = this.restingSellIdFor(intent, decision.approvedQuantity, resting.sells);
+
+        if (covered) {
+          this.logger.debug(
+            `skipping exit for lot ${String(intent.metadata?.lotId)} — order ${covered} already rests`,
+          );
+          continue;
+        }
+      }
+
       const submission = await this.submitOrder(intent, decision.approvedQuantity, recordId);
       outcome.submitted += submission.submitted ? 1 : 0;
       outcome.fills += submission.fills;
@@ -431,6 +601,19 @@ export class EngineService {
       if (submission.submitted && restingSnapshot?.status === 'OK') {
         restingSnapshot.limitPrices.add(roundPrice(intent.limitPrice));
       }
+    }
+
+    // **Persist after submission, because a working-order id is durable state.**
+    //
+    // `Lot.workingOrderId` and `Rung.workingOrderId` are written by the submit
+    // path, and nothing else on this bar writes them: fills and order statuses
+    // persist, but a bar that merely *places* orders did not. A crash in that
+    // window left the database holding a lot with no working order while a live
+    // sell rested at IB — so on restart the lot looked unprotected, a second
+    // sell was placed against it, and both could fill. That is the crash window
+    // Story 13 closed for entries, and it was reopened on the exit side.
+    if (outcome.submitted > 0) {
+      await this.persistLadderState();
     }
 
     outcome.halted = this.entryHalt !== null;
@@ -483,10 +666,32 @@ export class EngineService {
     // between the broker's ack and this bookkeeping still finds its rung. The
     // router ignores ids it does not know, and an order that fails to submit is
     // unregistered below, so registering early cannot leave a phantom.
-    const resting = this.isRestingEntry(intent);
+    const resting = this.isRestingOrder(intent);
+    const exitLotId = intent.metadata?.lotId as string | undefined;
 
-    if (resting) {
+    if (resting && intent.side === 'SELL' && exitLotId) {
       this.workingOrders.set(clientOrderId, {
+        kind: 'EXIT',
+        lotId: exitLotId,
+        strategyId: intent.strategyId,
+        rungPrice: intent.metadata?.rungPrice as number,
+        quantity,
+        symbol: intent.contract.symbol,
+      });
+
+      // Marked before `submit()` for the same reason a rung is: a marketable
+      // sell can fill *during* the call, and marking afterwards would let the
+      // fill land first, close the lot, and then be overwritten by a working-id
+      // for an order that had already completed. Rejection and submission
+      // failure both undo it below.
+      const state = this.coordinator.getState(intent.strategyId);
+
+      if (state) {
+        DipLadderStrategy.recordWorkingExit(state, exitLotId, clientOrderId);
+      }
+    } else if (resting && intent.side === 'BUY') {
+      this.workingOrders.set(clientOrderId, {
+        kind: 'ENTRY',
         strategyId: intent.strategyId,
         rungPrice: intent.limitPrice,
         quantity,
@@ -644,6 +849,15 @@ export class EngineService {
         limitPrices: new Set(
           open.filter((order) => order.side === 'BUY').map((order) => roundPrice(order.limitPrice)),
         ),
+        sells: open
+          .filter((order) => order.side === 'SELL')
+          .map((order) => ({
+            clientOrderId: order.clientOrderId,
+            limitPrice: order.limitPrice,
+            // The *outstanding* quantity: a partially filled sell still resting
+            // covers only what is left of it.
+            quantity: order.quantity - order.filledQuantity,
+          })),
       };
     } catch (error) {
       return {
@@ -662,14 +876,42 @@ export class EngineService {
    * at the broker and the ladder would never open a lot for them.
    */
   adoptWorkingOrders(strategyId: string, symbol: string, orders: OpenOrder[]): void {
+    const state = this.coordinator.getState(strategyId);
+    const lots = state ? (DipLadderStrategy.lotsOf(state) ?? []) : [];
+
     for (const order of orders) {
+      // The *outstanding* quantity, not the original: a partially-filled order
+      // that survives a restart has only its remainder still working, and the
+      // partial-fill rule must compare against what can still fill.
+      const quantity = order.quantity - order.filledQuantity;
+
+      if (order.side === 'SELL') {
+        // A resting sell is keyed to the lot it disposes, not to a price level,
+        // and `Lot.workingOrderId` is the durable record of that pairing. An
+        // order no lot claims is left unadopted rather than guessed at: it is
+        // not something this ladder placed as an exit, and attaching it to a
+        // lot chosen by price would sell shares against the wrong basis.
+        const lot = lots.find((candidate) => candidate.workingOrderId === order.clientOrderId);
+
+        if (lot) {
+          this.workingOrders.set(order.clientOrderId, {
+            kind: 'EXIT',
+            lotId: lot.id,
+            strategyId,
+            rungPrice: lot.rungPrice,
+            quantity,
+            symbol,
+          });
+        }
+
+        continue;
+      }
+
       this.workingOrders.set(order.clientOrderId, {
+        kind: 'ENTRY',
         strategyId,
         rungPrice: order.limitPrice,
-        // The *outstanding* quantity, not the original: a partially-filled
-        // order that survives a restart has only its remainder still working,
-        // and the partial-fill rule must compare against what can still fill.
-        quantity: order.quantity - order.filledQuantity,
+        quantity,
         symbol,
       });
     }
@@ -722,6 +964,7 @@ export class EngineService {
     }
 
     const recovered: WorkingOrder = {
+      kind: 'ENTRY',
       strategyId: order.strategyId,
       rungPrice: rung.price,
       quantity: order.quantity,
@@ -764,17 +1007,68 @@ export class EngineService {
   }
 
   /**
-   * True when this intent is a ladder entry that should rest at the broker.
+   * True when this intent should rest at the broker rather than be correlated
+   * inside the submit call.
    *
-   * Buys only: an exit is a sell against a lot the ladder already holds, and
-   * the rung bookkeeping here has nothing to say about it.
+   * Both sides now, which is the Story 14a change. Entries were moved to
+   * resting orders in Story 13 and exits were left behind — so a sell was
+   * submitted with no working-order registration, no persistent fill routing,
+   * and a lot closed optimistically before the broker confirmed anything.
+   */
+  private isRestingOrder(intent: OrderIntent): boolean {
+    return this.ladderConfigFor(intent.strategyId)?.orderPlacement === OrderPlacement.RESTING;
+  }
+
+  /**
+   * True when this intent is a ladder *entry* resting at the broker.
+   *
+   * Narrower than `isRestingOrder` and kept separate because the rung
+   * bookkeeping — the duplicate-price guard, the `WORKING` mark — is meaningful
+   * only for entries. Two sells at one price would be a duplicate; a sell and a
+   * buy at the same price are not, and an exit is keyed to its lot rather than
+   * to a level.
    */
   private isRestingEntry(intent: OrderIntent): boolean {
-    if (intent.side !== 'BUY') {
-      return false;
-    }
+    return intent.side === 'BUY' && this.isRestingOrder(intent);
+  }
 
-    return this.ladderConfigFor(intent.strategyId)?.orderPlacement === OrderPlacement.RESTING;
+  /** True when this intent is a ladder *exit* resting at the broker. */
+  private isRestingExit(intent: OrderIntent): boolean {
+    return intent.side === 'SELL' && this.isRestingOrder(intent);
+  }
+
+  /**
+   * The resting sell already covering the shares this exit would sell, if any.
+   *
+   * **Deliberately does not consult `Lot.workingOrderId`.** That field is the
+   * in-memory answer, and `selectRestingExits` has already filtered on it — so
+   * a duplicate can only arise when it is *wrong*: state restored from a
+   * database written before the mark was persisted, an order adopted by
+   * reconciliation, a fill router that has not yet run. A guard that re-read
+   * the same stale field would agree with it and pass the duplicate through,
+   * which is exactly what it did before this comment was written.
+   *
+   * The broker is the authority, and the matchable fact is **price and
+   * quantity**: a resting sell for the same quantity at the same limit is
+   * either this lot's own order or an indistinguishable duplicate of it, and
+   * placing a second one is unsafe in both readings. This is coarser than the
+   * entry guard's price match — two lots at one rung across cycles can share a
+   * target — and the cost of the collision is a declined exit that the next bar
+   * retries once the first order clears. Selling a position twice is not
+   * recoverable in the same way.
+   */
+  private restingSellIdFor(
+    intent: OrderIntent,
+    quantity: number,
+    sells: { clientOrderId: string; limitPrice: number; quantity: number }[],
+  ): string | null {
+    const target = roundPrice(intent.limitPrice);
+
+    const match = sells.find(
+      (order) => roundPrice(order.limitPrice) === target && order.quantity === quantity,
+    );
+
+    return match?.clientOrderId ?? null;
   }
 
   /**
@@ -826,11 +1120,16 @@ export class EngineService {
 
     const partial = fill.quantity < working.quantity;
 
-    // Cancel before opening the lot: if the cancel throws, the entry halt it
+    // Cancel before touching the lot: if the cancel throws, the entry halt it
     // raises should happen while the ladder still reflects a working order,
     // not after it has been marked filled.
     if (partial) {
       await this.cancelRemainder(fill.clientOrderId, working, fill.quantity);
+    }
+
+    if (working.kind === 'EXIT') {
+      await this.routeExitFill(fill, working, partial);
+      return;
     }
 
     const config = this.ladderConfigFor(working.strategyId);
@@ -857,6 +1156,94 @@ export class EngineService {
       `rung ${working.rungPrice.toFixed(2)} filled ${fill.quantity}${
         partial ? ` of ${working.quantity} (remainder cancelled)` : ''
       } @ ${fill.price.toFixed(2)} — lot ${lot.id} exits at ${lot.exitTarget.toFixed(2)}`,
+    );
+
+    await this.persistLadderState();
+  }
+
+  /**
+   * Moves the simulated market, if the bound broker has one.
+   *
+   * `MockBrokerAdapter` in `MARKET_AWARE` mode has no feed of its own and fills
+   * a resting order only when told price reached it. A real adapter has a real
+   * market and exposes no such method, so the capability check is what keeps
+   * this a no-op against IB rather than a mode flag that could disagree with
+   * the adapter actually bound.
+   */
+  private advanceSimulatedMarket(price: number, at: string): void {
+    const broker = this.broker as Partial<{
+      advanceMarket: (price: number, at: string) => unknown;
+    }>;
+
+    if (typeof broker.advanceMarket === 'function') {
+      broker.advanceMarket(price, at);
+    }
+  }
+
+  /**
+   * Routes a fill on a resting **SELL** back into ladder state.
+   *
+   * The counterpart to `openLotFromFill`, and the reason Story 14a exists: the
+   * lot closes **at the broker's fill price** and its rung re-arms **only now**,
+   * when the shares have genuinely been sold. The pre-14a path closed the lot
+   * and re-armed the rung when the *intent* was created, so a rejected or
+   * expired sell left the ladder believing it was flat at a level it still
+   * held — and re-armed that level for a fresh entry against exposure it had
+   * never released.
+   *
+   * A partial fill splits the lot rather than shrinking it; `splitLot` carries
+   * the reasoning. The rung deliberately does not re-arm in that case, since it
+   * still holds the remainder.
+   */
+  private async routeExitFill(
+    fill: Fill,
+    working: WorkingOrder & { kind: 'EXIT' },
+    partial: boolean,
+  ): Promise<void> {
+    const state = this.coordinator.getState(working.strategyId);
+
+    if (!state) {
+      return;
+    }
+
+    const result = DipLadderStrategy.closeLotFromFill(state, {
+      lotId: working.lotId,
+      price: fill.price,
+      quantity: fill.quantity,
+      at: fill.timestamp,
+    });
+
+    this.workingOrders.delete(fill.clientOrderId);
+
+    await this.orders.updateStatus(
+      fill.clientOrderId,
+      partial ? OrderStatus.PARTIALLY_FILLED : OrderStatus.FILLED,
+    );
+
+    if (!result) {
+      // The lot named by this order is gone or already closed — another path
+      // resolved it first. The fill is recorded and the order marked, but there
+      // is nothing left to close. Reported rather than silently dropped: the
+      // shares moved at the broker, so a divergence here is exactly what
+      // reconciliation must be able to see the cause of.
+      this.raiseAlert(
+        'WARNING',
+        'EXIT_FILL_UNATTRIBUTED',
+        `fill ${fill.fillId} closed no lot — ${working.lotId} is missing or already closed`,
+        fill.timestamp,
+      );
+
+      await this.persistLadderState();
+      return;
+    }
+
+    this.logger.log(
+      `lot ${result.closed.id} at rung ${working.rungPrice.toFixed(2)} sold ` +
+        `${fill.quantity}${partial ? ` of ${working.quantity} (remainder cancelled)` : ''} ` +
+        `@ ${fill.price.toFixed(2)}` +
+        (result.remainder
+          ? ` — ${result.remainder.quantity} still held as ${result.remainder.id}`
+          : ''),
     );
 
     await this.persistLadderState();
@@ -1033,6 +1420,217 @@ export class EngineService {
     return { deployed, pnl: { realized: 0, unrealized: 0 } };
   }
 
+  /**
+   * Places orders for gaps an operator has reviewed, on demand.
+   *
+   * ## This is a new way into the broker, and it is deliberately narrow
+   *
+   * Every other order this system places originates from a bar. This one
+   * originates from a click, which removes the two things a bar supplies: a
+   * strategy decision, and a current price. Both are replaced rather than
+   * skipped.
+   *
+   * - **The decision** is replaced by a diagnosis the caller already ran and
+   *   the operator already read. Candidates are re-derived here rather than
+   *   trusted from the request, so a stale preview cannot place an order the
+   *   ladder no longer wants — the diagnosis is re-run inside this call and
+   *   only its *current* findings are acted on.
+   * - **The price** is replaced by `lastBarClose`. With no bar to reference,
+   *   `isRestable`/`isRestableExit` cannot be evaluated, and an order that
+   *   cannot be proven non-marketable is not placed. A null close refuses
+   *   everything.
+   *
+   * ## What it does not bypass
+   *
+   * Nothing. Each candidate becomes an `OrderIntent` and crosses
+   * `RiskManagerService.evaluate()` exactly as a bar-generated intent does, so
+   * the capital caps, the loss breaker, and the kill switch all still apply —
+   * `evaluateBatch` is used so several candidates are measured against one
+   * running capital total rather than each against the starting figure. The
+   * entry halt still blocks BUYs. A rejected or resized candidate is reported,
+   * not forced.
+   *
+   * The exit side deliberately remains permitted under an entry halt, matching
+   * `processBar`: halting a sell would trap a position the ladder has already
+   * decided to close.
+   */
+  async placeMissingOrders(candidates: MissingOrderCandidate[]): Promise<PlacementResult> {
+    const result: PlacementResult = { placed: [], declined: [] };
+
+    if (candidates.length === 0) {
+      return result;
+    }
+
+    // No reference price means no way to prove an order would rest rather than
+    // cross the spread. Refusing everything is the safe direction: the cost is
+    // a placement the operator retries after the next bar.
+    if (this.lastBarClose === null) {
+      for (const candidate of candidates) {
+        result.declined.push({
+          candidate,
+          reason:
+            'no bar has been seen yet, so no reference price exists to prove the order would rest',
+        });
+      }
+
+      return result;
+    }
+
+    const close = this.lastBarClose;
+    const timestamp = this.lastBarTimestamp ?? new Date().toISOString();
+
+    if (!this.riskManager.canSubmit()) {
+      for (const candidate of candidates) {
+        result.declined.push({
+          candidate,
+          reason: 'submission is blocked — kill switch, breaker halt, or a non-submitting mode',
+        });
+      }
+
+      return result;
+    }
+
+    const eligible: { candidate: MissingOrderCandidate; intent: OrderIntent }[] = [];
+
+    for (const candidate of candidates) {
+      if (candidate.side === 'BUY' && this.entryHalt) {
+        result.declined.push({
+          candidate,
+          reason: `new entries are halted — ${this.entryHalt.reason}`,
+        });
+        continue;
+      }
+
+      // The rest guard, and the reason this method needs a price at all. A BUY
+      // must sit at or below the market and a SELL at or above it; anything
+      // else is marketable on arrival.
+      const rests =
+        candidate.side === 'BUY'
+          ? isRestable(candidate.limitPrice, close)
+          : isRestableExit(candidate.limitPrice, close);
+
+      if (!rests) {
+        result.declined.push({
+          candidate,
+          reason:
+            `a ${candidate.side} limit at ${candidate.limitPrice.toFixed(2)} would be marketable ` +
+            `against the last close of ${close.toFixed(2)} — refusing to cross the spread`,
+        });
+        continue;
+      }
+
+      const contract = this.contractFor(candidate.strategyId, candidate.symbol);
+
+      if (!contract) {
+        result.declined.push({
+          candidate,
+          reason: `no contract is registered for ${candidate.symbol}`,
+        });
+        continue;
+      }
+
+      eligible.push({
+        candidate,
+        intent: {
+          strategyId: candidate.strategyId,
+          contract,
+          side: candidate.side,
+          quantity: candidate.quantity,
+          orderType: OrderType.LIMIT,
+          limitPrice: candidate.limitPrice,
+          timeInForce: TimeInForce.DAY,
+          timestamp,
+          reason: `operator placement — ${candidate.reason}`,
+          ...(candidate.lotId ? { metadata: { lotId: candidate.lotId } } : {}),
+        },
+      });
+    }
+
+    if (eligible.length === 0) {
+      return result;
+    }
+
+    const account = await this.accountSnapshot();
+    const decisions = this.riskManager.evaluateBatch(
+      eligible.map((e) => toRiskIntent(e.intent)),
+      account,
+    );
+
+    for (let i = 0; i < eligible.length; i += 1) {
+      const { candidate, intent } = eligible[i];
+      const decision = decisions[i];
+
+      if (decision.approvedQuantity <= 0) {
+        result.declined.push({
+          candidate,
+          reason: `risk manager ${decision.outcome} — ${decision.reason}`,
+        });
+        continue;
+      }
+
+      // Persisted before submission, exactly as the bar path does — the intent
+      // record is what makes an order traceable to the decision behind it.
+      this.operatorIntentSequence += 1;
+      const recordId = `operator-intent-${timestamp}-${this.operatorIntentSequence}`;
+
+      await this.intents.save({
+        id: recordId,
+        intent,
+        decision,
+        submitted: false,
+        clientOrderId: null,
+        createdAt: timestamp,
+      });
+
+      try {
+        const submission = await this.submitOrder(intent, decision.approvedQuantity, recordId);
+
+        if (submission.submitted) {
+          result.placed.push({
+            candidate,
+            quantity: decision.approvedQuantity,
+            resized: decision.approvedQuantity !== candidate.quantity,
+          });
+        } else {
+          result.declined.push({ candidate, reason: 'the broker did not accept the order' });
+        }
+      } catch (error) {
+        result.declined.push({
+          candidate,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // The submit path writes `Lot.workingOrderId` and `Rung.workingOrderId`,
+    // and nothing else here does. Without persisting, a crash before the next
+    // bar would leave a live order at IB with no durable record of it — the
+    // same crash window `processBar` closes after its own submissions.
+    if (result.placed.length > 0) {
+      await this.persistLadderState();
+    }
+
+    return result;
+  }
+
+  /**
+   * The contract a registered ladder trades.
+   *
+   * Read from the strategy's own registration rather than constructed here, so
+   * an operator placement uses the identical contract the bar path would — a
+   * hand-built contract that differed in exchange or currency would be a
+   * different instrument wearing the same symbol.
+   */
+  private contractFor(strategyId: string, symbol: string): Contract | null {
+    const config = this.ladderConfigFor(strategyId);
+
+    // `equityContract` is the same helper the strategy itself uses to build an
+    // intent's contract, so an operator placement and a bar placement describe
+    // the identical instrument. Constructing one by hand here would risk a
+    // different exchange or currency wearing the same symbol.
+    return config && config.symbol === symbol ? equityContract(symbol) : null;
+  }
+
   private haltEntries(reason: string, code: EntryHaltCode, at?: string): void {
     if (this.entryHalt) {
       return;
@@ -1053,7 +1651,51 @@ export class EngineService {
     detail: string,
     timestamp: string,
   ): void {
-    this.alerts.push({ severity, code, detail, timestamp });
+    this.alerts.push({ severity, code, detail, timestamp, resolvedAt: null });
+    this.trimAlerts();
+  }
+
+  /**
+   * Evicts the oldest **resolved** alerts once the history exceeds its cap.
+   *
+   * Resolved-only on purpose: an active alert reports a condition that still
+   * holds, and dropping one to make room would hide a live fault behind a
+   * retention policy. If every retained alert is active the list is allowed to
+   * exceed the cap — 200 simultaneously unresolved faults is itself the thing
+   * an operator needs to see, not something to quietly truncate.
+   */
+  private trimAlerts(): void {
+    let excess = this.alerts.length - MAX_ALERT_HISTORY;
+
+    for (let i = 0; excess > 0 && i < this.alerts.length;) {
+      if (this.alerts[i].resolvedAt === null) {
+        i += 1;
+        continue;
+      }
+
+      this.alerts.splice(i, 1);
+      excess -= 1;
+    }
+  }
+
+  /**
+   * Marks every unresolved alert with `code` as ended.
+   *
+   * Called where a *condition* stops holding, never where an event merely
+   * finishes being handled. The timestamp is the moment the condition ended,
+   * supplied by the caller so it reads in the same clock as the alert it
+   * resolves — a bar's timestamp when a bar is the evidence, rather than
+   * wall-clock time that would sit oddly next to a replayed session.
+   *
+   * Idempotent: an already-resolved alert keeps its original `resolvedAt`, so
+   * repeated clears cannot walk a resolution time forward.
+   */
+  private resolveAlerts(code: string, at: string): void {
+    for (const alert of this.alerts) {
+      if (alert.code === code && alert.resolvedAt === null) {
+        alert.resolvedAt = at;
+      }
+    }
   }
 
   /**
@@ -1097,6 +1739,11 @@ export class EngineService {
     const previous = this.entryHalt;
     this.entryHalt = null;
 
+    // The alert reported the halt, so it ends when the halt does. The bar's
+    // own timestamp is the resolution time: it is the evidence, and it reads in
+    // the same clock as the `at` the alert was raised with.
+    this.resolveAlerts('ENTRY_HALT', this.lastBarTimestamp ?? previous.at);
+
     this.logger.log(
       `market data resumed — entry halt raised at ${previous.at} cleared automatically. ` +
         'Only a staleness halt clears this way; every other fault waits for an operator.',
@@ -1105,7 +1752,16 @@ export class EngineService {
 
   /** Operator action: clears a technical halt. Never happens on a timer. */
   clearHalt(): void {
+    const previous = this.entryHalt;
     this.entryHalt = null;
+
+    // Resolved even when nothing was halted: an operator clearing a halt is
+    // saying the condition is over, and leaving a stale ENTRY_HALT banner up
+    // after they acted is the exact failure this whole change fixes.
+    this.resolveAlerts(
+      'ENTRY_HALT',
+      this.lastBarTimestamp ?? previous?.at ?? new Date().toISOString(),
+    );
   }
 
   isHalted(): boolean {
@@ -1116,7 +1772,27 @@ export class EngineService {
     return this.entryHalt?.reason ?? null;
   }
 
+  /**
+   * Alerts whose condition still holds.
+   *
+   * This is what `GET /status` reports and what the dashboard banners, so it
+   * must mean what its name says. It previously returned the entire history,
+   * which is why a recovered engine kept rendering halts it had already
+   * cleared. Use `alertHistory()` for the full record.
+   */
   activeAlerts(): EngineAlert[] {
+    return this.alerts.filter((alert) => alert.resolvedAt === null);
+  }
+
+  /**
+   * Every alert raised this process, resolved ones included.
+   *
+   * Kept separate from `activeAlerts()` so the soak retains its evidence —
+   * "the feed went stale at 19:55 and recovered at 09:35" is exactly the record
+   * a soak day is signed off against, and filtering it out of existence to fix
+   * the banner would have destroyed that.
+   */
+  alertHistory(): EngineAlert[] {
     return [...this.alerts];
   }
 
@@ -1134,18 +1810,38 @@ export class EngineService {
    * the ladder too.
    */
   ladderLots(): Lot[] {
-    return this.ladderStates().flatMap((state) => DipLadderStrategy.lotsOf(state) ?? []);
+    return this.ladderStates().flatMap(({ state }) => DipLadderStrategy.lotsOf(state) ?? []);
   }
 
   ladderRungs(): Rung[] {
-    return this.ladderStates().flatMap((state) => DipLadderStrategy.rungsOf(state) ?? []);
+    return this.ladderStates().flatMap(({ state }) => DipLadderStrategy.rungsOf(state) ?? []);
   }
 
-  private ladderStates(): StrategyState[] {
+  /**
+   * Ladder rungs paired with the symbol whose ladder they belong to.
+   *
+   * A `Rung` carries only a price — the symbol lives on the strategy
+   * registration, not the rung — so a caller that must treat one symbol
+   * differently from another (the API, which serves a halted symbol from the
+   * database instead) cannot derive it from the rungs alone.
+   *
+   * Lots need no equivalent: a lot id is `${symbol}-lot-N`, so the symbol is
+   * recoverable from the record itself.
+   */
+  ladderRungsBySymbol(): { symbol: string; rungs: Rung[] }[] {
+    return this.ladderStates().map(({ symbols, state }) => ({
+      // One ladder instance trades one symbol — the id carries it, and
+      // `strategies.module.ts` registers one instance per symbol.
+      symbol: symbols[0] ?? '',
+      rungs: DipLadderStrategy.rungsOf(state) ?? [],
+    }));
+  }
+
+  private ladderStates(): { symbols: string[]; state: StrategyState }[] {
     return this.coordinator
       .snapshots()
       .filter((snapshot) => snapshot.id.startsWith(DIP_LADDER_ID_PREFIX) && snapshot.state)
-      .map((snapshot) => snapshot.state!);
+      .map((snapshot) => ({ symbols: [...snapshot.symbols], state: snapshot.state! }));
   }
 
   /** True when a reconciliation mismatch has halted this symbol (Story 9). */

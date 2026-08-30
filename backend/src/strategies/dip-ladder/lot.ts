@@ -44,6 +44,16 @@ export interface Lot {
   closedAt: string | null;
   /** Actual exit price. Null while held. */
   exitPrice: number | null;
+  /**
+   * The resting SELL placed against this lot, or null when none is working.
+   *
+   * The durable counterpart to `Rung.workingOrderId`, and load-bearing for the
+   * same reason: it is what stops `selectExit` choosing this lot again on the
+   * next bar and stacking a second sell against shares one order already
+   * covers. The engine's in-memory `workingOrders` map is a cache of the same
+   * fact and is rebuilt from here during reconciliation.
+   */
+  workingOrderId: string | null;
 }
 
 /**
@@ -54,7 +64,18 @@ export interface Lot {
  * upper rungs cycle repeatedly while lower rungs keep holding, which an
  * average-cost exit would forfeit by closing everything at once.
  */
-export function exitTargetFor(fillPrice: number, takeProfitPercent: number): number {
+export function exitTargetFor(
+  fillPrice: number,
+  takeProfitPercent: number,
+  takeProfitDollars: number | null = null,
+): number {
+  // An absolute target supersedes the percentage when set. It is a third
+  // parameter defaulting to null rather than a replacement, so every existing
+  // caller keeps the percentage rule its expected values were computed under.
+  if (takeProfitDollars !== null) {
+    return roundToCents(fillPrice + takeProfitDollars);
+  }
+
   return roundToCents(fillPrice * (1 + takeProfitPercent));
 }
 
@@ -70,6 +91,8 @@ export interface OpenLotParams {
   quantity: number;
   openedAt: string;
   takeProfitPercent: number;
+  /** Absolute take-profit; supersedes the percentage when set. */
+  takeProfitDollars?: number | null;
 }
 
 /** Creates a held lot with its exit target frozen at the current parameters. */
@@ -80,10 +103,15 @@ export function openLot(params: OpenLotParams): Lot {
     fillPrice: params.fillPrice,
     quantity: params.quantity,
     openedAt: params.openedAt,
-    exitTarget: exitTargetFor(params.fillPrice, params.takeProfitPercent),
+    exitTarget: exitTargetFor(
+      params.fillPrice,
+      params.takeProfitPercent,
+      params.takeProfitDollars ?? null,
+    ),
     status: LotStatus.HELD,
     closedAt: null,
     exitPrice: null,
+    workingOrderId: null,
   };
 }
 
@@ -95,7 +123,54 @@ export function openLot(params: OpenLotParams): Lot {
  * straightforward write of the returned value.
  */
 export function closeLot(lot: Lot, exitPrice: number, closedAt: string): Lot {
-  return { ...lot, status: LotStatus.CLOSED, exitPrice, closedAt };
+  // The working order is cleared, not preserved: a closed lot has no resting
+  // sell, and leaving the id set would make reconciliation try to adopt an
+  // order for a lot that no longer holds anything.
+  return { ...lot, status: LotStatus.CLOSED, exitPrice, closedAt, workingOrderId: null };
+}
+
+/**
+ * Splits a partially-sold lot into the portion that filled and the portion
+ * still held.
+ *
+ * A resting sell that fills 40 of 100 leaves a lot this type cannot otherwise
+ * describe — partly realized, partly held. Shrinking the lot in place was
+ * rejected: it changes a lot's composition after open, which `PRD.md:386`
+ * forbids for the frozen target, and `realizedPnl` multiplies by a lot's whole
+ * quantity so there is nowhere to record profit already taken.
+ *
+ * Splitting produces two *structurally ordinary* lots instead, so every
+ * downstream consumer sees something it already understands. The invariant that
+ * matters is preserved exactly: `sold.quantity + remainder.quantity ==
+ * lot.quantity`, so held quantities still sum to the broker's net position and
+ * the lot-sum assertion (`PRD.md:343`) is unaffected.
+ *
+ * **The remainder keeps the original `openedAt`.** It holds its place in the
+ * FIFO queue rather than jumping to the back — `fifoQueueAtRung` breaks ties by
+ * `id`, so a fresh id is safe where a fresh timestamp would silently reorder
+ * disposals. It also keeps `fillPrice` and `exitTarget`: the shares are the same
+ * shares, bought at the same price, and their target was frozen at open.
+ *
+ * The remainder carries **no working order** — its order filled partially and
+ * the rest is cancelled by the caller — so it becomes eligible for a fresh
+ * resting sell on the next bar without any further bookkeeping.
+ */
+export function splitLot(
+  lot: Lot,
+  filledQuantity: number,
+  exitPrice: number,
+  closedAt: string,
+  remainderId: string,
+): { sold: Lot; remainder: Lot } {
+  return {
+    sold: closeLot({ ...lot, quantity: filledQuantity }, exitPrice, closedAt),
+    remainder: {
+      ...lot,
+      id: remainderId,
+      quantity: lot.quantity - filledQuantity,
+      workingOrderId: null,
+    },
+  };
 }
 
 export function isHeld(lot: Lot): boolean {

@@ -386,6 +386,15 @@ export class DailyReportService {
    * progression off the lowest held lot whenever anything is held, bootstrap
    * otherwise.
    *
+   * **`this.ladderConfig` is passed so gap re-basing resolves identically here.**
+   * The bootstrap anchor re-bases onto the session open past `gapRebasePercent`,
+   * and a recomputation that omitted the config would anchor every gap-down
+   * session on the previous close while the engine used the open — reporting a
+   * full session of false `RUNG_VERIFICATION_UNEXPLAINED`. This stays a
+   * recomputation rather than a readback: the config supplies the *rule*,
+   * exactly as spacing already does, while the ladder's own rung list is still
+   * never consulted.
+   *
    * **The anchor is recomputed at every intent, not once for the session.** It
    * is a function of what is held *at that moment*, and the ladder re-evaluates
    * it on every bar — so a session that opens flat and fills four rungs uses
@@ -557,6 +566,7 @@ export class DailyReportService {
         [...held.values()],
         scalars.previousSessionClose,
         scalars.sessionOpen,
+        this.ladderConfig,
       );
 
       // The next level the ladder would extend to, which is where an entry
@@ -597,6 +607,7 @@ export class DailyReportService {
       [...held.values()],
       scalars.previousSessionClose,
       scalars.sessionOpen,
+      this.ladderConfig,
     );
 
     const unexplained: UnexplainedIntent[] = [];

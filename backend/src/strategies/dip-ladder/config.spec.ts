@@ -17,12 +17,19 @@ describe('dip ladder config', () => {
         spacingPercent: 0.05,
         atrMultiple: 1,
         atrPeriod: 14,
+        spacingDollars: 1,
         takeProfitPercent: 0.05,
+        // Absolute spacing and sizing are opt-in: null/percentage defaults keep
+        // every committed fixture on the rule its expectations were computed
+        // under.
+        takeProfitDollars: null,
         exitMode: ExitMode.PER_LOT,
         // Defaults to the bar-close rule the fixtures' expected intents were
         // computed under. The live engine selects RESTING explicitly.
         orderPlacement: OrderPlacement.IMMEDIATE,
+        gapRebasePercent: null,
         sizePerRung: 0.25,
+        fixedQuantity: null,
         escalationFactor: 1,
         maxConcurrentRungs: 5,
         hardFloorPercent: 0.25,
@@ -109,12 +116,28 @@ describe('dip ladder config', () => {
       [{ hardFloorPercent: 1 }, 'hardFloorPercent'],
       [{ symbolCapital: 0 }, 'symbolCapital'],
       [{ symbolCapital: -100 }, 'symbolCapital'],
+      // Zero would re-base on any open below the previous close — every
+      // ordinary down day rather than a gap — which is the chase-the-market
+      // behaviour the threshold is bounded to avoid.
+      [{ gapRebasePercent: 0 }, 'gapRebasePercent'],
+      [{ gapRebasePercent: 1 }, 'gapRebasePercent'],
+      [{ gapRebasePercent: -0.01 }, 'gapRebasePercent'],
     ])('rejects %o', (overrides, field) => {
       expect(() => buildDipLadderConfig('TQQQ', overrides)).toThrow(field);
     });
 
     it('accepts escalation set explicitly to a value above 1', () => {
       expect(buildDipLadderConfig('TQQQ', { escalationFactor: 1.5 }).escalationFactor).toBe(1.5);
+    });
+
+    it('defaults gap re-basing to off, leaving the plain max anchor rule', () => {
+      // Off by default for the same reason `orderPlacement` is: the committed
+      // fixtures' expected rung prices were computed under the max rule.
+      expect(buildDipLadderConfig('TQQQ').gapRebasePercent).toBeNull();
+    });
+
+    it('accepts a gap threshold set explicitly', () => {
+      expect(buildDipLadderConfig('TQQQ', { gapRebasePercent: 0.01 }).gapRebasePercent).toBe(0.01);
     });
   });
 });

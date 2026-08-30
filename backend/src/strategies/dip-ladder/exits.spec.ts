@@ -13,6 +13,7 @@ function lot(overrides: Partial<Lot> & Pick<Lot, 'id'>): Lot {
     status: LotStatus.HELD,
     closedAt: null,
     exitPrice: null,
+    workingOrderId: null,
     ...overrides,
   };
 }
@@ -139,6 +140,32 @@ describe('selectExit', () => {
   it('exits a lower rung once the higher one is gone', () => {
     const lots = [
       lot({ id: 'upper', status: LotStatus.CLOSED, exitPrice: 99.75 }),
+      lot({ id: 'lower', rungPrice: 90.25, fillPrice: 90.25, exitTarget: 94.76 }),
+    ];
+
+    expect(selectExit(lots, 100, BAR, 'TQQQ')!.lotId).toBe('lower');
+  });
+
+  /**
+   * The exit-side counterpart of `RungStatus.WORKING` excluding a rung from
+   * `isFireable`: a lot with a sell already resting at the broker must not
+   * receive a second intent.
+   */
+  it('skips a lot that already has a sell resting at the broker', () => {
+    const held = lot({ id: 'lot-1', workingOrderId: 'order-1' });
+
+    expect(selectExit([held], 100, BAR, 'TQQQ')).toBeNull();
+  });
+
+  it('falls through to the next rung when the higher one is already covered', () => {
+    const lots = [
+      lot({
+        id: 'upper',
+        rungPrice: 95,
+        fillPrice: 95,
+        exitTarget: 99.75,
+        workingOrderId: 'order-1',
+      }),
       lot({ id: 'lower', rungPrice: 90.25, fillPrice: 90.25, exitTarget: 94.76 }),
     ];
 

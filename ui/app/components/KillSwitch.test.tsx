@@ -31,6 +31,31 @@ describe('KillSwitch', () => {
     expect(screen.getByRole('button', { name: /engage kill switch/i })).toBeInTheDocument();
   });
 
+  it('shows the live price alongside the control', () => {
+    render(
+      <KillSwitch
+        engaged={false}
+        reason={null}
+        changedAt={null}
+        symbol="TQQQ"
+        lastPrice={{ symbol: 'TQQQ', price: 72.47, at: Date.now() }}
+      />,
+    );
+
+    // The price and the control an operator weighs it against must be legible
+    // in one glance — that is the reason it lives in this panel at all.
+    expect(screen.getByText('$72.47')).toBeInTheDocument();
+    expect(screen.getByTestId('kill-switch-state')).toHaveTextContent('ARMED');
+  });
+
+  it('still renders the control when no price is available', () => {
+    render(<KillSwitch engaged={false} reason={null} changedAt={null} />);
+
+    // A missing feed must never take the kill switch down with it.
+    expect(screen.getByRole('button', { name: /engage kill switch/i })).toBeInTheDocument();
+    expect(screen.getByText(/no live feed/i)).toBeInTheDocument();
+  });
+
   it('renders the engaged state and says submission is halted', () => {
     render(<KillSwitch engaged reason="operator action" changedAt="2024-03-04T10:00:00-05:00" />);
 

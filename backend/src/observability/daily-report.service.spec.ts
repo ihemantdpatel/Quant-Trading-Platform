@@ -158,6 +158,7 @@ function lot(overrides: Partial<Lot> = {}): Lot {
     status: LotStatus.HELD,
     closedAt: null,
     exitPrice: null,
+    workingOrderId: null,
     ...overrides,
   };
 }

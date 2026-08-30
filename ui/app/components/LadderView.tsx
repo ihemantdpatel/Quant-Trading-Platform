@@ -42,8 +42,18 @@ const STATUS_STYLE: Record<Rung['status'], { label: string; className: string }>
   PENDING: { label: 'Armed', className: 'border-slate-700 bg-slate-900 text-slate-400' },
 };
 
-export function LadderView({ rungs, mark }: { rungs: Rung[]; mark: number | null }) {
+export function LadderView({
+  rungs,
+  mark,
+  unavailable = false,
+}: {
+  rungs: Rung[];
+  mark: number | null;
+  /** True when the `/rungs` read failed — distinct from an unbuilt ladder. */
+  unavailable?: boolean;
+}) {
   const ordered = [...rungs].sort((a, b) => b.price - a.price);
+  const unverified = ordered.some((rung) => rung.unverified);
   const held = ordered.filter((rung) => rung.status === 'HELD').length;
   const working = ordered.filter((rung) => rung.status === 'WORKING').length;
   const cycles = ordered.reduce((sum, rung) => sum + rung.completedCycles, 0);
@@ -59,7 +69,18 @@ export function LadderView({ rungs, mark }: { rungs: Rung[]; mark: number | null
         </p>
       </header>
 
-      {ordered.length === 0 ? (
+      {unverified && (
+        <p className="border-b border-amber-800/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
+          Some rungs are shown from the <strong>database</strong> because their symbol is halted.
+          Nothing is armed while a symbol is halted, whatever a row's status reads.
+        </p>
+      )}
+
+      {unavailable ? (
+        <p className="px-4 py-6 text-sm text-amber-300">
+          Ladder unavailable — this read failed. Resting orders at the broker are unaffected.
+        </p>
+      ) : ordered.length === 0 ? (
         <p className="px-4 py-6 text-sm text-slate-500">
           No rungs yet. The first fires one spacing unit below the session anchor.
         </p>
