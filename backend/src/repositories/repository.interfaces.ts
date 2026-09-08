@@ -117,6 +117,35 @@ export interface RiskEventRepository {
 }
 
 /**
+ * One row per automatic lot-sum/state-version rebuild — see
+ * `LotRebuildService`. The audit trail for the one place reconciliation is
+ * now permitted to guess at (or write off) lot composition instead of halting
+ * a symbol for an operator to resolve by hand.
+ */
+export interface LotRebuildEventRecord {
+  symbol: string;
+  strategyId: string;
+  /** 'LOT_SUM_MISMATCH' | 'STATE_VERSION_MISMATCH' */
+  triggerCode: string;
+  /** 'ADD_TIER1_RECONSTRUCTED' | 'ADD_TIER2_SYNTHETIC' | 'WRITE_OFF' */
+  action: string;
+  brokerQuantity: number;
+  brokerAverageCost: number;
+  priorLotQuantity: number;
+  /** The full lot set written, verbatim — not a summary. */
+  resultingLots: Lot[];
+  detail: string;
+  timestamp: string;
+}
+
+export interface LotRebuildEventRepository {
+  save(event: LotRebuildEventRecord): Promise<void>;
+  findAll(): Promise<LotRebuildEventRecord[]>;
+  findBySymbol(symbol: string): Promise<LotRebuildEventRecord[]>;
+  clear(): Promise<void>;
+}
+
+/**
  * Cached historical bars — **the store IB's pacing limits make mandatory**
  * (`PRD.md:293`).
  *
@@ -273,6 +302,7 @@ export const FILL_REPOSITORY = Symbol('FILL_REPOSITORY');
 export const LOT_REPOSITORY = Symbol('LOT_REPOSITORY');
 export const RUNG_REPOSITORY = Symbol('RUNG_REPOSITORY');
 export const RISK_EVENT_REPOSITORY = Symbol('RISK_EVENT_REPOSITORY');
+export const LOT_REBUILD_EVENT_REPOSITORY = Symbol('LOT_REBUILD_EVENT_REPOSITORY');
 export const PARAMETER_CHANGE_REPOSITORY = Symbol('PARAMETER_CHANGE_REPOSITORY');
 export const STRATEGY_STATE_SNAPSHOT_REPOSITORY = Symbol('STRATEGY_STATE_SNAPSHOT_REPOSITORY');
 export const BACKTEST_REPOSITORY = Symbol('BACKTEST_REPOSITORY');

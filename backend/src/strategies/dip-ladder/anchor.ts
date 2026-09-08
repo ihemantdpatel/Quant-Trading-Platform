@@ -83,32 +83,35 @@ export function bootstrapAnchor(
 }
 
 /**
- * True when the session opened far enough below the previous close to re-base
- * the anchor onto the open.
+ * True when `to` sits far enough below `from` to re-base the anchor onto it.
  *
- * Separate from `bootstrapAnchor` so the condition can be asserted directly and
- * reported on: "the anchor re-based because the session gapped 3.2% down" is a
- * fact an operator reading a soak report needs, and it is not recoverable from
- * the resulting price alone.
+ * Generic over what `from`/`to` mean: the bootstrap path calls it with
+ * (previous close, today's open), the progression path with (lowest held lot,
+ * current bar close) — see `resolveAnchor`. Kept as one function rather than
+ * two so the threshold reads identically in both regimes, and so the
+ * condition can be asserted directly and reported on: "the anchor re-based
+ * because price gapped 3.2% below the lot it was anchored on" is a fact an
+ * operator reading a soak report needs, and it is not recoverable from the
+ * resulting price alone.
  *
  * Returns false when `gapRebasePercent` is null — the default — so every
  * committed fixture keeps the max rule its expected rung prices were computed
- * under. Guards a non-positive `previousClose` because the gap is a ratio
- * against it, and a division by zero would silently read as "no gap".
+ * under. Guards a non-positive `from` because the gap is a ratio against it,
+ * and a division by zero would silently read as "no gap".
  */
 export function isRebasableGap(
-  previousClose: number | null,
-  todayOpen: number,
+  from: number | null,
+  to: number,
   config?: Pick<DipLadderConfig, 'gapRebasePercent'>,
 ): boolean {
   const threshold = config?.gapRebasePercent ?? null;
 
-  if (threshold === null || previousClose === null || previousClose <= 0) {
+  if (threshold === null || from === null || from <= 0) {
     return false;
   }
 
-  // Negative for a gap down, which is the only direction this rule acts on.
-  const gap = (todayOpen - previousClose) / previousClose;
+  // Negative for a move down, which is the only direction this rule acts on.
+  const gap = (to - from) / from;
 
   return gap <= -threshold;
 }
@@ -144,21 +147,55 @@ export function lowestHeldLotPrice(heldLots: HeldLot[]): number | null {
  * extend from that exposure and not re-base to a session open that sits above
  * it.
  *
- * **Gap re-basing is therefore a bootstrap-only rule**, and that follows from
- * the same reasoning rather than being a separate decision: a ladder holding
- * lots through a gap-down open must keep extending below its existing exposure.
- * Re-basing onto the open there would place the next rung above lots already
- * held, breaking the invariant that the ladder descends.
+ * **Progression re-bases too, but only downward, and only past the same
+ * `gapRebasePercent` threshold the bootstrap path uses.** The bootstrap
+ * comment above explains why re-basing *up* onto a session open is refused
+ * while holding: it would place the next rung above lots already held,
+ * breaking the invariant that the ladder descends. Re-basing *down* onto
+ * `currentClose` carries no such risk — a rebasable gap is by definition a
+ * close that has fallen below the lowest held lot, so the re-based anchor is
+ * still below every held lot, same as the un-rebased one would be.
+ *
+ * Without this, a resting-order ladder that grinds down over several
+ * sessions — rather than gapping on a single open — can strand indefinitely:
+ * each new rung is one spacing unit below the anchor, but once that single
+ * computed level already exists in the ledger (a re-armed or pending rung
+ * from earlier, now sitting stranded above a market that has since moved
+ * on — `evaluateBar`'s resting branch refuses to invent a *fresh* level while
+ * one is already stranded there, precisely to avoid chasing a single fast
+ * move), the anchor never advances and no new rung is ever proposed. Once the
+ * gap from the anchor to the market exceeds the threshold, that is no longer
+ * "one print" — it re-bases, and the next rung lands one spacing unit below
+ * the market instead of forever below a lot that will not be seen again
+ * until price rallies back to it.
+ *
+ * `currentClose` is optional so every existing caller that has no bar in
+ * scope (a bootstrap-only recomputation, for instance) keeps the un-rebased
+ * behavior rather than being forced to thread one through.
+ *
+ * **Only pass `currentClose` from the branch of `evaluateBar` that has
+ * already found an existing rung stranded above the market** (`ladder.ts`'s
+ * `candidates.length > 0` branch) — never from a plain extension to a level
+ * the ladder has not reached before. A fresh extension has no rung to be
+ * "stranded"; re-basing there would snap the very first descent past any
+ * ordinary >1%-in-one-bar move onto that bar's exact close instead of the
+ * next clean grid level, which is chasing the market rather than the
+ * documented "grinds down over several sessions" case above.
  */
 export function resolveAnchor(
   heldLots: HeldLot[],
   previousClose: number | null,
   todayOpen: number,
   config?: Pick<DipLadderConfig, 'gapRebasePercent'>,
+  currentClose?: number,
 ): AnchorResult {
   const lowestHeld = lowestHeldLotPrice(heldLots);
 
   if (lowestHeld !== null) {
+    if (currentClose !== undefined && isRebasableGap(lowestHeld, currentClose, config)) {
+      return { price: currentClose, basis: AnchorBasis.PROGRESSION };
+    }
+
     return { price: lowestHeld, basis: AnchorBasis.PROGRESSION };
   }
 

@@ -11,6 +11,7 @@ import {
   runBacktestRepositoryContract,
   runBarRepositoryContract,
   runFillRepositoryContract,
+  runLotRebuildEventRepositoryContract,
   runLotRepositoryContract,
   runOrderIntentRepositoryContract,
   runOrderRepositoryContract,
@@ -24,6 +25,7 @@ import {
   InMemoryBacktestRepository,
   InMemoryBarRepository,
   InMemoryFillRepository,
+  InMemoryLotRebuildEventRepository,
   InMemoryLotRepository,
   InMemoryOrderIntentRepository,
   InMemoryOrderRepository,
@@ -41,6 +43,7 @@ describe('in-memory repositories', () => {
   runOrderRepositoryContract(() => new InMemoryOrderRepository());
   runFillRepositoryContract(() => new InMemoryFillRepository());
   runRiskEventRepositoryContract(() => new InMemoryRiskEventRepository());
+  runLotRebuildEventRepositoryContract(() => new InMemoryLotRebuildEventRepository());
   runParameterChangeRepositoryContract(() => new InMemoryParameterChangeRepository());
   runStrategyStateSnapshotRepositoryContract(() => new InMemoryStrategyStateSnapshotRepository());
   runBacktestRepositoryContract(() => new InMemoryBacktestRepository());

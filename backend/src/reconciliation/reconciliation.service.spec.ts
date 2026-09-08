@@ -20,8 +20,10 @@ import { EngineService } from '../engine/engine.service';
 import { StartupSequence } from '../engine/startup.sequence';
 import { ReplayService } from '../market-data/mock/replay.service';
 import { BarSize } from '../market-data/types';
+import { LotRebuildService, RebuildAction } from './lot-rebuild.service';
 import {
   InMemoryFillRepository,
+  InMemoryLotRebuildEventRepository,
   InMemoryLotRepository,
   InMemoryOrderIntentRepository,
   InMemoryOrderRepository,
@@ -62,8 +64,16 @@ function buildHarness(
     lots?: InMemoryLotRepository;
     rungs?: InMemoryRungRepository;
     snapshots?: InMemoryStrategyStateSnapshotRepository;
+    fills?: InMemoryFillRepository;
+    rebuildEvents?: InMemoryLotRebuildEventRepository;
     broker?: MockBrokerAdapter;
     symbols?: string[];
+    // Defaults to PAPER, matching production — see
+    // `docs/decisions/auto-lot-rebuild.md`. A test asserting that a
+    // LOT_SUM_MISMATCH still halts despite auto-rebuild being wired in should
+    // pass a mode other than PAPER, or a symbol not covered by `ladderConfig`,
+    // rather than relying on the rebuild attempt happening to fail.
+    mode?: ExecutionMode;
   } = {},
 ) {
   const lots = options.lots ?? new InMemoryLotRepository();
@@ -77,10 +87,15 @@ function buildHarness(
   const symbols = options.symbols ?? ['TQQQ'];
 
   const coordinator = new CoordinatorService();
+  const ladderConfig = buildDipLadderConfig(symbols[0], { symbolCapital: 100_000 });
 
   for (const symbol of symbols) {
     coordinator.register({
-      strategy: new DipLadderStrategy(buildDipLadderConfig(symbol, { symbolCapital: 100_000 })),
+      strategy: new DipLadderStrategy(
+        symbol === symbols[0]
+          ? ladderConfig
+          : buildDipLadderConfig(symbol, { symbolCapital: 100_000 }),
+      ),
       enabled: true,
       symbols: [symbol],
     });
@@ -90,6 +105,10 @@ function buildHarness(
   jest.spyOn(halts['logger'], 'error').mockImplementation(() => undefined);
   jest.spyOn(halts['logger'], 'warn').mockImplementation(() => undefined);
 
+  const fills = options.fills ?? new InMemoryFillRepository();
+  const rebuild = new LotRebuildService(orders, fills);
+  const rebuildEvents = options.rebuildEvents ?? new InMemoryLotRebuildEventRepository();
+
   const reconciliation = new ReconciliationService(
     coordinator,
     halts,
@@ -98,9 +117,15 @@ function buildHarness(
     orders,
     rungs,
     snapshots,
+    fills,
+    rebuild,
+    rebuildEvents,
+    ladderConfig,
+    options.mode ?? ExecutionMode.PAPER,
   );
   jest.spyOn(reconciliation['logger'], 'log').mockImplementation(() => undefined);
   jest.spyOn(reconciliation['logger'], 'error').mockImplementation(() => undefined);
+  jest.spyOn(reconciliation['logger'], 'warn').mockImplementation(() => undefined);
 
   const engine = new EngineService(
     new ReplayService(),
@@ -116,7 +141,7 @@ function buildHarness(
     broker,
     new InMemoryOrderIntentRepository(),
     orders,
-    new InMemoryFillRepository(),
+    fills,
     lots,
     rungs,
     ExecutionMode.PAPER,
@@ -133,6 +158,8 @@ function buildHarness(
     orders,
     rungs,
     snapshots,
+    fills,
+    rebuildEvents,
     broker,
     coordinator,
     halts,
@@ -275,6 +302,60 @@ describe('Story 9: startup reconciliation', () => {
       expect(reArmed?.lastExitAt).toBe('2025-01-06T14:00:00.000-05:00');
     });
 
+    it('backfills a HELD rung for a lot whose price has no matching rung row', async () => {
+      // A lot that entered the ledger outside the normal fill/rebuild paths
+      // (e.g. inserted directly) can hold a price with no corresponding Rung
+      // row at all. Without a backfill, that level could never re-arm once
+      // the lot exits — the ladder would simply lose it.
+      const { lots, rungs, snapshots, broker } = buildHarness();
+
+      await lots.saveAll(
+        [heldLot('TQQQ-lot-1', { rungPrice: 72.91, fillPrice: 72.91, quantity: 50 })],
+        'TQQQ',
+      );
+      // Deliberately no rung saved at 72.91 — only an unrelated rung exists.
+      await rungs.saveAll([rung(68.05)], 'TQQQ');
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 50, averageCost: 72.91 });
+
+      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const result = await restarted.startup.run(NOW);
+
+      expect(result.reconciliation.clean).toBe(true);
+
+      const backfilled = restarted.engine.ladderRungs().find((r) => r.price === 72.91);
+      expect(backfilled?.status).toBe(RungStatus.HELD);
+      expect(backfilled?.lotId).toBe('TQQQ-lot-1');
+
+      // Persisted, not just held in memory — a later reconciliation must see
+      // the same backfilled row rather than losing it to the next restore.
+      const persisted = await rungs.findBySymbol('TQQQ');
+      expect(persisted.find((r) => r.price === 72.91)?.status).toBe(RungStatus.HELD);
+    });
+
+    it('leaves a conflicting rung alone rather than overwriting it for a HELD lot', async () => {
+      // A rung already exists at the lot's price but disagrees with it (a
+      // different lotId). That is a genuine conflict between two records that
+      // both claim to be authoritative — guessing which is stale is exactly
+      // the kind of silent correction this path must not make.
+      const { lots, rungs, snapshots, broker } = buildHarness();
+
+      await lots.saveAll(
+        [heldLot('TQQQ-lot-1', { rungPrice: 72.91, fillPrice: 72.91, quantity: 50 })],
+        'TQQQ',
+      );
+      await rungs.saveAll(
+        [rung(72.91, { status: RungStatus.HELD, lotId: 'TQQQ-lot-other' })],
+        'TQQQ',
+      );
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 50, averageCost: 72.91 });
+
+      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      await restarted.startup.run(NOW);
+
+      const conflicting = restarted.engine.ladderRungs().find((r) => r.price === 72.91);
+      expect(conflicting?.lotId).toBe('TQQQ-lot-other');
+    });
+
     it('restores the anchor scalars from the snapshot', async () => {
       // The exit criterion names the anchor alongside lots and rungs
       // (`stories.md:567`). It lives only in the snapshot — lots and rungs do
@@ -327,6 +408,13 @@ describe('Story 9: startup reconciliation', () => {
       // `stories.md:557` — the headline failure case. The database says 300
       // shares in three lots; the broker says 200. Something happened that the
       // system cannot see, and lot composition is now unknowable.
+      //
+      // `mode: LIVE` — this scenario is exactly what `LotRebuildService`'s
+      // write-off tier auto-resolves in `PAPER` (see
+      // `docs/decisions/auto-lot-rebuild.md`); this suite is testing the
+      // unconditional refuse-to-guess invariant, so it runs where that
+      // auto-repair is gated off. The PAPER case is covered in
+      // `describe('automatic lot rebuild')` below.
       const { lots, rungs, snapshots, broker } = buildHarness();
 
       await lots.saveAll(
@@ -339,7 +427,7 @@ describe('Story 9: startup reconciliation', () => {
       );
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       const result = await restarted.startup.run(NOW);
 
       expect(result.reconciliation.clean).toBe(false);
@@ -361,7 +449,8 @@ describe('Story 9: startup reconciliation', () => {
       await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      // See the `mode: LIVE` note on the first test in this describe block.
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       await restarted.startup.run(NOW);
 
       expect(restarted.engine.ladderLots()).toEqual([]);
@@ -379,7 +468,8 @@ describe('Story 9: startup reconciliation', () => {
       await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      // See the `mode: LIVE` note on the first test in this describe block.
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       await restarted.startup.run(NOW);
 
       const replayed = await restarted.engine.replayFixture('chop-range');
@@ -397,7 +487,8 @@ describe('Story 9: startup reconciliation', () => {
 
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      // See the `mode: LIVE` note on the first test in this describe block.
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       await restarted.startup.run(NOW);
       await restarted.engine.replayFixture('chop-range');
 
@@ -419,7 +510,8 @@ describe('Story 9: startup reconciliation', () => {
       );
       broker.seedPosition({ symbol: 'TQQQ', quantity: 250, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      // See the `mode: LIVE` note on the first test in this describe block.
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       await restarted.startup.run(NOW);
       await restarted.engine.replayFixture('chop-range');
 
@@ -429,11 +521,13 @@ describe('Story 9: startup reconciliation', () => {
 
   describe('one-sided positions', () => {
     it('halts when the broker reports a position the DB has no lots for', async () => {
-      // `stories.md:560`.
+      // `stories.md:560`. `mode: LIVE` — see the note in 'injected quantity
+      // mismatch' above; PAPER's auto-rebuild would otherwise synthesize a lot
+      // for exactly this gap.
       const { lots, rungs, snapshots, broker } = buildHarness();
       broker.seedPosition({ symbol: 'TQQQ', quantity: 300, averageCost: 90 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       const result = await restarted.startup.run(NOW);
 
       expect(restarted.halts.isHalted('TQQQ')).toBe(true);
@@ -443,11 +537,11 @@ describe('Story 9: startup reconciliation', () => {
     });
 
     it('halts when the DB has lots the broker reports no position for', async () => {
-      // `stories.md:561`.
+      // `stories.md:561`. `mode: LIVE` — see the note above.
       const { lots, rungs, snapshots, broker } = buildHarness();
       await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 100 })], 'TQQQ');
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       const result = await restarted.startup.run(NOW);
 
       expect(restarted.halts.isHalted('TQQQ')).toBe(true);
@@ -486,12 +580,14 @@ describe('Story 9: startup reconciliation', () => {
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
       broker.seedPosition({ symbol: 'SOXL', quantity: 100, averageCost: 95 });
 
+      // `mode: LIVE` — see the note in 'injected quantity mismatch' above.
       const harness = buildHarness({
         lots,
         rungs,
         snapshots,
         broker,
         symbols: ['TQQQ', 'SOXL'],
+        mode: ExecutionMode.LIVE,
       });
       const result = await harness.startup.run(NOW);
 
@@ -572,7 +668,8 @@ describe('Story 9: startup reconciliation', () => {
       await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 100 })], 'TQQQ');
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92.5 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      // `mode: LIVE` — see the note in 'injected quantity mismatch' above.
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       const result = await restarted.startup.run(NOW);
 
       // Explicit halt, not a silent divergence.
@@ -717,12 +814,15 @@ describe('Story 9: startup reconciliation', () => {
 
   describe('halt release', () => {
     it('resumes trading the symbol only after an operator releases the halt', async () => {
+      // `mode: LIVE` — see the note in 'injected quantity mismatch' above;
+      // this test is about the manual release path, which must still work for
+      // a mismatch nothing auto-resolved.
       const { lots, rungs, snapshots, broker } = buildHarness();
 
       await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       await restarted.startup.run(NOW);
 
       expect((await restarted.engine.replayFixture('chop-range')).intentsGenerated).toBe(0);
@@ -737,16 +837,126 @@ describe('Story 9: startup reconciliation', () => {
     it('engine.reset does not dismiss an unresolved halt', async () => {
       // `POST /engine/reset` returns the engine to a known state for the next
       // replay. It is deliberately not a way to clear a mismatch nobody fixed.
+      // `mode: LIVE` — see the note in 'injected quantity mismatch' above.
       const { lots, rungs, snapshots, broker } = buildHarness();
 
       await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
       broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
 
-      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
       await restarted.startup.run(NOW);
       await restarted.engine.reset();
 
       expect(restarted.halts.isHalted('TQQQ')).toBe(true);
+    });
+  });
+
+  describe('broker-unavailable auto-release', () => {
+    it('releases BROKER_UNAVAILABLE automatically once the broker answers and the lot sum reconciles', async () => {
+      const { lots, rungs, snapshots } = buildHarness();
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
+
+      const broker = new MockBrokerAdapter();
+      const positionsSpy = jest
+        .spyOn(broker, 'getPositions')
+        .mockRejectedValue(new Error('not connected'));
+
+      const harness = buildHarness({ lots, rungs, snapshots, broker });
+      await harness.startup.run(NOW);
+
+      expect(harness.halts.haltFor('TQQQ')?.code).toBe(HALT_BROKER_UNAVAILABLE);
+      expect((await harness.engine.replayFixture('chop-range')).intentsGenerated).toBe(0);
+
+      // The broker is reachable again, and reports exactly what the DB
+      // expects — the "someone traded directly at IB" premise: nothing was
+      // ever actually wrong, the system just never got to check.
+      positionsSpy.mockRestore();
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 300, averageCost: 95 });
+
+      const results = await harness.reconciliation.reconcileBrokerUnavailableHalts(NOW);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].verdict.reconciled).toBe(true);
+      expect(harness.halts.isHalted('TQQQ')).toBe(false);
+      expect((await harness.engine.replayFixture('chop-range')).intentsGenerated).toBeGreaterThan(
+        0,
+      );
+    });
+
+    it('leaves the halt in place when the broker is still unreachable', async () => {
+      const broker = new MockBrokerAdapter();
+      jest.spyOn(broker, 'getPositions').mockRejectedValue(new Error('not connected'));
+
+      const harness = buildHarness({ broker });
+      await harness.startup.run(NOW);
+
+      const results = await harness.reconciliation.reconcileBrokerUnavailableHalts(NOW);
+
+      expect(results).toEqual([]);
+      expect(harness.halts.haltFor('TQQQ')?.code).toBe(HALT_BROKER_UNAVAILABLE);
+    });
+
+    it('does not release a symbol with no BROKER_UNAVAILABLE halt', async () => {
+      // Nothing to re-check for a clean symbol; asserted so the method reads
+      // as "narrow" and not just "happens not to have found a mismatch".
+      const harness = buildHarness();
+      await harness.startup.run(NOW);
+
+      const results = await harness.reconciliation.reconcileBrokerUnavailableHalts(NOW);
+
+      expect(results).toEqual([]);
+      expect(harness.halts.isHalted('TQQQ')).toBe(false);
+    });
+
+    it('never releases a genuine LOT_SUM_MISMATCH, even once the numbers would now agree', async () => {
+      // The decisive case: `BROKER_UNAVAILABLE` and `LOT_SUM_MISMATCH` are
+      // different claims. The first means "never checked"; the second means
+      // "checked, and it was wrong" — and that finding must survive a broker
+      // that later answers correctly, because the wrongness was never about
+      // reachability. Simulated by halting the ordinary way (broker reachable,
+      // totals disagree at startup) and then aligning the totals afterward.
+      //
+      // `mode: LIVE` — see the note in 'injected quantity mismatch' above;
+      // PAPER's auto-rebuild would resolve this mismatch at startup, before
+      // there was ever a LOT_SUM_MISMATCH halt for this test to check against.
+      const { lots, rungs, snapshots, broker } = buildHarness();
+
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
+
+      const harness = buildHarness({ lots, rungs, snapshots, broker, mode: ExecutionMode.LIVE });
+      await harness.startup.run(NOW);
+
+      expect(harness.halts.haltFor('TQQQ')?.code).toBe(HALT_LOT_SUM_MISMATCH);
+
+      // The position now matches what the DB expects — but this halt was
+      // never a `BROKER_UNAVAILABLE` one, so it is not a candidate at all.
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 300, averageCost: 92 });
+
+      const results = await harness.reconciliation.reconcileBrokerUnavailableHalts(NOW);
+
+      expect(results).toEqual([]);
+      expect(harness.halts.haltFor('TQQQ')?.code).toBe(HALT_LOT_SUM_MISMATCH);
+      expect((await harness.engine.replayFixture('chop-range')).intentsGenerated).toBe(0);
+    });
+
+    it('re-checks BROKER_UNAVAILABLE halts on its own when the broker reports CONNECTED', async () => {
+      // The production trigger: `onModuleInit` subscribes once, for the life
+      // of the process, so an operator does not have to call the method above
+      // by hand after every reconnect. Verified by spying on the method
+      // itself rather than re-asserting the release logic already covered
+      // above — this test is only about the wiring.
+      const harness = buildHarness();
+      const spy = jest
+        .spyOn(harness.reconciliation, 'reconcileBrokerUnavailableHalts')
+        .mockResolvedValue([]);
+
+      harness.reconciliation.onModuleInit();
+      await harness.broker.connect();
+      // Flushes the fire-and-forget handler's microtasks.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(spy).toHaveBeenCalled();
     });
   });
 
@@ -797,6 +1007,172 @@ describe('Story 9: startup reconciliation', () => {
       // independent targets versus one.
       expect(three.engine.ladderLots().map((l) => l.exitTarget)).toEqual([99.75, 94.76, 90.03]);
       expect(one.engine.ladderLots().map((l) => l.exitTarget)).toEqual([94.85]);
+    });
+  });
+
+  /**
+   * The counterpart to every `mode: LIVE` test above: the same shape of
+   * mismatch, in the default `PAPER` mode, now resolves automatically instead
+   * of halting. See `docs/decisions/auto-lot-rebuild.md`. Those other tests
+   * prove the invariant still holds when auto-rebuild is gated off; these
+   * prove the feature it is gated off *from* actually works end to end,
+   * beyond `LotRebuildService`'s own unit coverage in `lot-rebuild.service.spec.ts`.
+   */
+  describe('automatic lot rebuild (PAPER)', () => {
+    it('resolves a broker-lower mismatch via write-off and resumes trading', async () => {
+      const { lots, rungs, snapshots, broker } = buildHarness();
+
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
+
+      // Default mode is PAPER.
+      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const result = await restarted.startup.run(NOW);
+
+      expect(restarted.halts.isHalted('TQQQ')).toBe(false);
+      expect(result.reconciliation.clean).toBe(true);
+      expect(result.reconciliation.rebuildsApplied).toBe(1);
+
+      const [symbolResult] = result.reconciliation.symbols;
+      expect(symbolResult.resumed).toBe(true);
+      expect(symbolResult.rebuildAction).toBe(RebuildAction.WRITE_OFF);
+
+      // 100 shares written off at zero realized P&L; 200 remain held.
+      const persisted = await lots.findBySymbol('TQQQ');
+      const heldQuantity = persisted.reduce(
+        (sum, l) => (l.status === LotStatus.HELD ? sum + l.quantity : sum),
+        0,
+      );
+      expect(heldQuantity).toBe(200);
+
+      // The symbol trades again — the whole point of the feature.
+      expect((await restarted.engine.replayFixture('chop-range')).intentsGenerated).toBeGreaterThan(
+        0,
+      );
+    });
+
+    it('resolves a broker-higher mismatch via a Tier 2 synthetic lot and resumes trading', async () => {
+      const { lots, rungs, snapshots, broker } = buildHarness();
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 100, averageCost: 92 });
+
+      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const result = await restarted.startup.run(NOW);
+
+      expect(restarted.halts.isHalted('TQQQ')).toBe(false);
+      expect(result.reconciliation.rebuildsApplied).toBe(1);
+      expect(result.reconciliation.symbols[0].rebuildAction).toBe(
+        RebuildAction.ADD_TIER2_SYNTHETIC,
+      );
+
+      const [synthetic] = restarted.engine.ladderLots();
+      expect(synthetic.quantity).toBe(100);
+      expect(synthetic.fillPrice).toBe(92);
+    });
+
+    it('writes a durable audit row for every applied rebuild', async () => {
+      // The one place reconciliation is permitted to guess at (or write off)
+      // lot composition instead of halting needs its own paper trail — a
+      // container log line is not something an operator can query after the
+      // fact. See `LotRebuildEventRepository`.
+      const { lots, rungs, snapshots, broker, rebuildEvents } = buildHarness();
+
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
+
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, rebuildEvents });
+      await restarted.startup.run(NOW);
+
+      const events = await rebuildEvents.findBySymbol('TQQQ');
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        symbol: 'TQQQ',
+        strategyId: 'dip-ladder:TQQQ',
+        triggerCode: HALT_LOT_SUM_MISMATCH,
+        action: RebuildAction.WRITE_OFF,
+        brokerQuantity: 200,
+        brokerAverageCost: 92,
+        priorLotQuantity: 300,
+        timestamp: NOW,
+      });
+      expect(events[0].resultingLots.reduce((sum, l) => sum + l.quantity, 0)).toBe(300);
+    });
+
+    it('halts a second mismatch for the same symbol instead of auto-rebuilding again', async () => {
+      // `docs/decisions/auto-lot-rebuild.md`, "Revisit when": a rebuild firing
+      // more than once for one symbol in a session is evidence of a live bug
+      // upstream (exactly what a fill-routing race turned out to produce),
+      // not a second instance of the rare case Tier 2 exists for. The first
+      // mismatch still auto-resolves; the second must halt instead of
+      // compounding another guess on top of the first.
+      const { lots, rungs, snapshots, broker } = buildHarness();
+
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 300 })], 'TQQQ');
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 200, averageCost: 92 });
+
+      const restarted = buildHarness({ lots, rungs, snapshots, broker });
+      const first = await restarted.reconciliation.reconcileAll(NOW);
+
+      expect(first.rebuildsApplied).toBe(1);
+      expect(restarted.halts.isHalted('TQQQ')).toBe(false);
+
+      // A second, independent mismatch on the same symbol — the broker
+      // reports fewer shares again, exactly the shape the first rebuild
+      // resolved.
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 150, averageCost: 92 });
+      const second = await restarted.reconciliation.reconcileAll(NOW);
+
+      expect(second.rebuildsApplied).toBe(0);
+      expect(restarted.halts.isHalted('TQQQ')).toBe(true);
+      expect(restarted.halts.haltFor('TQQQ')?.code).toBe(HALT_LOT_SUM_MISMATCH);
+
+      // The first rebuild's result is untouched by the refusal to guess again.
+      const persisted = await lots.findBySymbol('TQQQ');
+      const heldQuantity = persisted.reduce(
+        (sum, l) => (l.status === LotStatus.HELD ? sum + l.quantity : sum),
+        0,
+      );
+      expect(heldQuantity).toBe(200);
+    });
+
+    it('still halts when auto-rebuild itself cannot produce an exact match', async () => {
+      // The refusal path survives the feature: a partial exit fill is exactly
+      // the case `LotRebuildService.writeOff` refuses (see its own spec) —
+      // proven here through the full reconciliation path rather than in
+      // isolation.
+      const lots = new InMemoryLotRepository();
+      await lots.saveAll(
+        [
+          heldLot('TQQQ-lot-1', {
+            rungPrice: 95,
+            fillPrice: 95,
+            workingOrderId: 'co-partial-sell',
+          }),
+        ],
+        'TQQQ',
+      );
+      const fills = new InMemoryFillRepository();
+      await fills.save({
+        clientOrderId: 'co-partial-sell',
+        brokerOrderId: '1',
+        fillId: 'exec-partial',
+        symbol: 'TQQQ',
+        side: 'SELL',
+        quantity: 40,
+        price: 99.75,
+        commission: 0,
+        timestamp: '2025-01-05T15:50:00.000-05:00',
+      });
+
+      const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+      await broker.connect();
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 60, averageCost: 95 });
+
+      const harness = buildHarness({ lots, fills, broker });
+      await harness.startup.run(NOW);
+
+      expect(harness.halts.isHalted('TQQQ')).toBe(true);
+      const report = harness.reconciliation.lastReconciliation();
+      expect(report!.rebuildsApplied).toBe(0);
     });
   });
 });
@@ -854,6 +1230,119 @@ describe('open-order reconciliation across a restart', () => {
     const restored = harness.engine.ladderRungs().find((r) => r.price === 95);
     expect(restored!.status).not.toBe(RungStatus.WORKING);
     expect(restored!.workingOrderId).toBeNull();
+  });
+
+  it('releases a held lot whose resting sell is no longer at the broker', async () => {
+    // The SELL-side counterpart to the rung case above: an exit cancelled by
+    // hand in TWS (or expired at the close). Left with a stale
+    // `workingOrderId` the lot can never again be diagnosed as `missing`, so
+    // an operator's `place-missing` can never rest a fresh exit for it.
+    const lots = new InMemoryLotRepository();
+    await lots.saveAll([heldLot('TQQQ-lot-1', { workingOrderId: 'co-cancelled-sell' })], 'TQQQ');
+
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+    // The lot-sum assertion must pass, or the symbol halts and restores
+    // nothing — this test is about open-order reconciliation, which runs only
+    // after that assertion succeeds.
+    broker.seedPosition({ symbol: 'TQQQ', quantity: 100, averageCost: 95 });
+
+    const harness = buildHarness({ lots, broker });
+    await harness.startup.run(NOW);
+
+    const restored = harness.engine.ladderLots().find((lot) => lot.id === 'TQQQ-lot-1');
+    expect(restored!.status).toBe(LotStatus.HELD);
+    expect(restored!.workingOrderId).toBeNull();
+  });
+
+  it('closes a held lot whose resting exit already filled but was never routed', async () => {
+    // The gap `recoverExitFills` exists for: the exit's `Fill` was recorded
+    // (a real IB execDetails event) but the live router never applied it —
+    // e.g. the fill arrived while the symbol was halted for something else.
+    // Unlike the cancelled-order case above, this must *close* the lot with
+    // the fill's real price, not merely release the working-order mark.
+    const lots = new InMemoryLotRepository();
+    await lots.saveAll(
+      [heldLot('TQQQ-lot-1', { rungPrice: 95, fillPrice: 95, workingOrderId: 'co-filled-sell' })],
+      'TQQQ',
+    );
+    // No Rung row at all for price 95 — the missing-rung case: recovery must
+    // reconstruct one to re-arm, not silently drop the level.
+    const rungs = new InMemoryRungRepository();
+    const fills = new InMemoryFillRepository();
+    await fills.save({
+      clientOrderId: 'co-filled-sell',
+      brokerOrderId: '1',
+      fillId: 'exec-1',
+      symbol: 'TQQQ',
+      side: 'SELL',
+      quantity: 100,
+      price: 99.75,
+      commission: 0,
+      timestamp: '2025-01-05T15:50:00.000-05:00',
+    });
+
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+    // The lot's 100 shares were genuinely sold — the broker is flat.
+    broker.seedPosition({ symbol: 'TQQQ', quantity: 0, averageCost: 0 });
+
+    const harness = buildHarness({ lots, rungs, fills, broker });
+    await harness.startup.run(NOW);
+
+    expect(harness.halts.isHalted('TQQQ')).toBe(false);
+
+    const closedLot = harness.engine.ladderLots().find((lot) => lot.id === 'TQQQ-lot-1');
+    expect(closedLot!.status).toBe(LotStatus.CLOSED);
+    expect(closedLot!.exitPrice).toBe(99.75);
+    expect(closedLot!.closedAt).toBe('2025-01-05T15:50:00.000-05:00');
+    expect(closedLot!.workingOrderId).toBeNull();
+
+    const rearmedRung = harness.engine.ladderRungs().find((r) => r.price === 95);
+    expect(rearmedRung!.status).toBe(RungStatus.RE_ARMED);
+    expect(rearmedRung!.lotId).toBeNull();
+    expect(rearmedRung!.completedCycles).toBe(1);
+
+    const report = harness.reconciliation.lastReconciliation();
+    expect(report!.recoveredExits).toBe(1);
+  });
+
+  it('does not recover a lot whose exit fill only partially covers it', async () => {
+    // A partial exit needs the live path's lot-splitting to describe
+    // correctly; a reconciliation-time repair that closed the whole lot on a
+    // partial fill would misstate both the realized proceeds and the shares
+    // still actually held. Left untouched — reported via the ordinary
+    // mismatch, not guessed at.
+    const lots = new InMemoryLotRepository();
+    await lots.saveAll(
+      [heldLot('TQQQ-lot-1', { rungPrice: 95, fillPrice: 95, workingOrderId: 'co-partial-sell' })],
+      'TQQQ',
+    );
+    const fills = new InMemoryFillRepository();
+    await fills.save({
+      clientOrderId: 'co-partial-sell',
+      brokerOrderId: '1',
+      fillId: 'exec-partial',
+      symbol: 'TQQQ',
+      side: 'SELL',
+      quantity: 40,
+      price: 99.75,
+      commission: 0,
+      timestamp: '2025-01-05T15:50:00.000-05:00',
+    });
+
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+    broker.seedPosition({ symbol: 'TQQQ', quantity: 60, averageCost: 95 });
+
+    const harness = buildHarness({ lots, fills, broker });
+    await harness.startup.run(NOW);
+
+    // 100 held vs. 60 at the broker: the assertion correctly still halts,
+    // since a partial fill is not evidence this repair is scoped to act on.
+    expect(harness.halts.isHalted('TQQQ')).toBe(true);
+    const report = harness.reconciliation.lastReconciliation();
+    expect(report!.recoveredExits).toBe(0);
   });
 
   it('leaves the ledger untouched when open orders cannot be read', async () => {

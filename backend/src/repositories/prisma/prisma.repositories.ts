@@ -40,6 +40,8 @@ import {
   BacktestRunRecord,
   BarRepository,
   FillRepository,
+  LotRebuildEventRecord,
+  LotRebuildEventRepository,
   LotRepository,
   OrderIntentRecord,
   OrderIntentRepository,
@@ -700,6 +702,73 @@ export class PrismaRiskEventRepository implements RiskEventRepository {
   async clear(): Promise<void> {
     await this.prisma.riskEvent.deleteMany();
   }
+}
+
+@Injectable()
+export class PrismaLotRebuildEventRepository implements LotRebuildEventRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async save(event: LotRebuildEventRecord): Promise<void> {
+    await this.prisma.lotRebuildEvent.create({
+      data: {
+        symbol: event.symbol,
+        strategyId: event.strategyId,
+        triggerCode: event.triggerCode,
+        action: event.action,
+        brokerQuantity: event.brokerQuantity,
+        brokerAverageCost: toDecimal(event.brokerAverageCost),
+        priorLotQuantity: event.priorLotQuantity,
+        resultingLots: toJson(event.resultingLots),
+        detail: event.detail,
+        timestamp: event.timestamp,
+      },
+    });
+  }
+
+  async findAll(): Promise<LotRebuildEventRecord[]> {
+    const rows = await this.prisma.lotRebuildEvent.findMany({ orderBy: { id: 'asc' } });
+
+    return rows.map(toLotRebuildEventRecord);
+  }
+
+  async findBySymbol(symbol: string): Promise<LotRebuildEventRecord[]> {
+    const rows = await this.prisma.lotRebuildEvent.findMany({
+      where: { symbol },
+      orderBy: { id: 'asc' },
+    });
+
+    return rows.map(toLotRebuildEventRecord);
+  }
+
+  async clear(): Promise<void> {
+    await this.prisma.lotRebuildEvent.deleteMany();
+  }
+}
+
+function toLotRebuildEventRecord(row: {
+  symbol: string;
+  strategyId: string;
+  triggerCode: string;
+  action: string;
+  brokerQuantity: number;
+  brokerAverageCost: Prisma.Decimal;
+  priorLotQuantity: number;
+  resultingLots: Prisma.JsonValue;
+  detail: string;
+  timestamp: string;
+}): LotRebuildEventRecord {
+  return {
+    symbol: row.symbol,
+    strategyId: row.strategyId,
+    triggerCode: row.triggerCode,
+    action: row.action,
+    brokerQuantity: row.brokerQuantity,
+    brokerAverageCost: toNumber(row.brokerAverageCost),
+    priorLotQuantity: row.priorLotQuantity,
+    resultingLots: fromJson<Lot[]>(row.resultingLots),
+    detail: row.detail,
+    timestamp: row.timestamp,
+  };
 }
 
 /**

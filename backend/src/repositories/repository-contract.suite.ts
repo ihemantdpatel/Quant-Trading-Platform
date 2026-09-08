@@ -36,6 +36,8 @@ import {
   BacktestRunRecord,
   BarRepository,
   FillRepository,
+  LotRebuildEventRecord,
+  LotRebuildEventRepository,
   LotRepository,
   OrderIntentRecord,
   OrderIntentRepository,
@@ -137,6 +139,21 @@ export function riskEventFixture(detail: string): RiskEvent {
     timestamp: '2025-01-02T10:00:00.000-05:00',
     intent: null,
     approvedQuantity: null,
+  };
+}
+
+export function lotRebuildEventFixture(detail: string): LotRebuildEventRecord {
+  return {
+    symbol: 'TQQQ',
+    strategyId: 'dip-ladder:TQQQ',
+    triggerCode: 'LOT_SUM_MISMATCH',
+    action: 'ADD_TIER2_SYNTHETIC',
+    brokerQuantity: 100,
+    brokerAverageCost: 95.5,
+    priorLotQuantity: 0,
+    resultingLots: [lotFixture({ id: 'TQQQ-lot-synthetic-1' })],
+    detail,
+    timestamp: '2025-01-02T10:00:00.000-05:00',
   };
 }
 
@@ -643,6 +660,67 @@ export function runRiskEventRepositoryContract(
 
     it('clear empties the store', async () => {
       await repo.save(riskEventFixture('a'));
+      await repo.clear();
+
+      expect(await repo.findAll()).toEqual([]);
+    });
+  });
+}
+
+export function runLotRebuildEventRepositoryContract(
+  create: RepositoryFactory<LotRebuildEventRepository>,
+): void {
+  describe('LotRebuildEventRepository contract', () => {
+    let repo: LotRebuildEventRepository;
+
+    beforeEach(async () => {
+      repo = await create();
+    });
+
+    it('saves via the repository interface', async () => {
+      await repo.save(lotRebuildEventFixture('via save'));
+
+      expect(await repo.findAll()).toHaveLength(1);
+    });
+
+    it('stores a copy, including the resultingLots snapshot', async () => {
+      const original = lotRebuildEventFixture('original');
+      await repo.save(original);
+
+      original.detail = 'mutated';
+      original.resultingLots[0].quantity = 999;
+
+      const [stored] = await repo.findAll();
+      expect(stored.detail).toBe('original');
+      expect(stored.resultingLots[0].quantity).not.toBe(999);
+    });
+
+    it('round-trips every field, including the full lot set written', async () => {
+      const event = lotRebuildEventFixture('rebuilt');
+      await repo.save(event);
+
+      const [stored] = await repo.findAll();
+      expect(stored).toEqual(event);
+    });
+
+    it('findBySymbol filters to one symbol', async () => {
+      await repo.save(lotRebuildEventFixture('tqqq-event'));
+      await repo.save({ ...lotRebuildEventFixture('other-event'), symbol: 'SOXL' });
+
+      const forTqqq = await repo.findBySymbol('TQQQ');
+      expect(forTqqq).toHaveLength(1);
+      expect(forTqqq[0].detail).toBe('tqqq-event');
+    });
+
+    it('keeps events in insertion order', async () => {
+      await repo.save(lotRebuildEventFixture('first'));
+      await repo.save(lotRebuildEventFixture('second'));
+
+      expect((await repo.findAll()).map((e) => e.detail)).toEqual(['first', 'second']);
+    });
+
+    it('clear empties the store', async () => {
+      await repo.save(lotRebuildEventFixture('a'));
       await repo.clear();
 
       expect(await repo.findAll()).toEqual([]);

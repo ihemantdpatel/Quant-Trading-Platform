@@ -11,6 +11,7 @@ import {
   markHeld,
   markWorking,
   reArm,
+  releaseWithoutCycle,
   Rung,
   RungStatus,
   selectFireableRung,
@@ -289,6 +290,49 @@ describe('resting orders on a rung', () => {
     const working = [markWorking(createRung(95), 'co-1')];
 
     expect(selectFireableRung(working, 90, BAR)).toBeNull();
+  });
+});
+
+describe('releaseWithoutCycle', () => {
+  it('releases a HELD rung to PENDING when it has never cycled', () => {
+    const held = markHeld(createRung(95), 'lot-1');
+    const released = releaseWithoutCycle(held);
+
+    expect(released.status).toBe(RungStatus.PENDING);
+    expect(released.lotId).toBeNull();
+    expect(released.workingOrderId).toBeNull();
+    expect(isFireable(released)).toBe(true);
+  });
+
+  it('releases to RE_ARMED, not PENDING, when the rung had already cycled', () => {
+    const cycled = reArm(markHeld(createRung(95), 'lot-1'), EXIT_BAR);
+    const heldAgain = markHeld(cycled, 'lot-2');
+
+    const released = releaseWithoutCycle(heldAgain);
+
+    expect(released.status).toBe(RungStatus.RE_ARMED);
+    expect(isFireable(released)).toBe(true);
+  });
+
+  it('does not credit a cycle or stamp an exit — no real exit happened', () => {
+    // The distinction from `reArm`: this discards a lot the automatic rebuild
+    // path decided never really existed, and must not fabricate ladder
+    // history. `completedCycles`/`lastExitAt` must be exactly what they were
+    // before the release, not incremented or overwritten.
+    const held = markHeld(createRung(95), 'lot-1');
+    expect(held.completedCycles).toBe(0);
+    expect(held.lastExitAt).toBeNull();
+
+    const released = releaseWithoutCycle(held);
+    expect(released.completedCycles).toBe(0);
+    expect(released.lastExitAt).toBeNull();
+
+    const cycled = reArm(markHeld(createRung(95), 'lot-1'), EXIT_BAR);
+    const heldAgain = markHeld(cycled, 'lot-2');
+    const releasedAgain = releaseWithoutCycle(heldAgain);
+
+    expect(releasedAgain.completedCycles).toBe(1);
+    expect(releasedAgain.lastExitAt).toBe(EXIT_BAR);
   });
 });
 

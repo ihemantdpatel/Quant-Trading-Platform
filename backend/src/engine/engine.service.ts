@@ -319,6 +319,22 @@ export class EngineService {
    */
   private readonly workingOrders = new Map<string, WorkingOrder>();
 
+  /**
+   * Serializes fill processing per `clientOrderId`.
+   *
+   * `Fill` is documented as "one order can produce several" — IB can (and
+   * does) deliver one resting order's execution as multiple reports, and
+   * `broker.onFill` dispatches each synchronously to a `void`-called,
+   * unawaited `routeFill`. Two reports for the same order therefore both read
+   * `workingOrders.get(fill.clientOrderId)` before either has applied its
+   * update, race on the same stale snapshot, and the second finds a lot the
+   * first has already closed — surfacing as `EXIT_FILL_UNATTRIBUTED` even
+   * though both fills were genuine. Chaining each fill onto the previous
+   * promise for the same id forces strictly sequential processing without
+   * blocking unrelated orders.
+   */
+  private readonly fillQueues = new Map<string, Promise<void>>();
+
   constructor(
     private readonly replay: ReplayService,
     private readonly coordinator: CoordinatorService,
@@ -1097,6 +1113,22 @@ export class EngineService {
    * position the broker holds once.
    */
   private async routeFill(fill: Fill): Promise<void> {
+    // Chained rather than awaited directly by the caller (`onFill` calls this
+    // as `void this.routeFill(fill)`): queuing onto the previous promise for
+    // this id, rather than blocking the emitter, is what lets unrelated
+    // orders' fills keep processing concurrently while same-order fills queue.
+    const previous = this.fillQueues.get(fill.clientOrderId) ?? Promise.resolve();
+    const next = previous.then(() => this.dispatchFill(fill));
+
+    this.fillQueues.set(
+      fill.clientOrderId,
+      next.catch(() => undefined),
+    );
+
+    return next;
+  }
+
+  private async dispatchFill(fill: Fill): Promise<void> {
     const working =
       this.workingOrders.get(fill.clientOrderId) ??
       (await this.recoverWorkingOrder(fill.clientOrderId));
@@ -1118,7 +1150,12 @@ export class EngineService {
 
     await this.fills.save(fill);
 
-    const partial = fill.quantity < working.quantity;
+    // Compared against what remains outstanding on *this* order, not its
+    // original size — an order already reduced by an earlier execution report
+    // (see `fillQueues`) is fully covered by a later one smaller than the
+    // order started at, and must not be treated as partial again.
+    const outstandingBeforeThisFill = working.quantity;
+    const partial = fill.quantity < outstandingBeforeThisFill;
 
     // Cancel before touching the lot: if the cancel throws, the entry halt it
     // raises should happen while the ladder still reflects a working order,
@@ -1145,7 +1182,19 @@ export class EngineService {
       at: fill.timestamp,
     });
 
-    this.workingOrders.delete(fill.clientOrderId);
+    // A fill smaller than what is still outstanding does not necessarily mean
+    // the order is done: IB can (and does) split one order's fill across
+    // several execution reports. Reducing the tracked quantity — rather than
+    // deleting the entry — lets a later report for the same `clientOrderId`
+    // still find it and open a second lot for the rest, instead of falling
+    // through to `recoverWorkingOrder` (BUY-only, and blind by then anyway
+    // since a filled rung's `workingOrderId` is already cleared) and being
+    // silently dropped.
+    if (partial) {
+      working.quantity = outstandingBeforeThisFill - fill.quantity;
+    } else {
+      this.workingOrders.delete(fill.clientOrderId);
+    }
 
     await this.orders.updateStatus(
       fill.clientOrderId,
@@ -1154,7 +1203,7 @@ export class EngineService {
 
     this.logger.log(
       `rung ${working.rungPrice.toFixed(2)} filled ${fill.quantity}${
-        partial ? ` of ${working.quantity} (remainder cancelled)` : ''
+        partial ? ` of ${outstandingBeforeThisFill} (remainder cancelled)` : ''
       } @ ${fill.price.toFixed(2)} — lot ${lot.id} exits at ${lot.exitTarget.toFixed(2)}`,
     );
 
@@ -1206,6 +1255,8 @@ export class EngineService {
       return;
     }
 
+    const outstandingBeforeThisFill = working.quantity;
+
     const result = DipLadderStrategy.closeLotFromFill(state, {
       lotId: working.lotId,
       price: fill.price,
@@ -1213,7 +1264,19 @@ export class EngineService {
       at: fill.timestamp,
     });
 
-    this.workingOrders.delete(fill.clientOrderId);
+    // A split leaves real, still-held shares behind, and IB can (and does)
+    // deliver one order's fill as more than one execution report — so this
+    // clientOrderId is not necessarily done. Re-pointing at the remainder's
+    // fresh id, rather than deleting the entry, is what lets a later report
+    // for the same order find and close it instead of hitting a lot this path
+    // already closed and being reported as `EXIT_FILL_UNATTRIBUTED` for a
+    // fill that was in fact genuine.
+    if (result?.remainder) {
+      working.lotId = result.remainder.id;
+      working.quantity = result.remainder.quantity;
+    } else {
+      this.workingOrders.delete(fill.clientOrderId);
+    }
 
     await this.orders.updateStatus(
       fill.clientOrderId,
@@ -1239,7 +1302,7 @@ export class EngineService {
 
     this.logger.log(
       `lot ${result.closed.id} at rung ${working.rungPrice.toFixed(2)} sold ` +
-        `${fill.quantity}${partial ? ` of ${working.quantity} (remainder cancelled)` : ''} ` +
+        `${fill.quantity}${partial ? ` of ${outstandingBeforeThisFill} (remainder cancelled)` : ''} ` +
         `@ ${fill.price.toFixed(2)}` +
         (result.remainder
           ? ` — ${result.remainder.quantity} still held as ${result.remainder.id}`

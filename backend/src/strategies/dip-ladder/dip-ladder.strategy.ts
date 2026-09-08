@@ -25,7 +25,7 @@
  * fill-agnostic is what lets it stay pure — it has no broker to ask.
  */
 
-import { Bar } from '../../market-data/types';
+import { Bar, BarSize } from '../../market-data/types';
 import { isRegularSession } from '../../market-data/session';
 import { Strategy } from '../strategy.interface';
 import {
@@ -70,6 +70,30 @@ export interface DipLadderStateData extends Record<string, JsonValue> {
   runningClose: number | null;
   sessionOpen: number | null;
   sessionDate: string | null;
+  /** Running high/low of the session in progress. Folded into `dailyBars` when the session ends. */
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  /**
+   * Timestamp of the most recently processed bar. Read only at a session
+   * rollover, to date the daily bar synthesized for the session that just
+   * ended — `sessionDate` alone is a calendar date, not the ISO timestamp
+   * `Bar.timestamp` requires.
+   */
+  sessionCloseAt: string | null;
+  /**
+   * Daily OHLC bars this ladder has synthesized from its own sessions, oldest
+   * first, capped at `atrPeriod + 1`.
+   *
+   * This is the only source ATR spacing (`spacing.ts`) has: strategies perform
+   * no I/O and cannot fetch daily history themselves (`architecture.spec.ts`),
+   * so a session's open/high/low/close is folded in here as it completes
+   * rather than read from `BarRepository`. The consequence is a warm-up: after
+   * a cold start or a restart that lost this array, ATR has no history and
+   * `resolveSpacing` falls back to percentage spacing for up to `atrPeriod`
+   * sessions while it re-accumulates — the same documented fallback
+   * `spacing.spec.ts` already covers, not a new failure mode.
+   */
+  dailyBars: Bar[] & JsonValue;
 }
 
 /** Narrow read of the opaque state blob, with the ladder's own shape restored. */
@@ -108,6 +132,10 @@ export class DipLadderStrategy implements Strategy {
         runningClose: null,
         sessionOpen: null,
         sessionDate: null,
+        sessionHigh: null,
+        sessionLow: null,
+        sessionCloseAt: null,
+        dailyBars: [],
       } as unknown as Record<string, JsonValue>,
     };
   }
@@ -191,7 +219,7 @@ export class DipLadderStrategy implements Strategy {
       this.config,
       data.previousSessionClose,
       data.sessionOpen!,
-      [],
+      data.dailyBars,
     );
 
     if (decision.intent) {
@@ -211,6 +239,9 @@ export class DipLadderStrategy implements Strategy {
     }
 
     data.runningClose = bar.close;
+    // Held so a session rollover (in `trackSession`, on the *next* bar) can
+    // date the daily bar it synthesizes for the session this bar just closed.
+    data.sessionCloseAt = bar.timestamp;
 
     return intents;
   }
@@ -246,9 +277,43 @@ export class DipLadderStrategy implements Strategy {
     const date = sessionDateOf(bar.timestamp);
 
     if (date !== data.sessionDate) {
+      // Fold the session that just ended into the daily-bar history ATR
+      // spacing draws on, before its running scalars are reset below.
+      // `sessionDate`/`sessionOpen`/`sessionHigh`/`sessionLow` still hold the
+      // *previous* session's values at this point — that is what makes this
+      // the right place, mirroring how `previousSessionClose` is captured
+      // from `runningClose` on the same line below.
+      if (
+        data.sessionDate !== null &&
+        data.sessionOpen !== null &&
+        data.sessionHigh !== null &&
+        data.sessionLow !== null &&
+        data.runningClose !== null &&
+        data.sessionCloseAt !== null
+      ) {
+        const completedSession: Bar = {
+          symbol: this.config.symbol,
+          barSize: BarSize.DAILY,
+          timestamp: data.sessionCloseAt,
+          open: data.sessionOpen,
+          high: data.sessionHigh,
+          low: data.sessionLow,
+          close: data.runningClose,
+          volume: 0,
+        };
+
+        // Capped rather than left to grow unbounded — only the last
+        // `atrPeriod + 1` sessions are ever consulted (`computeAtr`).
+        data.dailyBars = [...data.dailyBars, completedSession].slice(
+          -(this.config.atrPeriod + 1),
+        ) as DipLadderStateData['dailyBars'];
+      }
+
       data.previousSessionClose = data.runningClose;
       data.sessionDate = date;
       data.sessionOpen = null;
+      data.sessionHigh = null;
+      data.sessionLow = null;
     }
 
     if (data.sessionOpen === null) {
@@ -258,6 +323,9 @@ export class DipLadderStrategy implements Strategy {
     if (isSessionOpenBar(bar.timestamp)) {
       data.sessionOpen = bar.open;
     }
+
+    data.sessionHigh = data.sessionHigh === null ? bar.high : Math.max(data.sessionHigh, bar.high);
+    data.sessionLow = data.sessionLow === null ? bar.low : Math.min(data.sessionLow, bar.low);
   }
 
   private positionView(data: DipLadderStateData): LadderPosition {
@@ -405,6 +473,16 @@ export class DipLadderStrategy implements Strategy {
         remainder,
         ...data.lots.slice(index + 1),
       ] as DipLadderStateData['lots'];
+
+      // The rung is still genuinely held — by the remainder, not by the id
+      // that just closed. Without repointing it here, the rung's `lotId`
+      // keeps naming the now-CLOSED sold portion forever, so the re-arm match
+      // in the full-close branch below (`rung.lotId === closed.id`) can never
+      // succeed once the remainder itself is eventually sold — the level
+      // would stay HELD, unable to cycle again, for the rest of the session.
+      data.rungs = data.rungs.map((rung) =>
+        rung.lotId === lot.id ? { ...rung, lotId: remainder.id } : rung,
+      ) as DipLadderStateData['rungs'];
 
       return { closed: sold, remainder };
     }

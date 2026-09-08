@@ -14,15 +14,21 @@
  * has passed the true fill prices are gone from the wire. The evidence that
  * survives is the `Order` row and the `WORKING` rung that placed it.
  *
- * ## Why this is a script and not a reconciliation path
+ * ## Relationship to `LotRebuildService`
  *
- * Reconciliation deliberately has **no repair path**, and that is load-bearing:
- * scaling lots, synthesizing one for a difference, or dropping the oldest are
- * all guesses at composition, and guessing wrong means selling the wrong lot at
- * the wrong target on a 3x ETF with no stop underneath (`PRD.md:347`). Making
- * this automatic would put exactly that guess on the startup path, where nobody
- * reads it. As a script it runs when an operator decides it applies, prints what
- * it would write, and writes only when told twice.
+ * `ReconciliationService` now runs this same reconstruction automatically
+ * (`../reconciliation/lot-rebuild.service.ts`, sharing this arithmetic via
+ * `lot-recovery-plan.ts`), and falls back to a synthetic blended-cost lot when
+ * an exact reconstruction isn't possible — a deliberate, explicitly reviewed
+ * reversal of this script's original reasoning (`docs/decisions/auto-lot-rebuild.md`
+ * has the tradeoffs). That automatic path is gated to `PAPER` only. This script
+ * remains the manual repair path for everything the automatic one can't or
+ * shouldn't reach unattended: a `LIVE` account, a mismatch stale enough that no
+ * order records survive to reconstruct from, or a symbol an operator wants to
+ * inspect before writing anything. It runs when an operator decides it applies,
+ * prints what it would write, and writes only when told twice — the automatic
+ * path's synthetic fallback has no equivalent pause, which is exactly why it is
+ * confined to `PAPER` for now.
  *
  * ## What it reconstructs, and how wrong it can be
  *
@@ -47,7 +53,14 @@
  */
 
 import { PrismaClient } from '@prisma/client';
-import { exitTargetFor } from '../strategies/dip-ladder/lot';
+import {
+  buildRecoveryPlan,
+  refuseReason,
+  ProposedLot,
+  RecoveryPlan,
+} from '../reconciliation/lot-recovery-plan';
+
+export { buildRecoveryPlan, refuseReason, ProposedLot, RecoveryPlan };
 
 export const RECOVER_LOTS_USAGE = `Usage: npm run recover:lots -- --symbol <SYMBOL> [options]
 
@@ -120,109 +133,6 @@ export function parseRecoverLotsArgs(argv: string[]): RecoverLotsArgs {
     takeProfitPercent,
     apply: argv.includes('--apply'),
   };
-}
-
-/** One lot the script proposes to write. */
-export interface ProposedLot {
-  id: string;
-  symbol: string;
-  rungPrice: number;
-  fillPrice: number;
-  quantity: number;
-  openedAt: string;
-  exitTarget: number;
-  clientOrderId: string;
-}
-
-export interface RecoveryPlan {
-  lots: ProposedLot[];
-  recoveredQuantity: number;
-  weightedFillPrice: number;
-  /** The lowest fill price — where the ladder's anchor will sit. */
-  firstEntryPrice: number;
-}
-
-/**
- * Builds the lots implied by a set of stranded orders.
- *
- * Pure, so the arithmetic that decides a live position's exit targets is
- * testable without a database.
- *
- * Orders are taken **oldest first** so `openedAt` and the generated ids follow
- * the sequence the ladder would itself have produced — FIFO disposal depends on
- * that ordering, and a reconstruction that shuffles it would sell lots in an
- * order the ladder never chose.
- */
-export function buildRecoveryPlan(
-  symbol: string,
-  orders: { clientOrderId: string; quantity: number; limitPrice: number; createdAt: string }[],
-  rungPriceOf: (clientOrderId: string) => number,
-  takeProfitPercent: number,
-): RecoveryPlan {
-  const ordered = [...orders].sort((a, b) =>
-    a.createdAt === b.createdAt
-      ? a.clientOrderId.localeCompare(b.clientOrderId)
-      : a.createdAt.localeCompare(b.createdAt),
-  );
-
-  const lots = ordered.map((order, index) => {
-    // The limit price is the fill price's upper bound, so the target errs high.
-    const fillPrice = order.limitPrice;
-
-    return {
-      // Matches the ladder's own `${symbol}-lot-${n}` convention, continuing
-      // from an empty ledger — the precondition this script enforces.
-      id: `${symbol}-lot-${index + 1}`,
-      symbol,
-      rungPrice: rungPriceOf(order.clientOrderId),
-      fillPrice,
-      quantity: order.quantity,
-      openedAt: order.createdAt,
-      exitTarget: exitTargetFor(fillPrice, takeProfitPercent),
-      clientOrderId: order.clientOrderId,
-    };
-  });
-
-  const recoveredQuantity = lots.reduce((sum, lot) => sum + lot.quantity, 0);
-  const notional = lots.reduce((sum, lot) => sum + lot.fillPrice * lot.quantity, 0);
-
-  return {
-    lots,
-    recoveredQuantity,
-    weightedFillPrice: recoveredQuantity === 0 ? 0 : notional / recoveredQuantity,
-    // The hard floor is measured from the first entry (`invalidation.ts:50`), so
-    // this must be populated or the -25% stop-adding rule silently disappears.
-    firstEntryPrice: lots.length === 0 ? 0 : Math.max(...lots.map((lot) => lot.fillPrice)),
-  };
-}
-
-/** Why a recovery was refused, or null when it may proceed. */
-export function refuseReason(
-  plan: RecoveryPlan,
-  brokerQuantity: number,
-  averageCost: number | null,
-): string | null {
-  if (plan.lots.length === 0) {
-    return 'no stranded BUY orders with a WORKING rung were found — nothing to recover';
-  }
-
-  if (plan.recoveredQuantity !== brokerQuantity) {
-    return (
-      `recovered orders sum to ${plan.recoveredQuantity} share(s) but the broker reports ` +
-      `${brokerQuantity} — ${Math.abs(brokerQuantity - plan.recoveredQuantity)} share(s) ` +
-      'cannot be attributed to any order, so lot composition is genuinely unknown'
-    );
-  }
-
-  if (averageCost !== null && plan.weightedFillPrice < averageCost - 0.005) {
-    return (
-      `weighted reconstruction ${plan.weightedFillPrice.toFixed(4)} is below the broker's ` +
-      `average cost ${averageCost.toFixed(4)} — a buy limit fills at or below its limit, so ` +
-      'this is impossible and the orders do not explain the position'
-    );
-  }
-
-  return null;
 }
 
 /* istanbul ignore next -- I/O wrapper; the decisions above are covered */

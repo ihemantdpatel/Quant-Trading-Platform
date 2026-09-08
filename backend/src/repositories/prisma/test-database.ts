@@ -108,6 +108,7 @@ export async function resetDatabase(prisma: PrismaClient = testClient()): Promis
   await prisma.lot.deleteMany();
   await prisma.rung.deleteMany();
   await prisma.riskEvent.deleteMany();
+  await prisma.lotRebuildEvent.deleteMany();
   await prisma.backtestResult.deleteMany();
   await prisma.backtestRun.deleteMany();
   await prisma.strategyStateSnapshot.deleteMany();

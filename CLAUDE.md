@@ -256,6 +256,24 @@ counterparts when set.
   anchor, so the ladder exhausts `maxConcurrentRungs` long before the floor is consulted. The rung
   count is the binding constraint now, not the floor. `live-geometry.spec.ts` pins this.
 
+**`SpacingMode.ATR` is a fully wired alternative, available but not the compiled default.**
+`spacing.ts` computes ATR-14 on daily bars the strategy synthesizes for itself from each session's
+OHLC (`DipLadderStateData.dailyBars` — strategies perform no I/O, so this is the only source ATR has);
+`LADDER_ATR_MULTIPLE` (1) and `LADDER_ATR_PERIOD` (14) in `strategies.module.ts` are populated
+alongside the fixed-dollar constants so switching `spacingMode` to `ATR` through the parameter editor
+works immediately, without a second edit. An earlier revision *did* default to `ATR` here and was
+reverted: the operator had already dialed in a tighter `FIXED_DOLLAR` geometry
+(`spacingDollars`/`takeProfitDollars` → 0.5) through the runtime editor, and defaulting the compiled
+`spacingMode` to `ATR` silently made that tuning inert, since `spacingMode` itself was never part of
+the edit. `takeProfitDollars` stays decoupled from ATR distance (unlike the fixed-dollar case, where
+it is set equal to `spacingDollars` deliberately) — a lot's target is frozen at fill while ATR spacing
+moves session to session, so exact alignment with "the rung above" is no longer achievable by
+construction. A symbol with fewer than `atrPeriod + 1` sessions of history — every symbol immediately
+after this shipped, and any symbol for `atrPeriod` sessions after a restart that lost `dailyBars` —
+falls back to `spacingPercent` (5%) rather than to the $1 rule, which is *wider*, not narrower. Not
+backtested (`fixed-dollar-comparison.spec.ts` compares percentage vs. fixed-dollar only) — revisit
+alongside the other geometry decisions before `LIVE`.
+
 **The backtest evidence argues against this geometry, and it was overridden deliberately.** Over the
 committed drawdown scenarios, $1 rungs fill the whole ladder within $5 of price and leave nothing to
 cycle: the 2020 crash-and-recovery scenario completes 4 cycles for **+$1,477** under 5% spacing and
@@ -287,17 +305,38 @@ The fixed-dollar geometry turned that from tolerable into acute. A $1 rung is ~1
 while an ordinary 2% TQQQ gap is ~$1.44 — wider than a rung — so the whole ladder can sit stranded
 above the market on exactly the down days it exists to work.
 
-`gapRebasePercent` re-bases the bootstrap anchor onto the session open past a threshold, putting
-rungs where the market can reach them.
+`gapRebasePercent` re-bases the anchor onto the market past a threshold, putting rungs where the
+market can reach them — `resolveAnchor` now applies the same threshold in **two regimes**, not one.
 
 - **It changes where levels sit, not how they are ordered.** Entries remain resting limit orders
   below the market; nothing here emits a market order. That matters because a lot has **no stop-loss
   underneath it** — a market order into a gapped-open 3x ETF book is a fill price the ladder must
   then hold until it reaches take-profit, however long that takes.
-- **Bootstrap only.** Progression takes precedence whenever anything is held, so a ladder holding
-  through a gap keeps extending below its own exposure rather than re-basing above it.
-- **One-directional.** A gap *up* already re-bases through the max rule; the threshold applies only
-  to gaps down, where the max rule is what strands the anchor.
+- **Bootstrap re-bases onto the session open; progression now re-bases too, but only downward,
+  past the same threshold, and only in `RESTING` placement.** The original reasoning still holds for
+  why progression cannot re-base *up* onto a session open while holding — it would place the next
+  rung above lots already held, breaking the invariant that the ladder descends. But a ladder that
+  grinds down over several sessions, rather than gapping on a single open, can strand the same way: a
+  re-armed or pending rung sits above a market that has moved on, `evaluateBar` deliberately refuses
+  to invent a *fresh* rung while one is already stranded there (to avoid chasing a single fast move),
+  and the anchor's one computed next level never changes — so nothing is ever proposed at a reachable
+  price until price rallies back to the stale rung, however long that takes. Once the gap from the
+  lowest held lot to the current bar's close passes `gapRebasePercent`, that is judged a genuine
+  multi-session drift rather than one print, and `ladder.ts`'s resting branch re-bases the anchor onto
+  that bar's close instead — but **only** from the branch that has already found every existing
+  fireable rung stranded above the market (`candidates.length > 0`); a fresh extension to a level the
+  ladder has never reached before never re-bases, or the very first descent past any ordinary
+  >1%-in-one-bar move would snap onto that bar's exact close instead of the next clean grid level,
+  chasing the market rather than waiting for it.
+- **Stale rungs are tried in descending order before any of this fires.** `fireableRungsDescending`
+  (the plural form of the old `highestFireableRung`) returns every fireable rung, not just the
+  highest; `evaluateBar` walks it top-down and places at the first one that is actually restable
+  (below the market). Only when *every* candidate is marketable does the gap-rebase check above run
+  at all — a lower re-armed or pending rung the market has already reached is exactly what the ladder
+  should fire at first, before treating the situation as stranded.
+- **One-directional.** A gap *up* already re-bases through the max rule (bootstrap) or is simply never
+  reached (progression re-bases down only); the threshold applies only to gaps down, where the max
+  rule or a stranded high rung is what strands the anchor.
 - **Default `null`, opted in at 1%** in `strategies.module.ts`, for the same reason as
   `orderPlacement` and `fixedQuantity`: `scenarios.spec.ts` pins the `gap-down-open` fixture's first
   rung at 95.00 under the plain max rule, and a default would silently invalidate it. 1% sits just
@@ -349,9 +388,13 @@ no lot but **must not fire again** — otherwise every bar stacks another order 
   placed and breach the limit the instant it filled, with no point at which the limit could
   intervene. Over-counting costs a declined rung; under-counting costs real exposure past the
   ceiling.
-- Rung selection differs by mode: `RESTING` uses `highestFireableRung`, which **ignores where price
-  is**. Requiring the bar to have reached the level would forfeit the intra-bar fill the resting
-  order exists to capture, and would strand a released rung whenever price sits above it.
+- Rung selection differs by mode: `RESTING` uses `fireableRungsDescending`, which **ignores where
+  price is**. Requiring the bar to have reached the level would forfeit the intra-bar fill the resting
+  order exists to capture, and would strand a released rung whenever price sits above it. It returns
+  every fireable rung highest-first (not just the top one, which `highestFireableRung` still exposes
+  as a thin wrapper for callers that only want a single candidate) so `evaluateBar` can fall through a
+  stale, marketable high rung to a lower one the market has actually reached, rather than declining
+  the whole bar — see "Gap re-basing" above for what happens when none of them are restable.
 
 **Ordering rules that are easy to get wrong, and were:**
 
@@ -368,6 +411,19 @@ no lot but **must not fire again** — otherwise every bar stacks another order 
   durable record, and the map is rebuilt by `adoptWorkingOrders` during reconciliation — a fill
   carries only broker vocabulary and nothing identifying which rung placed it, so the map is where
   `rungPrice` is kept between placement and fill.
+- **A resting order's fill can arrive as more than one execution report, and fill processing is
+  serialized per `clientOrderId` to keep that safe.** IB both splits one order's fill across several
+  reports *and* re-issues its execution replay on a timer (`StoqeyIbSocket.startExecutionsPoll`, every
+  60s — `reqExecutions` is a snapshot as of the call, not a standing subscription, so calling it only
+  once at `connect()` left a live fill unrouted for the rest of the connection). Two reports for the
+  same order dispatched through `broker.onFill` would otherwise both read `EngineService.workingOrders`
+  before either applied its update, race on the same stale snapshot, and the second find a lot the
+  first already closed — surfacing as a spurious unattributed-fill halt even though both fills were
+  genuine. `EngineService.fillQueues` chains each fill onto the previous promise for the same id,
+  forcing strictly sequential processing for one order while unrelated orders' fills keep processing
+  concurrently. Partial-fill detection compares against what remains **outstanding on this order**
+  (`working.quantity`, decremented rather than deleted on a partial) rather than the order's original
+  size, so a second report smaller than the order started at is not misread as a fresh partial.
 
 **On the exit side the same rules hold, keyed to the lot rather than the rung:**
 
@@ -407,13 +463,21 @@ no lot but **must not fire again** — otherwise every bar stacks another order 
 
 **Restart safety is the reason `getOpenOrders()` exists on `BrokerAdapter`.** An order placed before
 a restart is still live at IB afterwards, and nothing in the database can confirm that — only the
-broker knows. Reconciliation resolves the two directions of divergence:
+broker knows. Reconciliation resolves the two directions of divergence, on **both** sides now — a
+`WORKING` rung and a `HELD` lot's `workingOrderId` are checked against the broker's open orders the
+same way, one keyed by side (`reconcileOpenOrders` filters resting orders into BUY and SELL id sets):
 
-- **`WORKING` rung, no order at IB** — a DAY order expired overnight, or was cancelled in TWS.
-  Released to fireable, or the level is blocked forever and the ladder silently stops laddering.
-- **Order at IB, no `WORKING` rung** — the crash window: the order reached IB but the process died
-  before persisting. Adopted, or the next bar places a **second** order at the same price and both
-  fill.
+- **`WORKING` rung, or `HELD` lot, with no order at IB** — a DAY order expired overnight, or was
+  cancelled in TWS. The rung is released to fireable, or the level is blocked forever and the ladder
+  silently stops laddering. The lot's `workingOrderId` is cleared to `null`, or it can never again be
+  diagnosed as `missing` and `POST /orders/place-missing` can never rest a fresh exit for it — a held
+  lot left permanently unprotected once its exit is cancelled out of band. (A lot reaching this branch
+  has already survived `recoverExitFills`, below — its "gone" order is genuinely gone, not a fill this
+  system had on record and simply failed to route live.)
+- **A BUY order at IB, no `WORKING` rung** — the crash window: the order reached IB but the process
+  died before persisting. Adopted, or the next bar places a **second** order at the same price and
+  both fill. The SELL-side equivalent is adopted separately, by `EngineService.adoptWorkingOrders`
+  keying off the lot rather than a price.
 
 **Orders are never cancelled by reconciliation.** An order the engine cannot explain is reported,
 not destroyed — cancelling one an operator placed by hand would be the system overruling a human
@@ -528,6 +592,29 @@ changed.
   nothing about the halt, and leaving its ledger stale would hand the operator a second, unrelated
   discrepancy to resolve.
 
+**`OrderPollService` closes the same gap during a session, not just at its end.** Before it, nothing
+re-asked the broker about open orders between boot and the post-close job (or an operator's own
+`POST /reconcile`) — bar processing never calls `getOpenOrders()`, and everything else this engine
+learns about an order arrives through `onFill`, which only a genuine fill produces. An order edited in
+TWS without filling — resized, or cancelled — was invisible for up to a full session. The concrete risk
+that leaves open: `EngineService.routeFill` decides whether a fill is partial by comparing it to the
+in-memory `working.quantity`, refreshed only by `adoptWorkingOrders` (called from `reconcileOpenOrders`).
+A resting BUY resized upward in TWS that then fills partially against its *new* size would be misread
+as a full fill against the stale old size, skip cancelling the remainder, and leave shares resting at
+the broker with no rung tracking them.
+
+- Same shape as the post-close job — `reconcileOrders`, not `reconcileAll`; never halts; degrades to
+  "changed nothing" when the broker is unreachable; errors are caught, never rethrown — but on a plain
+  `setInterval` (five minutes) rather than a one-shot timer pinned to the close. There is no single
+  instant this is anchored to, so DST/weekend arithmetic does not apply, and running outside market
+  hours is harmless for the same reason the post-close job does not skip holidays.
+- **Started alongside the live feed and the post-close job, gated on the same condition** — IB bound
+  only. The mock broker has no session and no resting order that outlives one.
+- Shares `ReconciliationService.lastOrderReconciliation` (`GET /status`'s `orderReconciliation`) with
+  the post-close job — the field now reads as "the last order reconciliation, whichever job ran it,"
+  which is a more current answer to the question an operator is actually asking than "the post-close
+  job's last run" was.
+
 ### Checking, placing, and de-duplicating orders
 
 Three operator controls sit beside Reconcile on the dashboard, backed by
@@ -599,6 +686,20 @@ The editable set excludes `symbolCapital` and `symbol`, and lot/rung fields are 
 no request shape can retarget a filled rung. Every change is written append-only with old value, new
 value, timestamp, and the strategy state at the time.
 
+**A runtime edit now survives a restart.** `ParameterService.restore(strategyId)` runs once at boot,
+after `register()` and before any bar reaches the strategy — first in `EngineModule`'s startup chain,
+ahead of `restoreClientOrderSequence`, so an operator's tuning is back in force before a single bar can
+evaluate. Before this, `config` was rebuilt from compiled source constants on every boot and nothing
+read `ParameterChange` history back, so an edit reverted silently on restart — worse than cosmetic
+when a cap reverted below the number of lots currently held, blocking new entries with
+`MAX_RUNGS_HELD` until someone noticed and reapplied it. `restore` replays only the **latest** recorded
+value per editable field from the append-only log and re-validates the result through the same
+`buildDipLadderConfig` path `edit()` uses, so it can never produce a config a fresh boot would refuse.
+It deliberately does **not** append new `ParameterChange` rows — that would double the audit trail on
+every restart — and is non-fatal: a value that was valid when recorded but rejected by today's
+validation is logged and skipped, falling back to the compiled default for that field rather than
+blocking the whole engine from booting.
+
 ### Persistence and recovery
 
 `DATABASE_URL` is the **only** switch. Set → the Prisma repositories; unset → the in-memory ones and
@@ -650,12 +751,33 @@ with the exact lot structure. Anything else → halt the symbol.
 - Halts clear only via `POST /halts/:symbol/release`. `POST /engine/reset` deliberately does not.
 - An unreachable broker is `null`, not `[]` — "unknown" must halt where "flat" may reconcile.
 
-**`StrategyStateSnapshot` carries the anchor, and only the anchor.** Lots and rungs are restored from
-their own tables (authoritative on composition); the snapshot supplies `sessionOpen`,
-`previousSessionClose`, `firstEntryPrice`, `lotSequence`, `sessionDate`, `runningClose`, which live
-nowhere else. One authority per fact — do not restore lots from the snapshot's copy. Snapshots are
-append-per-save so a crash mid-write leaves the previous good one readable, and a `version` the
-running code does not recognize is **rejected**, never coerced.
+**`recoverExitFills` runs before the assertion, and it is evidence, not a guess.** A `HELD` lot whose
+resting exit already filled at the broker but was never routed live (the order reached IB, the process
+was down when the fill arrived, `routeFill` never saw it) is exactly the assertion's failure shape —
+the DB is missing an exit the broker already executed. It closes only when **both** hold: the lot's
+`workingOrderId` names an order that is no longer resting at the broker, and this system's own `Fill`
+table (populated only from a real IB `execDetails` event, never synthesized) holds fill(s) for that
+`clientOrderId` summing to **exactly** the lot's quantity. Nothing here infers a price or invents a
+quantity — both come from the real fill, the same data `closeLotFromFill` would have used live. Short
+of an exact match (no fill, or one that doesn't cover the whole lot — a genuine partial needs the live
+path's lot-splitting), the lot is left untouched exactly as before this existed. A `HELD` lot missing
+its own `Rung` row (which would otherwise leave that price level unable to re-arm) is backfilled the
+same way `ensureRungsForHeldLots` does below, run unconditionally on every reconciliation — not only
+after a mismatch, since the lot-sum can already be exactly right while this bookkeeping link is still
+missing. Both repairs read back facts this system already recorded; see "Automatic lot-sum rebuild"
+below for the one place reconciliation goes further than that.
+
+**`StrategyStateSnapshot` carries the anchor scalars, and only the anchor scalars.** Lots and rungs
+are restored from their own tables (authoritative on composition); the snapshot supplies
+`sessionOpen`, `previousSessionClose`, `firstEntryPrice`, `lotSequence`, `sessionDate`, `runningClose`,
+plus (added alongside ATR spacing's session tracking) `sessionHigh`, `sessionLow`, `sessionCloseAt`,
+and `dailyBars` — the synthesized daily-OHLC history `spacing.ts`'s ATR calculation is the only
+consumer of, since strategies cannot fetch it themselves. All of it lives nowhere else. One authority
+per fact — do not restore lots from the snapshot's copy. `dailyBars` restores leniently (type-checked,
+not deeply validated, defaulting to `[]`): a restart that loses it is not a failure, just the same
+"insufficient history" ATR warm-up a cold start already produces. Snapshots are append-per-save so a
+crash mid-write leaves the previous good one readable, and a `version` the running code does not
+recognize is **rejected**, never coerced.
 
 **The expected outcome of a restart has inverted.** Under `SHADOW` the database legitimately diverged
 from the broker — the ladder recorded intents that were never submitted — so a restart with a held
@@ -671,6 +793,64 @@ demand and after the close" for `POST /reconcile` and the post-close job.
 
 On Apple Silicon, Prisma's engines fail against MySQL with a misleading `sha256_password` error;
 run the CLI and `test:db` through a Linux container. `backend/prisma/README.md` has the commands.
+
+### Automatic lot-sum rebuild — the one place reconciliation is allowed to guess
+
+`docs/decisions/auto-lot-rebuild.md` is the decision record; this section is the summary. **Gated to
+`PAPER` only** — `ReconciliationService` reads `ExecutionMode` (injected via a factory in
+`EngineModule`, since Nest cannot resolve a bare enum value the way it resolves a class) and refuses
+to attempt anything otherwise, so a `LIVE` mismatch halts exactly as before this existed.
+
+**`LotRebuildService.attempt` runs only after `assertLotSum` has already failed**, from
+`reconcileSymbol`, and never on a clean symbol. `delta = brokerQuantity - sumHeldQuantity(persistedLots)`
+decides the direction:
+
+- **`delta > 0`** (broker reports more shares than our lots explain) — `addLots` tries **Tier 1**
+  first: an exact reconstruction from this ladder's own `Order`/`Rung` records (the same arithmetic
+  `recover-lots.ts` uses, shared via `lot-recovery-plan.ts` so the manual and automatic paths can never
+  silently drift apart), refused unless the reconstructed quantity matches `delta` exactly *and* its
+  weighted fill price is not below the broker's reported average cost. Only when Tier 1 refuses does
+  **Tier 2** synthesize a single lot at the broker's own blended `averageCost` — a real, reported fact,
+  just not attributed to a specific lot. Tier 2's cost is a **collapsed exit target**: every share in
+  the gap shares one blended target instead of its own per-lot one, which is a real loss of the
+  per-lot exit discipline this ladder is built around, but not an unbounded one — the lot still only
+  ever exits in profit and still cannot exceed the broker's own reported quantity.
+- **`delta < 0`** (our lots claim more than the broker reports) — `writeOff` closes the difference,
+  oldest lot first (`fifoQueue`), at each lot's **own `fillPrice`**, never a market price, so
+  `realizedPnl` from it is always exactly zero — a write-off, not a fabricated trade. Refuses entirely
+  if any lot it would touch has an unresolved (inexact) `Fill` on record for its exit order — evidence
+  of a real partial sale `recoverExitFills` didn't already close cleanly, which a cost-basis write-off
+  must not silently paper over.
+
+**Both directions bring the lot sum to exactly `brokerQuantity`, or refuse entirely — never partial
+application.** `assertLotSum` is re-run against the rebuild's own output exactly as it would be against
+any other candidate state; a rebuild that doesn't produce an exact match still halts, indistinguishable
+from a mismatch nothing was attempted for.
+
+- **A per-symbol, per-process frequency cap.** `rebuildsAppliedBySymbol` refuses a second automatic
+  rebuild for the same symbol within one process's lifetime and halts instead — added after the paper
+  soak surfaced a fill-routing race (fixed 2026-09-03, see "fill processing is serialized per
+  `clientOrderId`" above) where a *second* `LOT_SUM_MISMATCH` for the same symbol was itself the
+  upstream bug's symptom, and Tier 2 was quietly synthesizing a lot to paper over it each time —
+  including once with a collapsed target that authorized a loss-making sale against the real
+  underlying lot's actual fill price. One rebuild is the rare edge case Tier 2 was designed for; a
+  second is evidence of a live bug that must reach an operator, not another guess stacked on the last.
+- **Every application is audited to `LotRebuildEvent`** (new table, `PrismaLotRebuildEventRepository` /
+  `InMemoryLotRebuildEventRepository`): symbol, trigger code, which action fired, the broker's reported
+  quantity/average cost, the prior (suspect) lot quantity, and `resultingLots` **verbatim** — not a
+  summary, since an operator auditing this after the fact needs to see exactly what was written per
+  lot. Written after the lots/rungs themselves are persisted, so a failure writing the audit row never
+  loses the rebuild itself.
+- **A broker reporting a nonzero position with no usable average cost is skipped, not guessed at** —
+  Tier 2 would otherwise synthesize a lot at price zero, which reconciles the count while recording a
+  fill price that cannot be real.
+- Worth watching over the soak: `ReconciliationReport.rebuildsApplied` firing often is evidence of an
+  upstream bug the rebuild is quietly masking as "reconciliation resolved it," not the rare case this
+  was built for. `RebuildAction.ADD_TIER2_SYNTHETIC` frequency specifically is what the decision doc
+  says to check before `LIVE`.
+- **Mandatory revisit before `LIVE` (Story 15)**: whether Tier 2's collapsed-target tradeoff is still
+  acceptable with real money at stake, whether it should require explicit operator confirmation even
+  in `LIVE` testing, and whether a size cap belongs alongside the frequency cap.
 
 ### The IB adapter (Story 10)
 
@@ -735,6 +915,15 @@ all happen on cue, and none of them is reproducible against a live Gateway.
   **Reporting only — it deliberately does not halt**, because IB uses the same channel for benign
   notices and a halt that fires on those trains an operator to clear halts without reading them. The
   staleness watchdog remains the thing that acts.
+- **`reqExecutions` is a snapshot as of the call, not a standing subscription.** Calling it once, at
+  `connect()`, replays executions up to that moment and then pushes nothing further — a live fill went
+  unrouted for as long as the socket happened to stay connected (no lot opened, no order left
+  `SUBMITTED`) until the *next* reconnect's fresh call replayed it, which in production meant hours of
+  a silently drifting position and a `LOT_SUM_MISMATCH` the moment reconciliation next ran.
+  `startExecutionsPoll` re-issues it every 60s (`EXECUTIONS_POLL_MS`) for the life of the process,
+  unrelated to `PacingQueue` (which paces historical-data requests specifically). Safe while briefly
+  disconnected — the underlying client queues commands issued before a (re)connect and sends them once
+  it has — and safe against re-delivery, since `routeFill` dedupes on `fillId`.
 
 **The HTTP server must never wait on the broker.** `EngineModule.onModuleInit` runs *before*
 `app.listen()`, so `startup.run()` is deliberately **not awaited** — the live feed starts from its
@@ -785,7 +974,7 @@ the flag itself.
 | Halt | Scope | Exits allowed? | Clears by |
 |---|---|---|---|
 | `entryHalt` (`EngineService`) | whole engine | **yes** | operator, or self on resumed data |
-| `SymbolHaltService` | one symbol | no | operator only |
+| `SymbolHaltService` | one symbol | no | operator, except `HALT_BROKER_UNAVAILABLE` — see below |
 
 **`EntryHaltCode` decides which technical halts can self-clear**, and it exists precisely so that
 decision is structural rather than textual. The halt previously carried only English prose in
@@ -811,9 +1000,25 @@ connection change. A recovery without a socket event left the detector permanent
 than after: it describes the arrival, not the outcome, and a bar that throws in `processBar` still
 proves data is flowing.
 
-**Reconciliation halts stay operator-only, deliberately.** "The numbers disagree" is never
-self-resolving, and the existing refusal to guess at lot composition is what makes that right. Clear
-them with `POST /halts/:symbol/release` after resolving the account by hand.
+**Reconciliation halts stay operator-only, with one narrow exception.** "The numbers disagree" is
+never self-resolving, and the existing refusal to guess at lot composition is what makes that right —
+`LOT_SUM_MISMATCH` still clears only via `POST /halts/:symbol/release` after resolving the account by
+hand (or via the automatic rebuild above, gated to `PAPER`, which is evidence-based reconstruction, not
+a halt release on faith).
+
+**`BROKER_UNAVAILABLE` is different in kind, and now self-releases.**
+`ReconciliationService.onModuleInit` subscribes to the broker's connection health for the life of the
+process (the same standing-subscription pattern `EngineService` uses for `onFill`), and a `CONNECTED`
+event triggers `reconcileBrokerUnavailableHalts`. The reasoning this rests on: `BROKER_UNAVAILABLE`
+means "we never got to check," not "we checked and it disagrees" — the halt carries no evidence a
+mismatch exists, only that none could be ruled out. Once the broker answers, re-running the same
+lot-sum assertion `reconcileAll` would use either confirms the position was fine all along (safe to
+resume — the state *was* checked) or reveals a genuine divergence, in which case this method changes
+nothing: it only ever **releases**, never halts or clears a `LOT_SUM_MISMATCH`, and a symbol not
+currently halted for `BROKER_UNAVAILABLE` specifically is skipped. `autoReleaseInFlight` guards a burst
+of `CONNECTED` events (a reconnect can report more than one) from starting overlapping runs. Also
+reachable directly, not only from the connection-change handler, so a test can trigger the same check
+without a real reconnect.
 
 ### Historical cache: IB is called only for gaps
 

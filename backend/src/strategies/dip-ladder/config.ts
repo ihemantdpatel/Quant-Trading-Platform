@@ -122,19 +122,33 @@ export interface DipLadderConfig {
    */
   orderPlacement: OrderPlacement;
   /**
-   * Fractional gap-down size beyond which the bootstrap anchor re-bases onto
-   * today's open instead of the previous close. 0.01 = 1%.
+   * Fractional gap-down size beyond which the anchor re-bases onto the market
+   * instead of holding at its usual reference. 0.01 = 1%.
    *
-   * `null` — the default — leaves the plain `max(previousClose, open)` rule in
-   * force, so every committed fixture keeps the rung prices its expected
-   * intents were computed under. Opted into in `strategies.module.ts`, the same
-   * way `orderPlacement` and `fixedQuantity` are, and for the same reason.
+   * `null` — the default — leaves the plain `max(previousClose, open)` bootstrap
+   * rule (and unconditional progression off the lowest held lot) in force, so
+   * every committed fixture keeps the rung prices its expected intents were
+   * computed under. Opted into in `strategies.module.ts`, the same way
+   * `orderPlacement` and `fixedQuantity` are, and for the same reason.
    *
-   * The problem it solves is specific to RESTING placement: an anchor left at
-   * the previous close puts the first rung above a gapped-down market, where
-   * `isRestable` refuses to place it, so the ladder does nothing for as long as
-   * the gap holds. See `bootstrapAnchor` for why erring toward the open is the
-   * safe direction — the entry is still a limit order resting below the market.
+   * **Two regimes, one threshold** (`resolveAnchor`):
+   *
+   * - **Bootstrap** (flat): re-bases onto today's open instead of the previous
+   *   close. The problem it solves is specific to RESTING placement: an anchor
+   *   left at the previous close puts the first rung above a gapped-down
+   *   market, where `isRestable` refuses to place it, so the ladder does
+   *   nothing for as long as the gap holds. See `bootstrapAnchor` for why
+   *   erring toward the open is the safe direction — the entry is still a
+   *   limit order resting below the market.
+   * - **Progression** (holding): re-bases onto the current bar's close instead
+   *   of the lowest held lot, but only past this same threshold. Without it, a
+   *   ladder that grinds down over several sessions — rather than gapping on a
+   *   single open — can strand indefinitely: `evaluateBar`'s resting branch
+   *   deliberately refuses to invent a fresh rung while an existing one sits
+   *   stranded above the market (chasing a single fast move), so if that one
+   *   stranded rung is the anchor's only computed next level, nothing ever
+   *   replaces it until price rallies back. Past the gap threshold that is no
+   *   longer "one print", and the anchor follows the market down instead.
    */
   gapRebasePercent: number | null;
   /** Fraction of symbol capital per rung. 0.25 = 25%. */

@@ -170,6 +170,61 @@ describe('anchor', () => {
     });
   });
 
+  /**
+   * `resolveAnchor`'s `currentClose` parameter — the same threshold applied to
+   * a held ladder, so a ladder that grinds down over several sessions (rather
+   * than gapping on a single open) is not stranded indefinitely behind its own
+   * stale rungs. See the `gapRebasePercent` doc on `DipLadderConfig`.
+   *
+   * Unlike the bootstrap case, this only ever moves the anchor *down* — past a
+   * close that has fallen below the lowest held lot — so it can never place a
+   * rung above exposure the ladder already carries.
+   */
+  describe('progression — gap re-basing', () => {
+    const rebasing = buildDipLadderConfig('TQQQ', { gapRebasePercent: 0.01 });
+
+    it('re-bases onto the current close once it has fallen past the threshold', () => {
+      // Lowest held at 72.13, close at 69.90: a 3.1% move, past the 1% threshold.
+      expect(resolveAnchor([lot(72.13)], null, 72.13, rebasing, 69.9)).toEqual({
+        price: 69.9,
+        basis: AnchorBasis.PROGRESSION,
+      });
+    });
+
+    it('leaves the anchor at the lowest held lot for a move inside the threshold', () => {
+      // 0.5% down from 72.13 — ordinary drift, not a gap.
+      expect(resolveAnchor([lot(72.13)], null, 72.13, rebasing, 71.77)).toEqual({
+        price: 72.13,
+        basis: AnchorBasis.PROGRESSION,
+      });
+    });
+
+    it('never re-bases upward — a close above the lowest held lot is not a gap down', () => {
+      expect(resolveAnchor([lot(72.13)], null, 72.13, rebasing, 75)).toEqual({
+        price: 72.13,
+        basis: AnchorBasis.PROGRESSION,
+      });
+    });
+
+    it('requires an explicit currentClose — a caller that omits it keeps the un-rebased anchor', () => {
+      // A caller with no bar in scope must not be opted into re-basing just by
+      // passing a config with `gapRebasePercent` set.
+      expect(resolveAnchor([lot(72.13)], null, 72.13, rebasing)).toEqual({
+        price: 72.13,
+        basis: AnchorBasis.PROGRESSION,
+      });
+    });
+
+    it('does nothing when gapRebasePercent is unset, even past a large move', () => {
+      const off = buildDipLadderConfig('TQQQ');
+
+      expect(resolveAnchor([lot(72.13)], null, 72.13, off, 60)).toEqual({
+        price: 72.13,
+        basis: AnchorBasis.PROGRESSION,
+      });
+    });
+  });
+
   describe('progression — position held', () => {
     it('anchors on the lowest held lot', () => {
       expect(lowestHeldLotPrice([lot(95), lot(90.25), lot(100)])).toBe(90.25);

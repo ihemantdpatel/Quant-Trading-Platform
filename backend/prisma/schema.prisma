@@ -267,6 +267,34 @@ model RiskEvent {
   @@index([timestamp], name: "risk_event_time")
 }
 
+/// One row per automatic lot-sum/state-version rebuild — the audit trail for
+/// the one place reconciliation is now permitted to guess at (or write off)
+/// lot composition instead of halting a symbol for an operator. See
+/// `docs/decisions/auto-lot-rebuild.md` for why this exists and what it does
+/// not cover (it is gated to PAPER; a LIVE mismatch still halts).
+model LotRebuildEvent {
+  id                BigInt  @id @default(autoincrement())
+  symbol            String  @db.VarChar(32)
+  strategyId        String  @db.VarChar(128)
+  /// LOT_SUM_MISMATCH or STATE_VERSION_MISMATCH — the condition that triggered it.
+  triggerCode       String  @db.VarChar(32)
+  /// ADD_TIER1_RECONSTRUCTED | ADD_TIER2_SYNTHETIC | WRITE_OFF.
+  action            String  @db.VarChar(32)
+  brokerQuantity    Int
+  brokerAverageCost Decimal @db.Decimal(18, 6)
+  /// Held-lot quantity the DB showed before the rebuild — the suspect figure.
+  priorLotQuantity  Int
+  /// The full lot set the rebuild wrote, verbatim. Not a summary: an operator
+  /// auditing this after the fact needs to see exactly what was written, per
+  /// lot, not a rolled-up total.
+  resultingLots     Json
+  detail            String  @db.Text
+  timestamp         String  @db.VarChar(32)
+
+  @@index([timestamp], name: "lot_rebuild_event_time")
+  @@index([symbol], name: "lot_rebuild_event_symbol")
+}
+
 /// **Append-only** (`PRD.md:392`).
 ///
 /// The interface offers no `update` and no `deleteOne`, but an interface is not

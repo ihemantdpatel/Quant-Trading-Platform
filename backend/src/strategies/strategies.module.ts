@@ -80,8 +80,9 @@ export const LADDER_SPACING_DOLLARS = 1;
 export const LADDER_FIXED_QUANTITY = 50;
 
 /**
- * The gap-down size past which the bootstrap anchor re-bases onto the session
- * open — 1% of the previous close.
+ * The gap-down size past which the anchor re-bases onto the market — 1% of the
+ * reference it is measured against (previous close while flat, the lowest held
+ * lot while holding — see `resolveAnchor`).
  *
  * Without this the anchor stays at the previous close on a gap-down open, which
  * under RESTING placement means the first rung sits *above* the market;
@@ -91,6 +92,17 @@ export const LADDER_FIXED_QUANTITY = 50;
  * not tolerable at `LADDER_SPACING_DOLLARS` of $1: a routine 2% TQQQ gap is
  * ~$1.44 — more than a full rung — so the whole ladder is stranded above the
  * market on exactly the down days it exists to work.
+ *
+ * **The same threshold also governs a *held* ladder, not just a flat one.**
+ * At the tighter `spacingDollars` an operator can dial in through the
+ * parameter editor (see the `restore` note on `ParameterService`), a ladder
+ * that grinds down gradually — several sessions of re-armed/pending rungs
+ * accumulating above a market that has since moved on, never a single
+ * gapped-down open — can strand the same way: the anchor's one computed next
+ * level already exists in the ledger and sits above the market, and
+ * `evaluateBar` deliberately refuses to invent a fresh one in its place
+ * (chasing a single move). Past this threshold that is judged a genuine gap
+ * rather than one print, and the anchor follows the market down instead.
  *
  * **1% is chosen to sit just above the spacing, not tuned.** A $1 rung is ~1.4%
  * at a $72 price, so the threshold fires roughly when a gap has consumed a
@@ -104,6 +116,67 @@ export const LADDER_FIXED_QUANTITY = 50;
  * backtest evidence before `LIVE`.
  */
 export const LADDER_GAP_REBASE_PERCENT = 0.01;
+
+/**
+ * Rung spacing as a multiple of ATR-14 — an *available* alternative to the
+ * flat `LADDER_SPACING_DOLLARS`, not the compiled default.
+ *
+ * `LADDER_SPACING_DOLLARS` of $1 is a *static* distance: the same on a quiet
+ * day and a 5%-range day. The backtest note on that constant already records
+ * the cost — the ladder fills all `maxConcurrentRungs` within $5 of price and
+ * sits fully extended 94.9% of the time in the 2020 crash scenario, with
+ * nothing left to cycle. ATR spacing (`spacing.ts`, implemented since Story 3
+ * but never selected by default here) makes the distance track recent daily
+ * true range instead: narrower on calm days, so more rungs are within reach
+ * and more cycles complete; wider on volatile days, so the ladder does not
+ * exhaust itself on the first real move — the same failure mode the
+ * fixed-dollar note documents.
+ *
+ * **Not selected by default deliberately.** An earlier revision of this file
+ * did select `SpacingMode.ATR` here, on the theory that the fixed-dollar
+ * geometry's rigidity was the whole problem. It was reverted: the operator
+ * had already expressed a concrete, tighter `FIXED_DOLLAR` geometry through
+ * the runtime parameter editor (`spacingDollars`/`takeProfitDollars` → 0.5),
+ * and defaulting `spacingMode` to `ATR` here silently made that tuning inert
+ * — `spacingMode` itself was never part of the edit, so
+ * `ParameterService.restore` had nothing to restore it from, and it fell
+ * through to whatever this factory compiled to. `atrMultiple`/`atrPeriod`
+ * stay populated below anyway, so switching `spacingMode` to `ATR` through
+ * the dashboard — now durable across a restart — works immediately without a
+ * second edit.
+ *
+ * **`atrMultiple` is chosen, not derived.** A multiple of 1 spaces each rung a
+ * full day's average true range apart — close to how wide the ladder already
+ * sits at the top of a normal-volatility day under the old $1 rule, but
+ * shrinking automatically in quieter regimes rather than staying fixed. Like
+ * `LADDER_SPACING_DOLLARS` before it, this is an operator choice sized to be
+ * safe, not backtested — `fixed-dollar-comparison.spec.ts` compares
+ * percentage vs. fixed-dollar spacing but not ATR, so there is no committed
+ * evidence for this multiple yet. Revisit alongside the other geometry
+ * decisions before `LIVE`.
+ *
+ * **`takeProfitDollars` stays fixed at `LADDER_SPACING_DOLLARS`, decoupled
+ * from this.** The fixed-dollar note above explains why the two were set
+ * equal — so a lot's target lands exactly on the rung above it. ATR distance
+ * moves session to session while a lot's target is frozen at fill
+ * (`PRD.md:386`), so exact alignment is no longer achievable by construction;
+ * decoupling accepts a lot's exit occasionally landing short of or past the
+ * rung above it, in exchange for entries that adapt to the market they are
+ * actually being placed into.
+ *
+ * **Warm-up**: a symbol with fewer than `atrPeriod + 1` sessions of history —
+ * every symbol immediately after this change ships, and any symbol for
+ * `atrPeriod` sessions after a restart that lost `dailyBars` — has no ATR yet,
+ * and `resolveSpacing` falls back to `spacingPercent` (5%, ~$3.60 on a $72
+ * TQQQ) rather than to `LADDER_SPACING_DOLLARS`. That is wider than the old
+ * $1 rule, not narrower — the ladder will look *less* active than before for
+ * the first ~14 live sessions after this deploys, then tighten or widen with
+ * realized volatility once it has history to draw on.
+ */
+export const LADDER_ATR_MULTIPLE = 1;
+
+/** Lookback for the ATR calculation, in daily bars. See `LADDER_ATR_MULTIPLE`. */
+export const LADDER_ATR_PERIOD = 14;
 
 /**
  * The capital the ladder sizes rungs from.
@@ -148,8 +221,23 @@ export function ladderCapital(_mode: ExecutionMode, symbol: string): number | nu
           // committed fixture keeps testing the percentage rule its expected
           // intents were computed under — the same reason `orderPlacement`
           // is selected here and not defaulted.
+          //
+          // **`FIXED_DOLLAR` stays the compiled default, not `ATR`.** ATR
+          // spacing (`LADDER_ATR_MULTIPLE`) is fully wired and available —
+          // `spacingMode` is runtime-editable, and `ParameterService.restore`
+          // now makes that edit durable across a restart — but it is not
+          // selected *here* by default. The operator's own runtime tuning
+          // (`spacingDollars`/`takeProfitDollars` → 0.5 via the parameter
+          // editor) already expresses the intended geometry for `FIXED_DOLLAR`
+          // mode; defaulting the compiled `spacingMode` to `ATR` made that
+          // tuning inert without changing `spacingMode` itself, since nothing
+          // had asked for `spacingMode` to change. `atrMultiple`/`atrPeriod`
+          // stay populated below so switching `spacingMode` to `ATR` — via the
+          // dashboard, durably — works immediately without a second edit.
           spacingMode: SpacingMode.FIXED_DOLLAR,
           spacingDollars: LADDER_SPACING_DOLLARS,
+          atrMultiple: LADDER_ATR_MULTIPLE,
+          atrPeriod: LADDER_ATR_PERIOD,
           takeProfitDollars: LADDER_SPACING_DOLLARS,
           fixedQuantity: LADDER_FIXED_QUANTITY,
           // **Re-base the anchor on a gap down.** Opt-in here rather than in

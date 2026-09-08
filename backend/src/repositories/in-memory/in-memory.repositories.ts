@@ -30,6 +30,8 @@ import {
   BacktestRunRecord,
   BarRepository,
   FillRepository,
+  LotRebuildEventRecord,
+  LotRebuildEventRepository,
   LotRepository,
   OrderIntentRecord,
   OrderIntentRepository,
@@ -357,6 +359,27 @@ export class InMemoryRiskEventRepository implements RiskEventRepository, RiskEve
 
   async findAll(): Promise<RiskEvent[]> {
     return copy(this.events);
+  }
+
+  async clear(): Promise<void> {
+    this.events.length = 0;
+  }
+}
+
+@Injectable()
+export class InMemoryLotRebuildEventRepository implements LotRebuildEventRepository {
+  private readonly events: LotRebuildEventRecord[] = [];
+
+  async save(event: LotRebuildEventRecord): Promise<void> {
+    this.events.push(copy(event));
+  }
+
+  async findAll(): Promise<LotRebuildEventRecord[]> {
+    return copy(this.events);
+  }
+
+  async findBySymbol(symbol: string): Promise<LotRebuildEventRecord[]> {
+    return copy(this.events.filter((event) => event.symbol === symbol));
   }
 
   async clear(): Promise<void> {

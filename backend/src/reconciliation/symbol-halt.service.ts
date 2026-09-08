@@ -85,6 +85,18 @@ export class SymbolHaltService {
   }
 
   /**
+   * Halted symbols whose halt carries the given `code`.
+   *
+   * Exists for `ReconciliationService`'s automatic re-check of
+   * `BROKER_UNAVAILABLE` halts, which must touch only that one code — a
+   * symbol halted for `LOT_SUM_MISMATCH` is a genuine finding and must not be
+   * swept up by a filter this loose.
+   */
+  haltedSymbolsWithCode(code: string): string[] {
+    return [...this.halts.values()].filter((halt) => halt.code === code).map((halt) => halt.symbol);
+  }
+
+  /**
    * Operator action: clears a halt after manual resolution.
    *
    * Returns false for a symbol that was not halted, so an HTTP caller can

@@ -22,6 +22,7 @@ import {
   runBacktestRepositoryContract,
   runBarRepositoryContract,
   runFillRepositoryContract,
+  runLotRebuildEventRepositoryContract,
   runLotRepositoryContract,
   runOrderIntentRepositoryContract,
   runOrderRepositoryContract,
@@ -35,6 +36,7 @@ import {
   PrismaBacktestRepository,
   PrismaBarRepository,
   PrismaFillRepository,
+  PrismaLotRebuildEventRepository,
   PrismaLotRepository,
   PrismaOrderIntentRepository,
   PrismaOrderRepository,
@@ -101,6 +103,11 @@ describeWithDatabase('Prisma repositories', () => {
   runRiskEventRepositoryContract(async () => {
     await resetDatabase(prisma);
     return new PrismaRiskEventRepository(asService(prisma));
+  });
+
+  runLotRebuildEventRepositoryContract(async () => {
+    await resetDatabase(prisma);
+    return new PrismaLotRebuildEventRepository(asService(prisma));
   });
 
   runParameterChangeRepositoryContract(

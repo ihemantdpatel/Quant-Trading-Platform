@@ -343,6 +343,108 @@ describe('evaluateBar', () => {
       expect(decision.blocked?.kind).toBe('ABOVE_RUNG');
     });
 
+    /**
+     * A gap down can leave several re-armed/pending rungs stranded above the
+     * market at once. The highest fireable candidate is still marketable —
+     * `isRestable` still refuses it — but a lower one the gap has reached
+     * should fire rather than the bar producing nothing at all.
+     */
+    it('falls through to a lower fireable rung when the highest is marketable', () => {
+      const stranded: LadderPosition = {
+        rungs: [
+          { price: 71.63, lotId: null, lastExitAt: null },
+          { price: 71.13, lotId: null, lastExitAt: null },
+          { price: 68.05, lotId: null, lastExitAt: null },
+        ],
+        heldLots: [],
+        firstEntryPrice: 71.63,
+      };
+
+      const decision = evaluateBar(bar(69.95), stranded, resting, 100, 100);
+
+      expect(decision.intent?.limitPrice).toBe(68.05);
+    });
+
+    it('declines the whole bar when every fireable rung is marketable', () => {
+      const stranded: LadderPosition = {
+        rungs: [
+          { price: 71.63, lotId: null, lastExitAt: null },
+          { price: 71.13, lotId: null, lastExitAt: null },
+        ],
+        heldLots: [],
+        firstEntryPrice: 71.63,
+      };
+
+      const decision = evaluateBar(bar(71.05), stranded, resting, 100, 100);
+
+      expect(decision.intent).toBeNull();
+      expect(decision.blocked?.kind).toBe('ABOVE_RUNG');
+    });
+
+    /**
+     * The gap-rebase counterpart to the two tests above: a *held* ladder can
+     * strand the same way over several sessions of grinding decline rather
+     * than a single gapped-down open. Once the gap from the anchor (the
+     * lowest held lot) to the market clears `gapRebasePercent`, the ladder
+     * re-bases instead of waiting indefinitely behind a rung that will not be
+     * seen again until price rallies back to it. Reproduces the live TQQQ
+     * shape: lowest held 72.13, three stranded re-armed/pending rungs above a
+     * market that has since moved on.
+     */
+    it("re-bases past a held ladder's own stranded rungs once the gap clears the threshold", () => {
+      const rebasing = buildDipLadderConfig('TQQQ', {
+        symbolCapital: 10_000,
+        orderPlacement: OrderPlacement.RESTING,
+        spacingMode: SpacingMode.FIXED_DOLLAR,
+        spacingDollars: 0.5,
+        fixedQuantity: 50,
+        gapRebasePercent: 0.01,
+      });
+
+      const stranded: LadderPosition = {
+        rungs: [
+          { price: 71.63, lotId: null, lastExitAt: null },
+          { price: 71.13, lotId: null, lastExitAt: null },
+          { price: 70.63, lotId: null, lastExitAt: null },
+        ],
+        heldLots: [lot(72.13)],
+        firstEntryPrice: 73.91,
+      };
+
+      const decision = evaluateBar(bar(69.9), stranded, rebasing, 100, 100);
+
+      // 3.1% below the 72.13 anchor clears the 1% threshold: the anchor
+      // follows the close, and the next rung lands one spacing unit below
+      // *it* — 69.40 — rather than staying pinned below 72.13, where the
+      // next level (71.63) already exists and is stranded.
+      expect(decision.intent?.limitPrice).toBe(69.4);
+    });
+
+    it('does not re-base a held ladder for an ordinary move inside the gap threshold', () => {
+      const rebasing = buildDipLadderConfig('TQQQ', {
+        symbolCapital: 10_000,
+        orderPlacement: OrderPlacement.RESTING,
+        spacingMode: SpacingMode.FIXED_DOLLAR,
+        spacingDollars: 0.5,
+        fixedQuantity: 50,
+        gapRebasePercent: 0.01,
+      });
+
+      const stranded: LadderPosition = {
+        rungs: [{ price: 71.63, lotId: null, lastExitAt: null }],
+        heldLots: [lot(72.13)],
+        firstEntryPrice: 73.91,
+      };
+
+      // 0.87% below the anchor — inside the 1% threshold, so this is
+      // ordinary drift, not a gap. The rung stays stranded and the bar
+      // declines rather than re-basing.
+      const decision = evaluateBar(bar(71.5), stranded, rebasing, 100, 100);
+
+      expect(decision.intent).toBeNull();
+      expect(decision.blocked?.kind).toBe('ABOVE_RUNG');
+    });
+
     it('declines a rung sitting exactly at the close', () => {
       // A limit equal to the close is marketable too, and a level the market is
       // already sitting on is not a dip.
@@ -454,11 +556,32 @@ describe('evaluateBar', () => {
       expect(decision.intent?.limitPrice).toBe(71);
     });
 
-    it('does not re-base while a lot is held', () => {
-      // Progression anchors on the held lot at 71.00, so the next rung is
-      // 70.00 — below existing exposure, regardless of the gap.
+    it('does not re-base a fresh extension below a held lot, even past the gap threshold', () => {
+      // Held at 71.00, close at 69.95: a 1.48% move past the 1% threshold —
+      // but nothing is stranded here (no existing rung at 70.00 the market
+      // has walked away from), so this is a genuinely fresh extension, not
+      // the "grinds down over several sessions" case gap re-basing exists
+      // for. The anchor stays at the held lot and the next rung is the plain
+      // 70.00, one spacing unit below it — re-basing a fresh extension onto
+      // whatever a single bar happened to close at would be chasing the
+      // market, not waiting for it. See the "stranded rungs" tests above for
+      // the case this *does* fire in.
       const decision = evaluateBar(
         bar(69.95),
+        position([71]),
+        rebasing,
+        PREVIOUS_CLOSE,
+        GAPPED_OPEN,
+      );
+
+      expect(decision.rungPrice).toBe(70);
+    });
+
+    it("leaves a held lot's anchor alone for a move inside the gap threshold", () => {
+      // Held at 71.00, close at 70.40: a 0.85% move — ordinary drift, not a
+      // gap. The anchor stays at the held lot and the next rung is 70.00.
+      const decision = evaluateBar(
+        bar(70.4),
         position([71]),
         rebasing,
         PREVIOUS_CLOSE,
