@@ -128,6 +128,45 @@ function roundToCents(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+/**
+ * Minimum price separation IB enforces between two resting orders on the same
+ * symbol/side — a second one placed closer than this is rejected outright
+ * ("must be $0.50 in gap"). A fixed broker rule, not a strategy tuning knob,
+ * so it lives as a constant here rather than a `DipLadderConfig` field.
+ */
+export const MIN_RESTING_ORDER_GAP_DOLLARS = 0.5;
+
+/**
+ * True when a resting BUY at `price` would land within
+ * `MIN_RESTING_ORDER_GAP_DOLLARS` of another rung already `WORKING` at the
+ * broker.
+ *
+ * Rungs re-arm at their original price and never expire, so distinct anchor
+ * generations — a session bootstrap, a gap re-base onto a bar's exact close —
+ * can leave working orders sitting a few cents apart on grids that never
+ * aligned with each other. IB rejects the second submission; this catches the
+ * collision before submission so the rung declines cleanly instead of
+ * retrying the same rejected price every bar.
+ */
+export function conflictsWithWorkingRung<
+  T extends { price: number; lotId: string | null; workingOrderId?: string | null },
+>(rungs: T[], price: number, minGapDollars: number = MIN_RESTING_ORDER_GAP_DOLLARS): boolean {
+  const target = roundToCents(price);
+
+  return rungs.some((rung) => {
+    if (rung.lotId !== null || !rung.workingOrderId) {
+      return false;
+    }
+
+    const workingPrice = roundToCents(rung.price);
+    // A WORKING rung at the exact target price cannot occur here in practice
+    // — the caller would already have treated it as RUNG_HELD or excluded it
+    // from the fireable set — but the exclusion is cheap insurance against a
+    // false positive if that ever changes.
+    return workingPrice !== target && Math.abs(workingPrice - target) < minGapDollars;
+  });
+}
+
 /** Marks a rung as holding a lot. Non-mutating. */
 export function markHeld(rung: Rung, lotId: string): Rung {
   // Clears any resting order id: the order that filled is no longer working,

@@ -48,6 +48,8 @@ import {
   OrderRecord,
   OrderRepository,
   ParameterChangeRepository,
+  PerSymbolLimitChange,
+  PerSymbolLimitChangeRepository,
   RiskEventRepository,
   RungRepository,
   StrategyStateSnapshotRecord,
@@ -832,6 +834,72 @@ export class PrismaParameterChangeRepository implements ParameterChangeRepositor
   async clear(): Promise<void> {
     // Intentionally empty — see above.
   }
+}
+
+/**
+ * The audit trail for `RiskConfig.perSymbolLimits` edits — see
+ * `PerSymbolLimitChangeRepository` for why this is a separate table from
+ * `ParameterChange` rather than a differently-keyed row in it.
+ *
+ * `clear` is a no-op for the same reason `PrismaParameterChangeRepository`'s
+ * is: the append-only trigger would reject the DELETE, and this table is an
+ * audit trail that must survive `POST /engine/reset` regardless.
+ */
+@Injectable()
+export class PrismaPerSymbolLimitChangeRepository implements PerSymbolLimitChangeRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async append(change: PerSymbolLimitChange): Promise<void> {
+    await this.prisma.perSymbolLimitChange.create({
+      data: {
+        id: change.id,
+        symbol: change.symbol,
+        oldValue: toDecimalOrNull(change.oldValue),
+        newValue: toDecimal(change.newValue),
+        timestamp: change.timestamp,
+        reason: change.reason,
+      },
+    });
+  }
+
+  async findAll(): Promise<PerSymbolLimitChange[]> {
+    const rows = await this.prisma.perSymbolLimitChange.findMany({
+      orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
+    });
+
+    return rows.map(toPerSymbolLimitChange);
+  }
+
+  async findBySymbol(symbol: string): Promise<PerSymbolLimitChange[]> {
+    const rows = await this.prisma.perSymbolLimitChange.findMany({
+      where: { symbol },
+      orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
+    });
+
+    return rows.map(toPerSymbolLimitChange);
+  }
+
+  async clear(): Promise<void> {
+    // Intentionally empty — see above.
+  }
+}
+
+function toPerSymbolLimitChange(row: {
+  id: string;
+  symbol: string;
+  oldValue: Prisma.Decimal | null;
+  newValue: Prisma.Decimal;
+  timestamp: string;
+  reason: string | null;
+}): PerSymbolLimitChange {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    oldValue: toNumberOrNull(row.oldValue),
+    newValue: toNumber(row.newValue),
+    timestamp: row.timestamp,
+    reason: row.reason,
+  };
 }
 
 /**

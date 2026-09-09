@@ -17,9 +17,11 @@ import { ParameterEditor } from './ParameterEditor';
 import type { LadderParameters } from '../lib/api';
 
 const editParameters = jest.fn();
+const editRiskLimit = jest.fn();
 
 jest.mock('../actions', () => ({
   editParameters: (...args: unknown[]) => editParameters(...args),
+  editRiskLimit: (...args: unknown[]) => editRiskLimit(...args),
 }));
 
 const PARAMETERS: LadderParameters = {
@@ -41,6 +43,11 @@ const PARAMETERS: LadderParameters = {
 beforeEach(() => {
   editParameters.mockReset();
   editParameters.mockResolvedValue({ ok: true, message: '1 parameter updated.' });
+  editRiskLimit.mockReset();
+  editRiskLimit.mockResolvedValue({
+    ok: true,
+    message: 'TQQQ risk limit updated: 40000 → 180000.',
+  });
 });
 
 function renderEditor(heldLotCount = 2) {
@@ -260,5 +267,95 @@ describe('ParameterEditor with fixed-dollar parameters', () => {
     renderFixedDollar();
 
     expect(screen.getByLabelText('Spacing mode')).toHaveValue('FIXED_DOLLAR');
+  });
+});
+
+/**
+ * The risk-layer per-symbol limit section — a separate control from the
+ * ladder parameters above, since `RiskConfig.perSymbolLimits` is not part of
+ * `DipLadderConfig` (`capital-cap.ts`).
+ */
+describe('ParameterEditor risk limit section', () => {
+  it('renders nothing when no symbol is supplied', () => {
+    render(
+      <ParameterEditor
+        strategyId="dip-ladder:TQQQ"
+        parameters={PARAMETERS}
+        heldLotCount={0}
+        changes={[]}
+      />,
+    );
+
+    expect(screen.queryByText(/risk limit —/i)).not.toBeInTheDocument();
+  });
+
+  it('shows the current limit for the symbol', () => {
+    render(
+      <ParameterEditor
+        strategyId="dip-ladder:TQQQ"
+        parameters={PARAMETERS}
+        heldLotCount={0}
+        changes={[]}
+        symbol="TQQQ"
+        riskLimit={40_000}
+        riskLimitChanges={[]}
+      />,
+    );
+
+    expect(screen.getByText(/risk limit — TQQQ/i)).toBeInTheDocument();
+    expect(screen.getByLabelText('Per-symbol limit')).toHaveValue(40_000);
+  });
+
+  it('submits an edit to the risk-limit action, separately from the ladder form', async () => {
+    const user = userEvent.setup();
+    render(
+      <ParameterEditor
+        strategyId="dip-ladder:TQQQ"
+        parameters={PARAMETERS}
+        heldLotCount={0}
+        changes={[]}
+        symbol="TQQQ"
+        riskLimit={40_000}
+        riskLimitChanges={[]}
+      />,
+    );
+
+    const input = screen.getByLabelText('Per-symbol limit');
+    await user.clear(input);
+    await user.type(input, '180000');
+    await user.click(screen.getByRole('button', { name: /update limit/i }));
+
+    expect(editRiskLimit).toHaveBeenCalledWith('TQQQ', 180_000, '');
+    expect(editParameters).not.toHaveBeenCalled();
+
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent(/180000/);
+  });
+
+  it('renders the append-only risk-limit change log', () => {
+    render(
+      <ParameterEditor
+        strategyId="dip-ladder:TQQQ"
+        parameters={PARAMETERS}
+        heldLotCount={0}
+        changes={[]}
+        symbol="TQQQ"
+        riskLimit={180_000}
+        riskLimitChanges={[
+          {
+            id: 'risk-limit-change-1',
+            symbol: 'TQQQ',
+            oldValue: 40_000,
+            newValue: 180_000,
+            timestamp: '2026-09-09T12:00:00.000Z',
+            reason: 'account funded to a larger balance',
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText(/account funded to a larger balance/)).toBeInTheDocument();
+    expect(screen.getByText(/40000/)).toBeInTheDocument();
+    expect(screen.getByText(/180000/)).toBeInTheDocument();
   });
 });

@@ -20,8 +20,13 @@
  */
 
 import { useState, useTransition } from 'react';
-import { editParameters, type ActionResult } from '../actions';
-import { formatPercent, type LadderParameters, type ParameterChange } from '../lib/api';
+import { editParameters, editRiskLimit, type ActionResult } from '../actions';
+import {
+  formatPercent,
+  type LadderParameters,
+  type ParameterChange,
+  type RiskLimitChange,
+} from '../lib/api';
 
 /**
  * Percentage-valued fields, rendered as percent and sent as fractions.
@@ -110,16 +115,32 @@ export function ParameterEditor({
   parameters,
   heldLotCount,
   changes,
+  symbol,
+  riskLimit,
+  riskLimitChanges,
 }: {
   strategyId: string;
   parameters: LadderParameters;
   /** How many lots keep their existing targets through this edit. */
   heldLotCount: number;
   changes: ParameterChange[];
+  /**
+   * The symbol this ladder trades — governs the risk-limit section below.
+   * Absent (or null) hides that section entirely, since there is nothing to
+   * join `riskLimit` to.
+   */
+  symbol?: string | null;
+  /** Current `RiskConfig.perSymbolLimits[symbol]`. Null means unconstrained. */
+  riskLimit?: number | null;
+  riskLimitChanges?: RiskLimitChange[];
 }) {
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [reason, setReason] = useState('');
+
+  const [riskLimitPending, startRiskLimitTransition] = useTransition();
+  const [riskLimitResult, setRiskLimitResult] = useState<ActionResult | null>(null);
+  const [riskLimitReason, setRiskLimitReason] = useState('');
 
   function submit(formData: FormData) {
     const payload: Record<string, number | string | null> = {};
@@ -172,6 +193,27 @@ export function ParameterEditor({
     startTransition(async () => {
       setResult(await editParameters(strategyId, payload, reason));
       setReason('');
+    });
+  }
+
+  /**
+   * Applies a risk-limit edit — a **separate** call from `submit` above,
+   * against a separate endpoint. `RiskConfig.perSymbolLimits` is not part of
+   * `DipLadderConfig`: it is the risk layer's own ceiling, shared across every
+   * strategy trading `symbol`, so it cannot be folded into the same request
+   * that edits this one ladder's geometry.
+   */
+  function submitRiskLimit(formData: FormData) {
+    if (!symbol) {
+      return;
+    }
+
+    const raw = formData.get('riskLimit');
+    const limit = typeof raw === 'string' ? Number(raw) : NaN;
+
+    startRiskLimitTransition(async () => {
+      setRiskLimitResult(await editRiskLimit(symbol, limit, riskLimitReason));
+      setRiskLimitReason('');
     });
   }
 
@@ -298,6 +340,85 @@ export function ParameterEditor({
           </div>
         )}
       </form>
+
+      {symbol && (
+        <div className="border-t border-slate-800 p-4">
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
+            Risk limit — {symbol}
+          </h3>
+          <p className="mt-1 text-xs text-slate-500">
+            The risk layer&apos;s per-symbol capital ceiling (
+            <code>RiskConfig.perSymbolLimits</code>). A separate control from the ladder parameters
+            above: this bounds capital deployed across every strategy trading {symbol}, not this
+            ladder&apos;s own geometry. A rejected BUY names this limit when it is the binding one.
+          </p>
+
+          <form action={submitRiskLimit} className="mt-3 flex flex-wrap items-end gap-3">
+            <Field
+              name="riskLimit"
+              label="Per-symbol limit"
+              hint={
+                riskLimit === null || riskLimit === undefined
+                  ? 'Currently unconstrained'
+                  : 'Currently deployed capital, at cost, is capped here'
+              }
+              prefix="$"
+              step={1000}
+              defaultValue={riskLimit ?? ''}
+            />
+
+            <label className="flex-1 text-xs text-slate-400">
+              Reason (recorded with the change)
+              <input
+                type="text"
+                value={riskLimitReason}
+                onChange={(event) => setRiskLimitReason(event.target.value)}
+                placeholder="why this change"
+                className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100 placeholder:text-slate-600"
+              />
+            </label>
+
+            <button
+              type="submit"
+              disabled={riskLimitPending}
+              className="rounded bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-500 disabled:opacity-50"
+            >
+              {riskLimitPending ? 'Applying…' : 'Update limit'}
+            </button>
+          </form>
+
+          {riskLimitResult && (
+            <div
+              role="status"
+              className={`mt-3 rounded border p-2 text-xs ${
+                riskLimitResult.ok
+                  ? 'border-emerald-800 bg-emerald-950/40 text-emerald-300'
+                  : 'border-red-800 bg-red-950/40 text-red-300'
+              }`}
+            >
+              <p className="font-medium">{riskLimitResult.message}</p>
+            </div>
+          )}
+
+          {riskLimitChanges && riskLimitChanges.length > 0 && (
+            <ul className="mt-3 space-y-1 text-xs text-slate-400">
+              {[...riskLimitChanges]
+                .reverse()
+                .slice(0, 8)
+                .map((change) => (
+                  <li key={change.id} className="font-mono">
+                    {change.oldValue ?? '(unconstrained)'} →{' '}
+                    <span className="text-sky-300">{change.newValue}</span>{' '}
+                    <span className="text-slate-600">{change.timestamp}</span>
+                    {change.reason ? (
+                      <span className="text-slate-500"> — {change.reason}</span>
+                    ) : null}
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {changes.length > 0 && (
         <div className="border-t border-slate-800 px-4 py-3">

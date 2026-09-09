@@ -115,7 +115,22 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
  * looks enforced and is not.
  */
 export function buildRiskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig {
-  const config: RiskConfig = { ...DEFAULT_RISK_CONFIG, ...overrides };
+  const config: RiskConfig = {
+    ...DEFAULT_RISK_CONFIG,
+    ...overrides,
+    // Copied rather than aliased. A shallow spread above would otherwise hand
+    // this config the *caller's own* map object — harmless while nothing
+    // wrote to it, but `RiskParameterService.edit()` mutates
+    // `perSymbolLimits` in place by design (`risk-parameter.service.ts`), and
+    // without this copy that mutation would reach through to whatever object
+    // the caller passed in, e.g. the compiled `PAPER_SYMBOL_CAPITAL` constant
+    // in `capital.config.ts` — silently rewriting a reviewed source file's
+    // exported value for the life of the process.
+    perSymbolLimits: { ...(overrides.perSymbolLimits ?? DEFAULT_RISK_CONFIG.perSymbolLimits) },
+    perStrategyLimits: {
+      ...(overrides.perStrategyLimits ?? DEFAULT_RISK_CONFIG.perStrategyLimits),
+    },
+  };
 
   if (config.accountEquity < 0) {
     throw new Error(`accountEquity must not be negative, got ${config.accountEquity}`);

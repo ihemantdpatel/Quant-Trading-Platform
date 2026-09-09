@@ -2,7 +2,13 @@ import { Bar } from '../../market-data/types';
 import { isRebasableGap, lowestHeldLotPrice, resolveAnchor } from './anchor';
 import { DipLadderConfig, OrderPlacement } from './config';
 import { evaluateInvalidation, InvalidationResult } from './invalidation';
-import { fireableRungsDescending, findRung, selectFireableRung } from './rung';
+import {
+  conflictsWithWorkingRung,
+  fireableRungsDescending,
+  findRung,
+  MIN_RESTING_ORDER_GAP_DOLLARS,
+  selectFireableRung,
+} from './rung';
 import { isWithinFiringWindow } from './session-window';
 import { nextRungPrice, roundToCents } from './spacing';
 import { EntryIntent, LadderPosition } from './types';
@@ -155,11 +161,36 @@ function aboveMarket(rungPrice: number, close: number): FiringDecision {
   };
 }
 
+/**
+ * The decline a resting rung produces when it would land within
+ * `MIN_RESTING_ORDER_GAP_DOLLARS` of another rung already `WORKING` at the
+ * broker.
+ *
+ * A distinct kind rather than folding into `ABOVE_RUNG`: the two are
+ * different faults an operator needs to tell apart — a rung waiting for price
+ * is normal and expected, a rung stuck behind another working order at an
+ * unrelated grid is a broker-constraint collision worth investigating (see
+ * `conflictsWithWorkingRung`).
+ */
+function priceGapConflict(rungPrice: number): FiringDecision {
+  return {
+    intent: null,
+    rungPrice,
+    blocked: {
+      kind: 'PRICE_GAP_CONFLICT',
+      detail:
+        `rung ${rungPrice.toFixed(2)} sits within $${MIN_RESTING_ORDER_GAP_DOLLARS.toFixed(2)} ` +
+        'of another working order — the broker would reject a second resting order this close',
+    },
+  };
+}
+
 export type BlockedReason =
   | { kind: 'OUTSIDE_WINDOW'; detail: string }
   | { kind: 'ABOVE_RUNG'; detail: string }
   | { kind: 'RUNG_HELD'; detail: string }
-  | { kind: 'INVALIDATED'; detail: string };
+  | { kind: 'INVALIDATED'; detail: string }
+  | { kind: 'PRICE_GAP_CONFLICT'; detail: string };
 
 /**
  * Evaluates one closed bar against the ladder.
@@ -214,7 +245,14 @@ export function evaluateBar(
     // market has since reached is exactly what the ladder should place at
     // instead.
     const candidates = fireableRungsDescending(position.rungs, bar.timestamp);
-    const restable = candidates.find((rung) => isRestable(rung.price, bar.close));
+    // A candidate that is below the market but within MIN_RESTING_ORDER_GAP_DOLLARS
+    // of another rung already WORKING is skipped here too — placing it would
+    // only be rejected by the broker, and a lower candidate the market has
+    // reached may still be clear to place at.
+    const restable = candidates.find(
+      (rung) =>
+        isRestable(rung.price, bar.close) && !conflictsWithWorkingRung(position.rungs, rung.price),
+    );
 
     if (restable) {
       return buildEntry(restable.price, bar, position, config, `re-arm/pending rung`);
@@ -247,7 +285,11 @@ export function evaluateBar(
         );
         const rebasedPrice = nextRungPrice(anchor.price, config, dailyBars);
 
-        if (!findRung(position.rungs, rebasedPrice) && isRestable(rebasedPrice, bar.close)) {
+        if (
+          !findRung(position.rungs, rebasedPrice) &&
+          isRestable(rebasedPrice, bar.close) &&
+          !conflictsWithWorkingRung(position.rungs, rebasedPrice)
+        ) {
           return buildEntry(
             rebasedPrice,
             bar,
@@ -260,8 +302,19 @@ export function evaluateBar(
 
       // None restable, and no gap re-base applied (or it produced nothing
       // usable) — report against the highest, the level an operator is most
-      // likely watching.
-      return aboveMarket(candidates[0].price, bar.close);
+      // likely watching. A candidate below the market but colliding with a
+      // working order gets its own reason rather than being folded into
+      // "above the market", since the two need different operator attention.
+      const highest = candidates[0];
+
+      if (
+        isRestable(highest.price, bar.close) &&
+        conflictsWithWorkingRung(position.rungs, highest.price)
+      ) {
+        return priceGapConflict(highest.price);
+      }
+
+      return aboveMarket(highest.price, bar.close);
     }
   } else {
     const existing = selectFireableRung(position.rungs, bar.close, bar.timestamp);
@@ -315,6 +368,16 @@ export function evaluateBar(
   if (config.orderPlacement === OrderPlacement.RESTING) {
     if (!isRestable(rungPrice, bar.close)) {
       return aboveMarket(rungPrice, bar.close);
+    }
+
+    // A freshly extended level can still land within MIN_RESTING_ORDER_GAP_DOLLARS
+    // of a rung already WORKING from an earlier, differently-anchored grid —
+    // gap re-basing (`anchor.ts`) snaps onto an arbitrary bar close or session
+    // open rather than a grid-aligned price, so distinct anchor generations
+    // need not line up. Declining here is cheaper and quieter than submitting
+    // and letting the broker reject it every bar.
+    if (conflictsWithWorkingRung(position.rungs, rungPrice)) {
+      return priceGapConflict(rungPrice);
     }
 
     return buildEntry(

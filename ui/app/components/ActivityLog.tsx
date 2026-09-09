@@ -15,6 +15,7 @@
  */
 
 import { formatCurrency, type Fill, type Order, type RiskEvent } from '../lib/api';
+import { OrdersFillsHistory } from './OrdersFillsHistory';
 
 /**
  * Statuses where the broker may still fill the order.
@@ -53,43 +54,7 @@ export function ActivityLog({
         <PendingOrders orders={pending} fills={fills} mode={mode} />
       </div>
 
-      <Panel title="Orders & fills">
-        {orders.length === 0 && fills.length === 0 ? (
-          <Empty>
-            {mode === 'SHADOW'
-              ? 'None — SHADOW logs full order payloads and submits nothing.'
-              : 'No orders yet.'}
-          </Empty>
-        ) : (
-          <ul className="divide-y divide-slate-800 text-xs">
-            {orders
-              .slice(-12)
-              .reverse()
-              .map((order) => (
-                <li key={order.clientOrderId} className="flex justify-between gap-2 px-4 py-2">
-                  <span className="font-mono text-slate-300">
-                    <span className={order.side === 'BUY' ? 'text-sky-400' : 'text-emerald-400'}>
-                      {order.side}
-                    </span>{' '}
-                    {order.quantity} {order.symbol} @ {formatCurrency(order.limitPrice)}
-                  </span>
-                  <span className="text-slate-500">{order.status}</span>
-                </li>
-              ))}
-            {fills
-              .slice(-12)
-              .reverse()
-              .map((fill) => (
-                <li key={fill.fillId} className="flex justify-between gap-2 px-4 py-2">
-                  <span className="font-mono text-slate-400">
-                    FILL {fill.quantity} @ {formatCurrency(fill.price)}
-                  </span>
-                  <span className="text-slate-600">{fill.timestamp}</span>
-                </li>
-              ))}
-          </ul>
-        )}
-      </Panel>
+      <OrdersFillsHistory orders={orders} fills={fills} mode={mode} />
 
       <Panel title={`Risk events (${riskEvents.length})`}>
         {riskEvents.length === 0 ? (

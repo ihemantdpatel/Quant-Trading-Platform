@@ -19,6 +19,7 @@ import { RungStatus } from '../../strategies/dip-ladder/rung';
 import {
   lotFixture,
   parameterChangeFixture,
+  perSymbolLimitChangeFixture,
   runBacktestRepositoryContract,
   runBarRepositoryContract,
   runFillRepositoryContract,
@@ -27,6 +28,7 @@ import {
   runOrderIntentRepositoryContract,
   runOrderRepositoryContract,
   runParameterChangeRepositoryContract,
+  runPerSymbolLimitChangeRepositoryContract,
   runRiskEventRepositoryContract,
   runRungRepositoryContract,
   runStrategyStateSnapshotRepositoryContract,
@@ -41,6 +43,7 @@ import {
   PrismaOrderIntentRepository,
   PrismaOrderRepository,
   PrismaParameterChangeRepository,
+  PrismaPerSymbolLimitChangeRepository,
   PrismaRiskEventRepository,
   PrismaRungRepository,
   PrismaStrategyStateSnapshotRepository,
@@ -52,6 +55,7 @@ import {
   resetDatabase,
   testClient,
   truncateParameterChanges,
+  truncatePerSymbolLimitChanges,
 } from './test-database';
 
 /**
@@ -120,6 +124,14 @@ describeWithDatabase('Prisma repositories', () => {
     { supportsClear: false },
   );
 
+  runPerSymbolLimitChangeRepositoryContract(
+    async () => {
+      await resetDatabase(prisma);
+      return new PrismaPerSymbolLimitChangeRepository(asService(prisma));
+    },
+    { supportsClear: false },
+  );
+
   runStrategyStateSnapshotRepositoryContract(async () => {
     await resetDatabase(prisma);
     return new PrismaStrategyStateSnapshotRepository(asService(prisma));
@@ -172,6 +184,48 @@ describeWithDatabase('ParameterChange is append-only at the database level', () 
     // would pass both tests above while breaking the feature.
     await repo.append(parameterChangeFixture('a'));
     await repo.append(parameterChangeFixture('b'));
+
+    expect(await repo.findAll()).toHaveLength(2);
+  });
+});
+
+describeWithDatabase('PerSymbolLimitChange is append-only at the database level', () => {
+  const prisma = testClient();
+  const repo = new PrismaPerSymbolLimitChangeRepository(asService(prisma));
+
+  beforeEach(async () => {
+    await truncatePerSymbolLimitChanges(prisma);
+  });
+
+  afterAll(async () => {
+    await disconnectTestClient();
+  });
+
+  it('rejects an UPDATE, so the audit trail cannot be rewritten', async () => {
+    await repo.append(perSymbolLimitChangeFixture('a'));
+
+    await expect(
+      prisma.$executeRawUnsafe(
+        "UPDATE `PerSymbolLimitChange` SET `newValue` = '999' WHERE `id` = 'a'",
+      ),
+    ).rejects.toThrow(/append-only/);
+
+    expect((await repo.findAll())[0].newValue).toBe(180_000);
+  });
+
+  it('rejects a DELETE, so a row cannot be removed and re-inserted', async () => {
+    await repo.append(perSymbolLimitChangeFixture('a'));
+
+    await expect(
+      prisma.$executeRawUnsafe("DELETE FROM `PerSymbolLimitChange` WHERE `id` = 'a'"),
+    ).rejects.toThrow(/append-only/);
+
+    expect(await repo.findAll()).toHaveLength(1);
+  });
+
+  it('still accepts INSERT — the log appends, it just never rewrites', async () => {
+    await repo.append(perSymbolLimitChangeFixture('a'));
+    await repo.append(perSymbolLimitChangeFixture('b'));
 
     expect(await repo.findAll()).toHaveLength(2);
   });

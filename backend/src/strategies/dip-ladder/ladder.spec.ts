@@ -489,6 +489,62 @@ describe('evaluateBar', () => {
       expect(evaluateBar(bar(99), FLAT, config, 100, 100).intent).toBeNull();
       expect(evaluateBar(bar(95), FLAT, config, 100, 100).intent?.limitPrice).toBe(95);
     });
+
+    /**
+     * IB rejects a second resting order within roughly $0.50 of one already
+     * working on the same symbol/side. Distinct anchor generations — a fresh
+     * bootstrap here, whatever grid produced 95.30 — need not land on the same
+     * grid, so this collision is a real live scenario, not a contrived one.
+     * Declining pre-submission is what stops the rung retrying the same
+     * rejected price every bar.
+     */
+    describe('declines rather than colliding with a WORKING rung on another grid', () => {
+      it('declines a freshly extended rung that lands within the minimum gap', () => {
+        const nearbyWorking: LadderPosition = {
+          rungs: [{ price: 95.3, lotId: null, workingOrderId: 'co-1', lastExitAt: null }],
+          heldLots: [],
+          firstEntryPrice: null,
+        };
+
+        // Anchor 100 → rung 95, 30¢ under the already-working 95.30.
+        const decision = evaluateBar(bar(99), nearbyWorking, resting, 100, 100);
+
+        expect(decision.intent).toBeNull();
+        expect(decision.blocked?.kind).toBe('PRICE_GAP_CONFLICT');
+      });
+
+      it('falls through to a lower fireable candidate that clears the gap', () => {
+        const stranded: LadderPosition = {
+          rungs: [
+            { price: 95, lotId: null, lastExitAt: null },
+            { price: 95.3, lotId: null, workingOrderId: 'co-1', lastExitAt: null },
+            { price: 90, lotId: null, lastExitAt: null },
+          ],
+          heldLots: [],
+          firstEntryPrice: null,
+        };
+
+        const decision = evaluateBar(bar(99), stranded, resting, 100, 100);
+
+        expect(decision.intent?.limitPrice).toBe(90);
+      });
+
+      it('declines the whole bar when the only fireable candidate conflicts', () => {
+        const stranded: LadderPosition = {
+          rungs: [
+            { price: 95, lotId: null, lastExitAt: null },
+            { price: 95.3, lotId: null, workingOrderId: 'co-1', lastExitAt: null },
+          ],
+          heldLots: [],
+          firstEntryPrice: null,
+        };
+
+        const decision = evaluateBar(bar(99), stranded, resting, 100, 100);
+
+        expect(decision.intent).toBeNull();
+        expect(decision.blocked?.kind).toBe('PRICE_GAP_CONFLICT');
+      });
+    });
   });
 
   /**

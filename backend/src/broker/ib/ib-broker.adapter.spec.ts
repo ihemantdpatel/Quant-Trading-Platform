@@ -838,6 +838,34 @@ describe('IBBrokerAdapter', () => {
 
       expect(socket.historicalRequests[0].regularHoursOnly).toBe(true);
     });
+
+    it('does not default RTH-only for 1-minute bars — only FIVE_MIN carries that default', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+      socket.seedBars('TQQQ', BarSize.ONE_MIN, []);
+
+      await adapter.getHistoricalBars({
+        contract: TQQQ,
+        barSize: BarSize.ONE_MIN,
+        from: '2025-01-02T09:30:00.000-05:00',
+        to: '2025-01-02T16:00:00.000-05:00',
+      });
+
+      expect(socket.historicalRequests[0].regularHoursOnly).toBe(false);
+    });
+
+    it('subscribes live bars at 1-minute size, the live engine default', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+      const received: Bar[] = [];
+
+      adapter.subscribeBars(TQQQ, BarSize.ONE_MIN, (b) => received.push(b));
+      socket.emitBar({ ...bar('2025-01-02T09:45:00.000-05:00', 42), barSize: BarSize.ONE_MIN });
+
+      expect(received).toHaveLength(1);
+    });
   });
 
   describe('order path (built for Story 13, unreachable in SHADOW)', () => {

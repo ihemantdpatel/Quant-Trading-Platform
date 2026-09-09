@@ -94,7 +94,7 @@ describe('LotTable', () => {
     expect(screen.getByTestId('blended-average')).toHaveTextContent('$92.50');
   });
 
-  it('excludes closed lots from the blended average and reports their realized P&L', () => {
+  it('excludes closed lots from the blended average and from the table entirely', () => {
     render(
       <LotTable
         lots={[
@@ -113,8 +113,9 @@ describe('LotTable', () => {
       />,
     );
 
-    const closed = screen.getByTestId('lot-row-closed');
-    expect(within(closed).getByText('$50.00')).toBeInTheDocument();
+    // Closed lots belong to TradeHistoryTable, not here.
+    expect(screen.queryByTestId('lot-row-closed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('lot-row-held')).toBeInTheDocument();
     // Blended reflects only the held lot, not the closed one at 100.
     expect(screen.getByTestId('blended-average')).toHaveTextContent('$90.00');
   });
@@ -131,6 +132,25 @@ describe('LotTable', () => {
   it('renders an empty state rather than a bare table when there are no lots', () => {
     render(<LotTable lots={[]} mark={null} now={NOW} />);
 
-    expect(screen.getByText(/no lots yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/no lots held/i)).toBeInTheDocument();
+  });
+
+  it('renders the held-only empty state even when only closed lots exist', () => {
+    render(
+      <LotTable
+        lots={[
+          lot({
+            id: 'closed',
+            status: 'CLOSED',
+            realized: 50,
+            closedAt: '2024-03-04T10:30:00-05:00',
+          }),
+        ]}
+        mark={null}
+        now={NOW}
+      />,
+    );
+
+    expect(screen.getByText(/no lots held/i)).toBeInTheDocument();
   });
 });

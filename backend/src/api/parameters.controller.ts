@@ -44,11 +44,20 @@ export class ParametersController {
     private readonly changes: ParameterChangeRepository,
   ) {}
 
-  /** Current editable parameters for every ladder instance. */
+  /**
+   * Current editable parameters for every ladder instance.
+   *
+   * `symbol` is included alongside `strategyId` so the dashboard can join a
+   * ladder to its risk-layer per-symbol limit (`GET /risk-limits`) without
+   * parsing the id string — `configOf` already carries the full
+   * `DipLadderConfig`, and `symbol` is the one field of it every editable
+   * parameter set needs alongside the strategy id.
+   */
   @Get()
   getAll(): unknown[] {
     return this.parameters.editableStrategyIds().map((strategyId) => ({
       strategyId,
+      symbol: this.parameters.configOf(strategyId)?.symbol ?? null,
       parameters: this.parameters.parametersOf(strategyId),
     }));
   }
@@ -73,7 +82,7 @@ export class ParametersController {
       throw new NotFoundException(`unknown or non-editable strategy "${strategyId}"`);
     }
 
-    return { strategyId, parameters };
+    return { strategyId, symbol: this.parameters.configOf(strategyId)?.symbol ?? null, parameters };
   }
 
   /**
