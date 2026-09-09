@@ -66,6 +66,7 @@ import { DIP_LADDER_ID_PREFIX } from '../strategies/dip-ladder/dip-ladder.strate
 import { isWithinFiringWindow, sessionDateOf } from '../strategies/dip-ladder/session-window';
 import { nextRungPrice, roundToCents } from '../strategies/dip-ladder/spacing';
 import { DIP_LADDER_CONFIG } from '../strategies/strategies.module';
+import { Bar } from '../market-data/types';
 
 /**
  * The read-only slice of reconciliation this report needs.
@@ -571,7 +572,7 @@ export class DailyReportService {
 
       // The next level the ladder would extend to, which is where an entry
       // goes when no existing rung is free.
-      const extension = nextRungPrice(anchor.price, this.ladderConfig);
+      const extension = nextRungPrice(anchor.price, this.ladderConfig, scalars.dailyBars);
 
       // Levels currently free: a known rung with no lot sitting on it. These
       // are the re-arm targets, and under RESTING they take precedence over
@@ -640,14 +641,15 @@ export class DailyReportService {
     }
 
     const spacing = roundToCents(
-      openingAnchor.price - nextRungPrice(openingAnchor.price, this.ladderConfig),
+      openingAnchor.price -
+        nextRungPrice(openingAnchor.price, this.ladderConfig, scalars.dailyBars),
     );
 
     const expectedPrices: number[] = [];
     let price = openingAnchor.price;
 
     for (let level = 1; level <= this.ladderConfig.maxConcurrentRungs; level += 1) {
-      price = nextRungPrice(price, this.ladderConfig);
+      price = nextRungPrice(price, this.ladderConfig, scalars.dailyBars);
       expectedPrices.push(price);
     }
 
@@ -677,7 +679,7 @@ export class DailyReportService {
    */
   private anchorScalars(
     data: Record<string, unknown> | undefined,
-  ): { previousSessionClose: number | null; sessionOpen: number } | null {
+  ): { previousSessionClose: number | null; sessionOpen: number; dailyBars: Bar[] } | null {
     if (!data) {
       return null;
     }
@@ -692,6 +694,14 @@ export class DailyReportService {
     return {
       sessionOpen,
       previousSessionClose: typeof previousSessionClose === 'number' ? previousSessionClose : null,
+      // Under ATR spacing (`spacing.ts`), rung prices depend on this array the
+      // same way they depend on the config's `gapRebasePercent` — omitting it
+      // would recompute every rung under the percentage fallback while the
+      // engine used ATR, reporting a full session of false
+      // `RUNG_VERIFICATION_UNEXPLAINED`. Untyped fallback to `[]` for the same
+      // reason as the rest of this method: an older or partial snapshot must
+      // degrade, not throw.
+      dailyBars: Array.isArray(data.dailyBars) ? (data.dailyBars as Bar[]) : [],
     };
   }
 

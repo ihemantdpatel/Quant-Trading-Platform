@@ -102,4 +102,21 @@ describe('SymbolHaltService', () => {
         .sort(),
     ).toEqual(['SOXL', 'TQQQ']);
   });
+
+  describe('haltedSymbolsWithCode', () => {
+    it('returns only symbols halted with the given code', () => {
+      halts.halt('TQQQ', 'BROKER_UNAVAILABLE', 'unreachable', 'now');
+      halts.halt('SOXL', 'LOT_SUM_MISMATCH', 'mismatch', 'now');
+      halts.halt('SPXL', 'BROKER_UNAVAILABLE', 'unreachable', 'now');
+
+      expect(halts.haltedSymbolsWithCode('BROKER_UNAVAILABLE').sort()).toEqual(['SPXL', 'TQQQ']);
+      expect(halts.haltedSymbolsWithCode('LOT_SUM_MISMATCH')).toEqual(['SOXL']);
+    });
+
+    it('returns an empty list when nothing is halted with that code', () => {
+      halts.halt('TQQQ', 'LOT_SUM_MISMATCH', 'mismatch', 'now');
+
+      expect(halts.haltedSymbolsWithCode('BROKER_UNAVAILABLE')).toEqual([]);
+    });
+  });
 });

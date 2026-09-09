@@ -102,6 +102,27 @@ export function clearWorking(rung: Rung): Rung {
   };
 }
 
+/**
+ * Releases a `HELD` rung whose lot was discarded **without a real exit** —
+ * `LotRebuildService`'s automatic reconciliation rewriting a symbol's held
+ * lots to match the broker (`lot-rebuild.service.ts`), never the ladder's own
+ * trading path.
+ *
+ * Same status rule as `clearWorking` (empty and fireable again, `RE_ARMED` if
+ * it has cycled before, `PENDING` otherwise), but deliberately **not**
+ * `reArm()`: no exit happened, so incrementing `completedCycles` or stamping
+ * `lastExitAt` would fabricate a profitable cycle this rung never actually
+ * completed.
+ */
+export function releaseWithoutCycle(rung: Rung): Rung {
+  return {
+    ...rung,
+    status: rung.completedCycles > 0 ? RungStatus.RE_ARMED : RungStatus.PENDING,
+    lotId: null,
+    workingOrderId: null,
+  };
+}
+
 /** Local copy to avoid a circular import with `spacing.ts`. */
 function roundToCents(value: number): number {
   return Math.round(value * 100) / 100;
@@ -188,8 +209,8 @@ export function findRung<T extends { price: number }>(rungs: T[], price: number)
 }
 
 /**
- * The highest empty rung with no order resting at it, regardless of where price
- * currently is.
+ * Every empty rung with no order resting at it, regardless of where price
+ * currently is, highest first.
  *
  * The resting-order counterpart to `selectFireableRung`. Price is deliberately
  * not a factor: a resting limit order is placed ahead of the market and waits
@@ -197,16 +218,35 @@ export function findRung<T extends { price: number }>(rungs: T[], price: number)
  * would defeat the point and would strand a released rung whenever price sits
  * above it.
  *
- * **This selects a level, not an order.** Ignoring price means the level
- * returned may be *above* the close — a re-armed rung price recovered past —
- * and a BUY limit there is marketable rather than resting. `evaluateBar` is
- * where that is caught (`isRestable`); do not read this function's indifference
- * to price as permission to place the order without checking.
+ * **This selects levels, not orders.** Ignoring price means a returned level
+ * may be *above* the close — a re-armed rung price recovered past — and a BUY
+ * limit there is marketable rather than resting. `evaluateBar` is where that
+ * is caught (`isRestable`); do not read this function's indifference to price
+ * as permission to place an order without checking. It returns the whole
+ * descending list, not just the top one, so a caller can fall through past a
+ * marketable candidate to the next one down rather than declining the whole
+ * bar over a single stale high rung.
  *
- * Highest, for the same reason `selectFireableRung` picks the highest: the
- * ladder descends one level at a time, so the shallowest unplaced rung is the
- * next commitment.
+ * Highest first, for the same reason `selectFireableRung` picks the highest:
+ * the ladder descends one level at a time, so the shallowest unplaced rung is
+ * the next commitment.
  */
+export function fireableRungsDescending<
+  T extends {
+    price: number;
+    lotId: string | null;
+    workingOrderId?: string | null;
+    lastExitAt: string | null;
+  },
+>(rungs: T[], barTimestamp: string): T[] {
+  return rungs
+    .filter(
+      (rung) => rung.lotId === null && !rung.workingOrderId && rung.lastExitAt !== barTimestamp,
+    )
+    .sort((a, b) => b.price - a.price);
+}
+
+/** The single highest candidate from {@link fireableRungsDescending}, or null. */
 export function highestFireableRung<
   T extends {
     price: number;
@@ -215,15 +255,7 @@ export function highestFireableRung<
     lastExitAt: string | null;
   },
 >(rungs: T[], barTimestamp: string): T | null {
-  const candidates = rungs.filter(
-    (rung) => rung.lotId === null && !rung.workingOrderId && rung.lastExitAt !== barTimestamp,
-  );
-
-  if (candidates.length === 0) {
-    return null;
-  }
-
-  return candidates.reduce((highest, rung) => (rung.price > highest.price ? rung : highest));
+  return fireableRungsDescending(rungs, barTimestamp)[0] ?? null;
 }
 
 /**

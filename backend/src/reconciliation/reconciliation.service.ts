@@ -23,24 +23,54 @@
  *
  * ## What a failure never does
  *
- * It never liquidates, never adjusts lots to fit the broker's number, and never
- * releases itself. Halting is the whole response. `CLAUDE.md` is explicit that
- * a technical fault must not become a realized loss, and a reconciliation
- * mismatch is the case where "fixing it automatically" is most tempting and
- * most dangerous.
+ * It never liquidates and never releases a halt on its own — halting (or
+ * staying halted) is the whole response once the evidence runs out.
+ * `CLAUDE.md` is explicit that a technical fault must not become a realized
+ * loss, and a reconciliation mismatch is the case where "fixing it
+ * automatically" is most tempting and most dangerous.
+ *
+ * **One narrow exception, and it is evidence, not adjustment.**
+ * `recoverExitFills` (below, run as part of step 3) closes a HELD lot whose
+ * resting exit already filled at the broker, but only from that lot's own
+ * `Fill` row — real execution data this system already recorded and simply
+ * failed to route live. It never redistributes a mismatch across lots, never
+ * synthesizes a quantity or price to make totals agree, and does nothing at
+ * all when the evidence is anything less than an exact match. That is the
+ * line: reading back a fact this system already holds is not the guess
+ * `PRD.md:347` forbids.
+ *
+ * ## The other exception: `LotRebuildService`
+ *
+ * `attemptRebuild` (below, run only when step 3's assertion fails) is the
+ * second and only other departure from "halt is the whole response," and it
+ * is a deliberate, documented one — see `docs/decisions/auto-lot-rebuild.md`.
+ * Unlike `recoverExitFills`, it *can* reconstruct from broken evidence (an
+ * order's own limit price, or the broker's blended average cost) rather than
+ * only an exact recorded fill — which is exactly the guess this file's header
+ * otherwise forbids. Two things keep it inside the line the decision doc
+ * draws: it is gated to `PAPER` only, and `assertLotSum` is re-run against its
+ * output exactly as it would be against any other candidate state — a rebuild
+ * that does not produce an exact match still halts, with no partial
+ * application, precisely like every other mismatch before this existed.
  */
 
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import {
   BROKER_ADAPTER,
   BrokerAdapter,
   BrokerPosition,
   CompletedOrder,
+  ConnectionState,
   OpenOrder,
   OrderStatus,
 } from '../broker/broker-adapter.interface';
+import { ExecutionMode } from '../config/execution-mode';
 import {
+  FILL_REPOSITORY,
+  FillRepository,
+  LOT_REBUILD_EVENT_REPOSITORY,
   LOT_REPOSITORY,
+  LotRebuildEventRepository,
   LotRepository,
   ORDER_REPOSITORY,
   OrderRepository,
@@ -50,16 +80,24 @@ import {
   StrategyStateSnapshotRepository,
 } from '../repositories/repository.interfaces';
 import { CoordinatorService } from '../strategies/coordinator.service';
+import { DipLadderConfig } from '../strategies/dip-ladder/config';
 import {
   DIP_LADDER_ID_PREFIX,
   DIP_LADDER_STATE_VERSION,
   DipLadderStateData,
   DipLadderStrategy,
 } from '../strategies/dip-ladder/dip-ladder.strategy';
-import { Lot } from '../strategies/dip-ladder/lot';
-import { Rung } from '../strategies/dip-ladder/rung';
+import { closeLot, Lot, LotStatus } from '../strategies/dip-ladder/lot';
+import { reArm, Rung, RungStatus } from '../strategies/dip-ladder/rung';
+import { DIP_LADDER_CONFIG } from '../strategies/strategies.module';
 import { JsonValue } from '../strategies/types';
-import { assertLotSum, LotSumVerdict, ReconciliationStatus } from './lot-sum-assertion';
+import {
+  assertLotSum,
+  LotSumVerdict,
+  ReconciliationStatus,
+  sumHeldQuantity,
+} from './lot-sum-assertion';
+import { LotRebuildService, RebuildAction, RebuildOutcome } from './lot-rebuild.service';
 import { SymbolHaltService } from './symbol-halt.service';
 
 /** Halt codes, so the dashboard can distinguish causes without parsing prose. */
@@ -78,6 +116,19 @@ export interface SymbolReconciliation {
   restoredRungs: number;
   /** Set when the snapshot's version was not the one this build understands. */
   snapshotVersion: number | null;
+  /**
+   * HELD lots closed by `recoverExitFills` before the assertion ran, using a
+   * `Fill` this system already recorded for that lot's own exit order.
+   */
+  recoveredExits: number;
+  /**
+   * Set when `LotRebuildService` produced the state this symbol resumed with
+   * — see `docs/decisions/auto-lot-rebuild.md`. `null` on a symbol that never
+   * needed it (the ordinary case) and on a symbol that still halted despite
+   * an attempt (`rebuildOutcome` in that case has `applied: false`, which is
+   * not surfaced here — a halt is a halt regardless of what was tried).
+   */
+  rebuildAction: RebuildAction | null;
 }
 
 export interface ReconciliationReport {
@@ -96,6 +147,15 @@ export interface ReconciliationReport {
    * condition for something that costs nothing and is now fixed.
    */
   ordersUpdated: number;
+  /** Sum of `SymbolReconciliation.recoveredExits` across every symbol. */
+  recoveredExits: number;
+  /**
+   * Count of symbols resumed via `LotRebuildService` rather than an ordinary
+   * clean assertion. See `docs/decisions/auto-lot-rebuild.md` — worth watching
+   * over the soak: a rebuild that fires often is evidence of an upstream bug
+   * this is quietly papering over, not the rare edge case it was built for.
+   */
+  rebuildsApplied: number;
 }
 
 /**
@@ -115,10 +175,29 @@ export interface OrderReconciliationReport {
 }
 
 @Injectable()
-export class ReconciliationService {
+export class ReconciliationService implements OnModuleInit {
   private readonly logger = new Logger(ReconciliationService.name);
   private lastReport: ReconciliationReport | null = null;
   private lastOrderReconciliation: OrderReconciliationReport | null = null;
+
+  /** Serializes `reconcileBrokerUnavailableHalts` against overlapping `CONNECTED` events. */
+  private autoReleaseInFlight = false;
+
+  /**
+   * Successful auto-rebuilds applied per symbol this process's lifetime.
+   *
+   * `docs/decisions/auto-lot-rebuild.md` names this explicitly under "Revisit
+   * when" as not yet implemented: "halting instead if it would fire more than
+   * once for the same symbol in a session." A rebuild firing once is the rare
+   * edge case Tier 2 was designed for — an order placed, filled, and never
+   * durably tied to a rung. A *second* one for the same symbol is evidence of
+   * a live bug upstream still producing fresh mismatches, and letting the
+   * auto-rebuild keep absorbing them would silently paper over it, each
+   * attempt compounding on whatever the previous one guessed. Scoped to the
+   * process rather than a calendar session — this system does not model
+   * trading-session boundaries anywhere else reconciliation reasons about.
+   */
+  private readonly rebuildsAppliedBySymbol = new Map<string, number>();
 
   constructor(
     private readonly coordinator: CoordinatorService,
@@ -129,7 +208,134 @@ export class ReconciliationService {
     @Inject(RUNG_REPOSITORY) private readonly rungs: RungRepository,
     @Inject(STRATEGY_STATE_SNAPSHOT_REPOSITORY)
     private readonly snapshots: StrategyStateSnapshotRepository,
+    @Inject(FILL_REPOSITORY) private readonly fills: FillRepository,
+    private readonly rebuild: LotRebuildService,
+    @Inject(LOT_REBUILD_EVENT_REPOSITORY)
+    private readonly rebuildEvents: LotRebuildEventRepository,
+    // Single shared config, mirroring `DailyReportService`'s own
+    // `DIP_LADDER_CONFIG` injection — see the "revisit when" note in
+    // `docs/decisions/auto-lot-rebuild.md` for what a second symbol requires.
+    @Inject(DIP_LADDER_CONFIG) private readonly ladderConfig: DipLadderConfig,
+    private readonly mode: ExecutionMode,
   ) {}
+
+  /**
+   * Subscribes to broker connection health for the life of the process, the
+   * same pattern `EngineService` uses for `onFill`/`onOrderStatus` and
+   * `LiveFeedService` uses for re-subscribing bars — nothing else re-arms this
+   * after a reconnect, so it must not be torn down.
+   *
+   * See `reconcileBrokerUnavailableHalts` for what a `CONNECTED` event
+   * triggers and, just as importantly, what it does not.
+   */
+  onModuleInit(): void {
+    this.broker.onConnectionChange((health) => {
+      if (health.state === ConnectionState.CONNECTED) {
+        this.autoReleaseBrokerUnavailableHalts();
+      }
+    });
+  }
+
+  /**
+   * Fire-and-forget wrapper around `reconcileBrokerUnavailableHalts` for the
+   * connection-change handler, which cannot itself be `async`.
+   *
+   * `autoReleaseInFlight` guards against a burst of `CONNECTED` events (a
+   * reconnect can report it more than once, the same fact `LiveFeedService`
+   * guards against) starting overlapping runs against the same halts and lots.
+   */
+  private autoReleaseBrokerUnavailableHalts(): void {
+    if (this.autoReleaseInFlight) {
+      return;
+    }
+
+    this.autoReleaseInFlight = true;
+
+    this.reconcileBrokerUnavailableHalts(new Date().toISOString())
+      .catch((error: unknown) => {
+        this.logger.error(
+          `automatic re-check of BROKER_UNAVAILABLE halts failed: ${
+            error instanceof Error ? error.message : String(error)
+          }. Halts are unchanged; a later reconnect or a manual /reconcile will try again.`,
+        );
+      })
+      .finally(() => {
+        this.autoReleaseInFlight = false;
+      });
+  }
+
+  /**
+   * Re-checks symbols halted for `HALT_BROKER_UNAVAILABLE` and releases the
+   * halt automatically when the position now reconciles exactly.
+   *
+   * **Why this one halt code, and no other.** `BROKER_UNAVAILABLE` means "we
+   * never got to check" — the broker did not answer, so the halt carries no
+   * evidence that a mismatch exists, only that none could be ruled out. Once
+   * the broker answers, re-running the same lot-sum assertion `reconcileAll`
+   * uses either confirms the position was fine all along or reveals a real
+   * divergence. The first case is safe to resume automatically, because
+   * nothing has been trusted without checking — it is not the case
+   * `symbol-halt.service.ts` warns against ("an automatic release would
+   * resume trading on state nobody checked"): the state *was* checked, by
+   * this method, using the same assertion an operator's `POST /reconcile`
+   * would use.
+   *
+   * A `LOT_SUM_MISMATCH` is the opposite case — the broker answered and the
+   * totals disagree — and this method never produces or clears one: a symbol
+   * not currently halted for `BROKER_UNAVAILABLE` is skipped entirely, and a
+   * re-check that still does not reconcile leaves the existing halt exactly
+   * as it was (`reconcileSymbol`'s halt path is a no-op against an already-
+   * halted symbol — `SymbolHaltService.halt` keeps the first reason). That
+   * case stays exactly as deliberate and operator-only as it has always been.
+   *
+   * Also reachable directly (not just from the `CONNECTED` handler) so a test
+   * — or an operator script — can trigger the same check without waiting for
+   * a real reconnect event.
+   */
+  async reconcileBrokerUnavailableHalts(now: string): Promise<SymbolReconciliation[]> {
+    const candidates = this.halts.haltedSymbolsWithCode(HALT_BROKER_UNAVAILABLE);
+
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    const positions = await this.brokerPositions();
+
+    // Still unreachable — the halts already say exactly this, and there is
+    // nothing new to check them against.
+    if (positions === null) {
+      return [];
+    }
+
+    const openOrders = await this.brokerOpenOrders();
+    const results: SymbolReconciliation[] = [];
+
+    for (const snapshot of this.coordinator.snapshots()) {
+      if (!snapshot.id.startsWith(DIP_LADDER_ID_PREFIX)) {
+        continue;
+      }
+
+      const symbol = snapshot.symbols[0];
+
+      if (!symbol || !candidates.includes(symbol)) {
+        continue;
+      }
+
+      const result = await this.reconcileSymbol(snapshot.id, symbol, positions, openOrders, now);
+      results.push(result);
+
+      if (result.verdict.reconciled) {
+        this.halts.release(symbol, now);
+        this.logger.warn(
+          `${symbol}: broker reachable again and the position now reconciles — ` +
+            `BROKER_UNAVAILABLE halt released automatically (${result.verdict.reason}). ` +
+            `Restored ${result.restoredLots} lot(s) and ${result.restoredRungs} rung(s).`,
+        );
+      }
+    }
+
+    return results;
+  }
 
   /**
    * Reconciles every registered ladder and restores the ones that pass.
@@ -184,6 +390,8 @@ export class ReconciliationService {
       symbols: results,
       haltedSymbols: this.halts.haltedSymbols(),
       ordersUpdated,
+      recoveredExits: results.reduce((sum, result) => sum + result.recoveredExits, 0),
+      rebuildsApplied: results.filter((result) => result.rebuildAction !== null).length,
     };
 
     this.lastReport = report;
@@ -375,6 +583,8 @@ export class ReconciliationService {
         },
         now,
         snapshot?.version ?? null,
+        0,
+        null,
       );
     }
 
@@ -401,14 +611,81 @@ export class ReconciliationService {
         },
         now,
         snapshot.version,
+        0,
+        null,
       );
     }
 
+    // Recover any HELD lot whose resting exit already filled at the broker
+    // before asserting the sum — see `recoverExitFills`. A lot closed here is
+    // exactly the shape of gap the assertion below would otherwise halt on,
+    // and the fix is evidence this system already recorded, not a guess.
+    const recovery = await this.recoverExitFills(symbol, persistedLots, persistedRungs, openOrders);
+
     // Step 3 — the assertion itself.
-    const verdict = assertLotSum(symbol, persistedLots, brokerQuantity);
+    let verdict = assertLotSum(symbol, recovery.lots, brokerQuantity);
+    let finalLots = recovery.lots;
+    let finalRungs = recovery.rungs;
+    let rebuildOutcome: RebuildOutcome | null = null;
 
     if (!verdict.reconciled) {
-      // Step 4 — log, alert, refuse to trade this symbol.
+      // See `docs/decisions/auto-lot-rebuild.md`. Only attempted on the
+      // failure this assertion itself just found — never runs against a
+      // clean symbol, and never runs at all outside `PAPER`.
+      rebuildOutcome = await this.attemptRebuild(
+        symbol,
+        recovery.lots,
+        recovery.rungs,
+        positions,
+        now,
+      );
+
+      if (rebuildOutcome.applied) {
+        this.rebuildsAppliedBySymbol.set(
+          symbol,
+          (this.rebuildsAppliedBySymbol.get(symbol) ?? 0) + 1,
+        );
+
+        // Captured before `finalLots` is reassigned — the audit row records
+        // what the ladder looked like *before* the rebuild acted on it.
+        const priorLotQuantity = sumHeldQuantity(recovery.lots);
+
+        finalLots = rebuildOutcome.lots;
+        finalRungs = rebuildOutcome.rungs;
+        verdict = rebuildOutcome.verdict;
+
+        // Persisted immediately rather than left for the next bar's write —
+        // the same reasoning `recoverExitFills` follows: a crash between this
+        // reconciliation and the first bar must not lose the rebuild and
+        // strand the symbol back at the same mismatch on the next restart.
+        await this.lots.saveAll(finalLots, symbol);
+        await this.rungs.saveAll(finalRungs, symbol);
+
+        // The durable audit trail for the one place reconciliation is
+        // permitted to guess at (or write off) lot composition instead of
+        // halting — see `docs/decisions/auto-lot-rebuild.md`. Written after
+        // the lots/rungs themselves, so a failure here never loses the
+        // rebuild itself; only the audit row would be missing, which
+        // `reconcileSymbol`'s own log line still surfaces.
+        await this.rebuildEvents.save({
+          symbol,
+          strategyId,
+          triggerCode: HALT_LOT_SUM_MISMATCH,
+          action: rebuildOutcome.action!,
+          brokerQuantity: positions.find((p) => p.symbol === symbol)?.quantity ?? 0,
+          brokerAverageCost: positions.find((p) => p.symbol === symbol)?.averageCost ?? 0,
+          priorLotQuantity,
+          resultingLots: finalLots,
+          detail: rebuildOutcome.detail,
+          timestamp: now,
+        });
+      }
+    }
+
+    if (!verdict.reconciled) {
+      // Step 4 — log, alert, refuse to trade this symbol. Reached whether or
+      // not a rebuild was attempted: an attempt that did not produce an exact
+      // match changes nothing about the outcome here.
       return this.haltWith(
         strategyId,
         symbol,
@@ -416,21 +693,43 @@ export class ReconciliationService {
         verdict,
         now,
         snapshot?.version ?? null,
+        recovery.recovered,
+        null,
+      );
+    }
+
+    // A HELD lot with no matching Rung row can never re-arm its price level
+    // once it exits — the ladder loses the level rather than making it
+    // fireable again. This can arise from a lot that entered the ledger
+    // outside the normal fill/rebuild paths, both of which already keep a
+    // lot's rung in sync (see `LotRebuildService`). Checked on every
+    // reconciliation, not only on a `LOT_SUM_MISMATCH` — the sum can already
+    // be exactly right while this bookkeeping link is still missing.
+    const rungRepair = this.ensureRungsForHeldLots(finalLots, finalRungs);
+
+    if (rungRepair.added.length > 0) {
+      finalRungs = rungRepair.rungs;
+      await this.rungs.saveAll(finalRungs, symbol);
+      this.logger.warn(
+        `${symbol}: backfilled a Rung row for held lot(s) ${rungRepair.added.join(', ')} — ` +
+          'no rung existed at the price they hold, so the level could never have re-armed',
       );
     }
 
     // Reconciled. Only now is state written into the live strategy.
-    const restored = this.restore(
-      strategyId,
-      persistedLots,
-      persistedRungs,
-      snapshot?.data ?? null,
-    );
+    const restored = this.restore(strategyId, finalLots, finalRungs, snapshot?.data ?? null);
 
     // Resting orders are reconciled *after* the lot-sum assertion passes, not
     // instead of it: the two answer different questions. The assertion is about
     // shares that exist; this is about orders that might yet create some.
     await this.reconcileOpenOrders(strategyId, symbol, openOrders);
+
+    if (rebuildOutcome?.applied) {
+      this.logger.warn(
+        `${symbol}: LOT_SUM_MISMATCH auto-resolved via ${rebuildOutcome.action} — ` +
+          `${rebuildOutcome.detail}. See docs/decisions/auto-lot-rebuild.md.`,
+      );
+    }
 
     this.logger.log(
       `${symbol}: reconciled — ${verdict.reason}. ` +
@@ -445,24 +744,243 @@ export class ReconciliationService {
       restoredLots: restored.lots,
       restoredRungs: restored.rungs,
       snapshotVersion: snapshot?.version ?? null,
+      recoveredExits: recovery.recovered,
+      rebuildAction: rebuildOutcome?.applied ? rebuildOutcome.action : null,
     };
   }
 
   /**
-   * Reconciles the rung ledger against orders actually resting at the broker.
+   * Attempts `LotRebuildService` against a mismatch the assertion above just
+   * found. See `docs/decisions/auto-lot-rebuild.md` for why this is safe
+   * enough to run automatically in `PAPER` and nowhere else.
    *
-   * **This is what makes a restart safe.** The ladder's `WORKING` rungs are a
-   * record of orders this engine placed; the broker's open-order list is the
-   * record of which of them still exist. They diverge in both directions, and
-   * each direction is dangerous in its own way:
+   * Returns an unapplied outcome (never throws) when the mode gate refuses,
+   * so the caller's `if (rebuildOutcome.applied)` reads the same whether the
+   * attempt was skipped or genuinely failed to reconcile.
+   */
+  private async attemptRebuild(
+    symbol: string,
+    lots: Lot[],
+    rungs: Rung[],
+    positions: BrokerPosition[],
+    now: string,
+  ): Promise<RebuildOutcome> {
+    const skipped: RebuildOutcome = {
+      applied: false,
+      action: null,
+      lots,
+      rungs,
+      verdict: assertLotSum(
+        symbol,
+        lots,
+        positions.find((p) => p.symbol === symbol)?.quantity ?? 0,
+      ),
+      detail: 'auto-rebuild not attempted',
+    };
+
+    if (this.mode !== ExecutionMode.PAPER) {
+      return { ...skipped, detail: `auto-rebuild skipped — mode is ${this.mode}, not PAPER` };
+    }
+
+    // See `rebuildsAppliedBySymbol` and `docs/decisions/auto-lot-rebuild.md`
+    // — a second mismatch for a symbol already auto-rebuilt this session is
+    // treated as evidence of a live bug, not a second instance of the rare
+    // case Tier 2 exists for, and halts for an operator to look at rather
+    // than compounding another guess on top of the first.
+    const priorRebuilds = this.rebuildsAppliedBySymbol.get(symbol) ?? 0;
+
+    if (priorRebuilds > 0) {
+      return {
+        ...skipped,
+        detail:
+          `auto-rebuild skipped — ${symbol} already auto-rebuilt ${priorRebuilds} time(s) ` +
+          'this session; a repeat mismatch is treated as a live bug, not synthesized again',
+      };
+    }
+
+    // The shared `DIP_LADDER_CONFIG` describes one ladder — see the
+    // constructor comment and the decision doc's "revisit when" note for what
+    // a second symbol requires.
+    if (symbol !== this.ladderConfig.symbol) {
+      return { ...skipped, detail: `auto-rebuild skipped — no config registered for ${symbol}` };
+    }
+
+    const brokerPosition = positions.find((p) => p.symbol === symbol);
+
+    // A broker reporting a nonzero position with no usable average cost is
+    // malformed data, not a gap this system's own records can fill — Tier 2
+    // would otherwise synthesize a lot at price zero, which reconciles the
+    // *count* while recording a fill price that cannot be real.
+    if ((brokerPosition?.quantity ?? 0) > 0 && (brokerPosition?.averageCost ?? 0) <= 0) {
+      return {
+        ...skipped,
+        detail: 'auto-rebuild skipped — broker reports a position with no usable average cost',
+      };
+    }
+
+    return this.rebuild.attempt({
+      symbol,
+      persistedLots: lots,
+      persistedRungs: rungs,
+      brokerQuantity: brokerPosition?.quantity ?? 0,
+      brokerAverageCost: brokerPosition?.averageCost ?? 0,
+      takeProfitPercent: this.ladderConfig.takeProfitPercent,
+      takeProfitDollars: this.ladderConfig.takeProfitDollars,
+      now,
+    });
+  }
+
+  /**
+   * Closes a HELD lot whose resting exit already filled at the broker but was
+   * never routed live — a real, recorded `Fill` this engine simply failed to
+   * apply — before the lot-sum assertion runs.
    *
-   * - **A `WORKING` rung with no order at IB** — the DAY order expired
-   *   overnight, or was cancelled in TWS. Left as-is the level is blocked
-   *   forever and the ladder silently stops laddering. Released to fireable.
-   * - **An order at IB with no `WORKING` rung** — the crash window: the order
-   *   reached IB but the process died before persisting the rung. Adopted, so
-   *   the ladder knows the level is taken. Without this the next bar places a
-   *   *second* order at the same price and both fill.
+   * **Why this cannot wait for `reconcileOpenOrders`.** That method only runs
+   * *after* the assertion passes, because it answers a different question
+   * (orders that might yet create shares) from the assertion (shares that
+   * already exist). A lot stranded HELD after its exit filled is exactly the
+   * assertion's failure mode — the DB is missing an exit the broker already
+   * executed — so recovering it has to happen first, or the symbol halts for
+   * a gap this system already has the evidence to close on its own.
+   *
+   * **The evidence bar, and why this is not the guess this file's own header
+   * comment warns against.** A lot closes only when both hold:
+   *
+   * 1. its `workingOrderId` names an order that is **not** currently resting
+   *    at the broker (`openOrders` says so) — something happened to it, and
+   * 2. this system's `Fill` table — populated only from a real IB
+   *    `execDetails` event, never synthesized — holds fill(s) for that exact
+   *    `clientOrderId` summing to **exactly** the lot's quantity.
+   *
+   * Nothing here infers a price or invents a quantity; both come from the
+   * fill itself, the same data `closeLotFromFill` would have used had the
+   * live router seen it. Anything short of an exact match — no fill at all,
+   * or one that does not cover the whole lot (a genuine partial exit needs
+   * the live path's lot-splitting, not a guess made here) — is left
+   * untouched, exactly as before this method existed: `reconcileOpenOrders`
+   * below still releases a `workingOrderId` the broker confirms gone
+   * *without* a matching fill (cancelled, rejected, expired), which is a
+   * different, safe kind of gone.
+   *
+   * **A missing rung is reconstructed, not left absent.** A HELD lot with no
+   * `Rung` row pointing at it (`rung.lotId === lot.id`) can happen when the
+   * held-lot itself survived a gap that lost its rung row; without a row to
+   * re-arm, closing the lot here would leave that price level permanently
+   * unable to fire again. Rebuilt fresh at `HELD` with `completedCycles: 0` —
+   * any cycle history predating the gap is unrecoverable, the same trade-off
+   * `dailyBars` makes on a restart that lost its own history.
+   */
+  private async recoverExitFills(
+    symbol: string,
+    lots: Lot[],
+    rungs: Rung[],
+    openOrders: OpenOrder[] | null,
+  ): Promise<{ lots: Lot[]; rungs: Rung[]; recovered: number }> {
+    // `null` is "could not ask", not "nothing resting" — the same distinction
+    // `reconcileOpenOrders` makes below, for the same reason: treating it as
+    // "definitely not resting" could close a lot whose exit is still working.
+    if (openOrders === null) {
+      return { lots, rungs, recovered: 0 };
+    }
+
+    const restingSellIds = new Set(
+      openOrders
+        .filter((order) => order.symbol === symbol && order.side === 'SELL')
+        .map((order) => order.clientOrderId),
+    );
+
+    let nextLots = lots;
+    let nextRungs = rungs;
+    let recovered = 0;
+
+    for (const lot of lots) {
+      if (lot.status !== LotStatus.HELD || !lot.workingOrderId) {
+        continue;
+      }
+
+      if (restingSellIds.has(lot.workingOrderId)) {
+        continue;
+      }
+
+      const exitFills = await this.fills.findByClientOrderId(lot.workingOrderId);
+      const filledQuantity = exitFills.reduce((sum, fill) => sum + fill.quantity, 0);
+
+      if (exitFills.length === 0 || filledQuantity !== lot.quantity) {
+        continue;
+      }
+
+      // Several rows would mean the broker filled this one order in more than
+      // one print; the exact-quantity match above already rules out a true
+      // partial sitting here, so the last print is the one that completed it.
+      const fill = exitFills[exitFills.length - 1];
+
+      const closed = closeLot(lot, fill.price, fill.timestamp);
+      nextLots = nextLots.map((candidate) => (candidate.id === lot.id ? closed : candidate));
+
+      const rungIndex = nextRungs.findIndex((candidate) => candidate.lotId === lot.id);
+      const heldRung: Rung =
+        rungIndex === -1
+          ? {
+              price: lot.rungPrice,
+              status: RungStatus.HELD,
+              lotId: lot.id,
+              workingOrderId: null,
+              completedCycles: 0,
+              lastExitAt: null,
+            }
+          : nextRungs[rungIndex];
+
+      const rearmed = reArm(heldRung, fill.timestamp);
+      nextRungs =
+        rungIndex === -1
+          ? [...nextRungs, rearmed]
+          : nextRungs.map((candidate, index) => (index === rungIndex ? rearmed : candidate));
+
+      recovered += 1;
+
+      this.logger.warn(
+        `${symbol}: recovered exit fill for ${lot.id} — order ${lot.workingOrderId} filled ` +
+          `${fill.quantity} @ ${fill.price.toFixed(2)} but was never routed live; closed with ` +
+          `realized ${((fill.price - lot.fillPrice) * lot.quantity).toFixed(2)}`,
+      );
+    }
+
+    if (recovered > 0) {
+      await this.lots.saveAll(nextLots, symbol);
+      await this.rungs.saveAll(nextRungs, symbol);
+    }
+
+    return { lots: nextLots, rungs: nextRungs, recovered };
+  }
+
+  /**
+   * Reconciles the rung ledger and the held-lot exits against orders actually
+   * resting at the broker.
+   *
+   * **This is what makes a restart safe.** The ladder's `WORKING` rungs and
+   * its held lots' `workingOrderId`s are a record of orders this engine
+   * placed; the broker's open-order list is the record of which of them still
+   * exist. They diverge in both directions, and each direction is dangerous
+   * in its own way:
+   *
+   * - **A `WORKING` rung, or a held lot, with no order at IB** — the DAY
+   *   order expired overnight, or was cancelled in TWS. Left as-is the rung
+   *   is blocked forever and the ladder silently stops laddering, or the lot
+   *   is permanently unprotected: with `workingOrderId` still set it can
+   *   never be diagnosed as `missing`, so `place-missing` can never rest a
+   *   fresh exit for it. Released — the rung to fireable, the lot to a bare
+   *   `workingOrderId: null` a future diagnosis can pick up.
+   *
+   *   By the time this runs, `recoverExitFills` above has already closed any
+   *   held lot whose "gone" order turned out to be a fill this system had on
+   *   record — so a lot reaching this branch is one whose order is gone
+   *   *without* a matching fill: genuinely cancelled, rejected, or expired.
+   * - **A BUY order at IB with no `WORKING` rung** — the crash window: the
+   *   order reached IB but the process died before persisting the rung.
+   *   Adopted, so the ladder knows the level is taken. Without this the next
+   *   bar places a *second* order at the same price and both fill. The SELL
+   *   equivalent is adopted separately, by `EngineService.adoptWorkingOrders`
+   *   keying off the lot rather than a price — see its own doc comment.
    *
    * Orders are never cancelled here. An order the engine cannot explain is
    * reported, not destroyed — cancelling an order an operator placed by hand
@@ -491,16 +1009,38 @@ export class ReconciliationService {
     }
 
     const rungs = DipLadderStrategy.rungsOf(state) ?? [];
-    const restingForSymbol = openOrders.filter(
-      (order) => order.symbol === symbol && order.side === 'BUY',
+    const lots = DipLadderStrategy.lotsOf(state) ?? [];
+    const restingForSymbol = openOrders.filter((order) => order.symbol === symbol);
+    const restingBuyIds = new Set(
+      restingForSymbol.filter((order) => order.side === 'BUY').map((order) => order.clientOrderId),
     );
-    const restingIds = new Set(restingForSymbol.map((order) => order.clientOrderId));
+    const restingSellIds = new Set(
+      restingForSymbol.filter((order) => order.side === 'SELL').map((order) => order.clientOrderId),
+    );
 
     let released = 0;
 
     for (const rung of rungs) {
-      if (rung.workingOrderId && !restingIds.has(rung.workingOrderId)) {
+      if (rung.workingOrderId && !restingBuyIds.has(rung.workingOrderId)) {
         DipLadderStrategy.clearWorkingOrder(state, rung.workingOrderId);
+        released += 1;
+      }
+    }
+
+    // The SELL-side counterpart to the rung release above. A held lot's
+    // `workingOrderId` is stale in exactly the same way a rung's is — the DAY
+    // order expired, or an operator cancelled it in TWS — and left unreleased
+    // the lot can never again be diagnosed as `missing`, so `place-missing` can
+    // never rest a fresh exit for it. See "Orders the engine could not learn
+    // the fate of" — this is the gap that leaves a held lot permanently
+    // unprotected once its exit is cancelled out of band.
+    for (const lot of lots) {
+      if (
+        lot.status === LotStatus.HELD &&
+        lot.workingOrderId &&
+        !restingSellIds.has(lot.workingOrderId)
+      ) {
+        DipLadderStrategy.clearWorkingOrder(state, lot.workingOrderId);
         released += 1;
       }
     }
@@ -508,7 +1048,9 @@ export class ReconciliationService {
     const knownIds = new Set(
       rungs.map((rung) => rung.workingOrderId).filter((id): id is string => Boolean(id)),
     );
-    const orphans = restingForSymbol.filter((order) => !knownIds.has(order.clientOrderId));
+    const orphans = restingForSymbol.filter(
+      (order) => order.side === 'BUY' && !knownIds.has(order.clientOrderId),
+    );
 
     for (const orphan of orphans) {
       DipLadderStrategy.recordWorkingOrder(state, orphan.limitPrice, orphan.clientOrderId);
@@ -516,15 +1058,59 @@ export class ReconciliationService {
 
     if (released > 0 || orphans.length > 0) {
       this.logger.log(
-        `${symbol}: open-order reconciliation — released ${released} rung(s) whose order is ` +
-          `no longer at the broker, adopted ${orphans.length} resting order(s) the ladder ` +
-          'had no record of',
+        `${symbol}: open-order reconciliation — released ${released} rung/lot working-order ` +
+          `mark(s) whose order is no longer at the broker, adopted ${orphans.length} resting ` +
+          'order(s) the ladder had no record of',
       );
     }
 
     // The engine's in-memory working-order registry is rebuilt from what the
     // broker actually holds, so a fill on an adopted order finds its rung.
     this.onOpenOrdersReconciled?.(strategyId, symbol, restingForSymbol);
+  }
+
+  /**
+   * Backfills a `HELD` rung for any lot whose `rungPrice` has no matching
+   * `Rung` row, and returns the untouched array (same reference) when there
+   * is nothing to add — so a caller can skip the persist/log entirely on the
+   * ordinary case.
+   *
+   * Deliberately narrower than `LotRebuildService`: it never invents a
+   * quantity, a price, or a lot — every fact used here (`lot.rungPrice`,
+   * `lot.id`) is already trusted, sourced from a lot this reconciliation just
+   * accepted as correct. That is what makes it safe to run in every mode,
+   * unlike the Tier 1/Tier 2 rebuild, which is gated to `PAPER`
+   * (`docs/decisions/auto-lot-rebuild.md`) precisely because it *does* guess
+   * at composition.
+   *
+   * A rung that exists at the price but disagrees with the lot (wrong
+   * `lotId`, or a status other than `HELD`) is left alone rather than
+   * overwritten — that is a genuine conflict between two records that both
+   * claim to be authoritative, and guessing which one is stale is exactly the
+   * kind of silent correction this reconciliation path refuses to make
+   * elsewhere.
+   */
+  private ensureRungsForHeldLots(lots: Lot[], rungs: Rung[]): { rungs: Rung[]; added: string[] } {
+    const byPrice = new Map(rungs.map((rung) => [rung.price, rung]));
+    const added: string[] = [];
+
+    for (const lot of lots) {
+      if (lot.status !== LotStatus.HELD || byPrice.has(lot.rungPrice)) {
+        continue;
+      }
+
+      byPrice.set(lot.rungPrice, {
+        price: lot.rungPrice,
+        status: RungStatus.HELD,
+        lotId: lot.id,
+        workingOrderId: null,
+        completedCycles: 0,
+        lastExitAt: null,
+      });
+      added.push(lot.id);
+    }
+
+    return added.length > 0 ? { rungs: [...byPrice.values()], added } : { rungs, added };
   }
 
   /**
@@ -567,6 +1153,20 @@ export class ReconciliationService {
       data.sessionOpen = numberOrNull(snapshotData.sessionOpen);
       data.sessionDate =
         typeof snapshotData.sessionDate === 'string' ? snapshotData.sessionDate : null;
+      data.sessionHigh = numberOrNull(snapshotData.sessionHigh);
+      data.sessionLow = numberOrNull(snapshotData.sessionLow);
+      data.sessionCloseAt =
+        typeof snapshotData.sessionCloseAt === 'string' ? snapshotData.sessionCloseAt : null;
+      // ATR's daily-bar history, restored the same lightweight way as every
+      // other scalar here: not deeply validated (nothing else in this method
+      // is either), just type-checked well enough that a malformed or missing
+      // value degrades to empty rather than crashing the first ATR lookup. An
+      // empty result is not a fault — it is the same "insufficient history"
+      // fallback a cold start already produces (`spacing.ts`), so a restart
+      // that loses this array trades a warm-up period, not a failure.
+      data.dailyBars = (
+        Array.isArray(snapshotData.dailyBars) ? snapshotData.dailyBars : []
+      ) as DipLadderStateData['dailyBars'];
     }
 
     this.coordinator.setState(strategyId, state);
@@ -581,6 +1181,8 @@ export class ReconciliationService {
     verdict: LotSumVerdict,
     now: string,
     snapshotVersion: number | null,
+    recoveredExits: number,
+    rebuildAction: RebuildAction | null,
   ): SymbolReconciliation {
     this.halts.halt(symbol, code, verdict.reason, now);
 
@@ -595,6 +1197,14 @@ export class ReconciliationService {
       restoredLots: 0,
       restoredRungs: 0,
       snapshotVersion,
+      // Reported even on a halt: `verdict` above was computed from the
+      // post-recovery lots, so a symbol that still does not reconcile after
+      // recovery genuinely has a second, different problem — this says
+      // recovery was not silently skipped.
+      recoveredExits,
+      // Always null here: `haltWith` is only reached when nothing reconciled,
+      // and `RebuildOutcome.applied` is what would have made it reconcile.
+      rebuildAction,
     };
   }
 

@@ -17,6 +17,7 @@ import { ExecutionMode } from '../../config/execution-mode';
 import { EngineService } from '../../engine/engine.service';
 import { StartupSequence } from '../../engine/startup.sequence';
 import { ReconciliationService } from '../../reconciliation/reconciliation.service';
+import { LotRebuildService } from '../../reconciliation/lot-rebuild.service';
 import { SymbolHaltService } from '../../reconciliation/symbol-halt.service';
 import { LotStatus } from '../../strategies/dip-ladder/lot';
 import { MockBrokerAdapter } from '../../broker/mock/mock-broker.adapter';
@@ -30,6 +31,7 @@ import { InMemoryRiskEventSink } from '../../risk/risk-event';
 import { buildRiskConfig } from '../../risk/risk.config';
 import {
   PrismaFillRepository,
+  PrismaLotRebuildEventRepository,
   PrismaLotRepository,
   PrismaOrderIntentRepository,
   PrismaOrderRepository,
@@ -75,9 +77,10 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
     const broker = new MockBrokerAdapter();
     const halts = new SymbolHaltService();
     const snapshots = new PrismaStrategyStateSnapshotRepository(service);
+    const ladderConfig = buildDipLadderConfig('TQQQ', { symbolCapital: 100_000 });
 
     coordinator.register({
-      strategy: new DipLadderStrategy(buildDipLadderConfig('TQQQ', { symbolCapital: 100_000 })),
+      strategy: new DipLadderStrategy(ladderConfig),
       enabled: true,
       symbols: ['TQQQ'],
     });
@@ -92,6 +95,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
     const lots = new PrismaLotRepository(service);
     const orders = new PrismaOrderRepository(service);
     const rungs = new PrismaRungRepository(service);
+    const fills = new PrismaFillRepository(service);
 
     const engine = new EngineService(
       new ReplayService(),
@@ -100,7 +104,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
       broker,
       new PrismaOrderIntentRepository(service),
       orders,
-      new PrismaFillRepository(service),
+      fills,
       lots,
       rungs,
       ExecutionMode.PAPER,
@@ -112,7 +116,20 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
     // enforces — a second instance would let a halted symbol keep trading.
     const startup = new StartupSequence(
       coordinator,
-      new ReconciliationService(coordinator, halts, broker, lots, orders, rungs, snapshots),
+      new ReconciliationService(
+        coordinator,
+        halts,
+        broker,
+        lots,
+        orders,
+        rungs,
+        snapshots,
+        fills,
+        new LotRebuildService(orders, fills),
+        new PrismaLotRebuildEventRepository(service),
+        ladderConfig,
+        ExecutionMode.PAPER,
+      ),
       broker,
     );
 

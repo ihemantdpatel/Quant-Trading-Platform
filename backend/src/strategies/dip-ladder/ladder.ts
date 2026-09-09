@@ -1,8 +1,8 @@
 import { Bar } from '../../market-data/types';
-import { resolveAnchor } from './anchor';
+import { isRebasableGap, lowestHeldLotPrice, resolveAnchor } from './anchor';
 import { DipLadderConfig, OrderPlacement } from './config';
 import { evaluateInvalidation, InvalidationResult } from './invalidation';
-import { findRung, highestFireableRung, selectFireableRung } from './rung';
+import { fireableRungsDescending, findRung, selectFireableRung } from './rung';
 import { isWithinFiringWindow } from './session-window';
 import { nextRungPrice, roundToCents } from './spacing';
 import { EntryIntent, LadderPosition } from './types';
@@ -203,24 +203,84 @@ export function evaluateBar(
   // exists to capture, and would leave a released rung permanently unplaced
   // whenever price sits above it.
   const resting = config.orderPlacement === OrderPlacement.RESTING;
-  const existing = resting
-    ? highestFireableRung(position.rungs, bar.timestamp)
-    : selectFireableRung(position.rungs, bar.close, bar.timestamp);
 
-  if (existing) {
+  if (resting) {
     // A resting BUY limit must sit *below* the market to rest. A re-armed rung
-    // keeps its original price while price recovers past it, so
-    // `highestFireableRung` — which ignores where price is, by design — will
-    // hand back a level above the close. Sent as a limit order that is a
-    // marketable buy: it fills instantly at the ask instead of waiting for the
-    // dip, which is the opposite of what a predetermined-level ladder does.
-    if (resting && !isRestable(existing.price, bar.close)) {
-      return aboveMarket(existing.price, bar.close);
+    // keeps its original price while price recovers past it, so the highest
+    // fireable candidate may be above the close — marketable rather than
+    // resting. Rather than declining the whole bar over that one stale high
+    // rung, try every fireable candidate from highest to lowest and take the
+    // first that is actually restable: a lower re-armed or pending rung the
+    // market has since reached is exactly what the ladder should place at
+    // instead.
+    const candidates = fireableRungsDescending(position.rungs, bar.timestamp);
+    const restable = candidates.find((rung) => isRestable(rung.price, bar.close));
+
+    if (restable) {
+      return buildEntry(restable.price, bar, position, config, `re-arm/pending rung`);
     }
 
-    return buildEntry(existing.price, bar, position, config, `re-arm/pending rung`);
+    if (candidates.length > 0) {
+      // Every existing fireable rung is stranded above the market. Ordinarily
+      // that is where the bar declines rather than inventing a fresh level —
+      // computing one now would chase whatever single move stranded these
+      // candidates, which is exactly what a ladder that descends one rung at
+      // a time must not do (`declines a newly extended rung when price has
+      // fallen below the anchor`, below).
+      //
+      // The one deliberate exception: a *held* ladder that has ground down
+      // past `gapRebasePercent` from its own anchor — typically across
+      // several sessions of stale rungs accumulating above a market that
+      // moved on, not a single print — re-bases the same way the bootstrap
+      // anchor already does on a gapped-down open. `resolveAnchor` only
+      // re-bases past that threshold, so an ordinary bar still falls through
+      // to the decline below unchanged.
+      const lowestHeld = lowestHeldLotPrice(position.heldLots);
+
+      if (lowestHeld !== null && isRebasableGap(lowestHeld, bar.close, config)) {
+        const anchor = resolveAnchor(
+          position.heldLots,
+          previousClose,
+          sessionOpen,
+          config,
+          bar.close,
+        );
+        const rebasedPrice = nextRungPrice(anchor.price, config, dailyBars);
+
+        if (!findRung(position.rungs, rebasedPrice) && isRestable(rebasedPrice, bar.close)) {
+          return buildEntry(
+            rebasedPrice,
+            bar,
+            position,
+            config,
+            `progression anchor re-based to market ${bar.close.toFixed(2)}, resting limit`,
+          );
+        }
+      }
+
+      // None restable, and no gap re-base applied (or it produced nothing
+      // usable) — report against the highest, the level an operator is most
+      // likely watching.
+      return aboveMarket(candidates[0].price, bar.close);
+    }
+  } else {
+    const existing = selectFireableRung(position.rungs, bar.close, bar.timestamp);
+
+    if (existing) {
+      return buildEntry(existing.price, bar, position, config, `re-arm/pending rung`);
+    }
   }
 
+  // No `bar.close` here, deliberately — this is a genuinely fresh extension
+  // (no existing rung claims this level, and if one did the branch above
+  // already returned). Gap re-basing exists for a rung that has *already*
+  // been placed and left behind by the market — the `candidates.length > 0`
+  // branch above, which passes `bar.close` — not for the first time the
+  // ladder reaches a new level. Re-basing here would snap the very first
+  // extension after any ordinary >1%-in-one-bar move onto that bar's exact
+  // close instead of the next clean grid level, which is chasing the market
+  // rather than waiting for it — the opposite of what a predetermined-level
+  // ladder is for. See `resolveAnchor`'s `currentClose` parameter.
   const anchor = resolveAnchor(position.heldLots, previousClose, sessionOpen, config);
   const rungPrice = nextRungPrice(anchor.price, config, dailyBars);
 

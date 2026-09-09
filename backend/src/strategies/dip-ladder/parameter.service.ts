@@ -41,6 +41,7 @@ import { buildDipLadderConfig, DipLadderConfig } from './config';
 import { Lot, LotStatus } from './lot';
 import {
   buildParameterChanges,
+  EditableParameter,
   EditableParameters,
   editableParametersOf,
   isEditableParameter,
@@ -92,6 +93,120 @@ export class ParameterService {
 
   register(strategyId: string, config: DipLadderConfig): void {
     this.configs.set(strategyId, config);
+  }
+
+  /**
+   * Re-applies the latest recorded value of every editable field onto a
+   * freshly-registered config, from the append-only audit log.
+   *
+   * **Without this, a restart silently discards every runtime edit.** The
+   * config `register()` receives is rebuilt from compiled source constants on
+   * every boot (`strategies.module.ts`); nothing else reads `ParameterChange`
+   * history back, so an operator's tuning — say, raising `maxConcurrentRungs`
+   * to trade through a wider ladder — reverts to the code default the instant
+   * the process restarts, with no warning. Worse than a cosmetic revert: a cap
+   * that reverts below the number of lots currently held blocks new entries
+   * with `MAX_RUNGS_HELD` until someone notices and re-applies the same edit
+   * again.
+   *
+   * Called once at boot, after `register()` and before any bar reaches the
+   * strategy — mirroring the ordering `StartupSequence` already establishes
+   * for lots and rungs, just for parameters instead.
+   *
+   * **Deliberately does not append new `ParameterChange` records.** This
+   * restores values that are already on the log; treating it as a fresh edit
+   * would double the audit trail on every restart and make "when did an
+   * operator actually change this" unreadable.
+   *
+   * **Non-fatal by design.** A parameter that was valid when recorded but is
+   * rejected by today's `buildDipLadderConfig` (e.g. a validation rule
+   * tightened since) must not block the whole engine from booting — the
+   * config falls back to its compiled defaults for every field involved, and
+   * the failure is only logged. Also mirrors `restoreClientOrderSequence`,
+   * the other best-effort restore in this startup path.
+   */
+  async restore(strategyId: string): Promise<void> {
+    const config = this.configs.get(strategyId);
+
+    if (!config) {
+      return;
+    }
+
+    const history = await this.changes.findByStrategy(strategyId);
+
+    // Bump the in-memory changeId counter past every sequence number seen in
+    // history. `changeSequence` is a single counter shared by every `edit()`
+    // call across every strategy, and each `ParameterChange.id` is
+    // `${changeId}:${parameter}` with no strategyId in it — so restoring it
+    // too low lets a fresh edit reuse a `param-change-N` a prior process
+    // lifetime already wrote, and the second `.append()` fails on the
+    // primary key. Only ever raised, never lowered, so restoring several
+    // strategies in any order converges on the true max.
+    for (const change of history) {
+      const match = /^param-change-(\d+)$/.exec(change.changeId);
+
+      if (match) {
+        this.changeSequence = Math.max(this.changeSequence, Number(match[1]));
+      }
+    }
+
+    if (history.length === 0) {
+      return;
+    }
+
+    // Append-only, so the latest record per field is the effective value —
+    // ties (identical timestamps) resolve to whichever sorts last, matching
+    // insertion order for records written in the same edit.
+    const latest = new Map<EditableParameter, ParameterChange>();
+
+    for (const change of history) {
+      if (!isEditableParameter(change.parameter)) {
+        continue;
+      }
+
+      const existing = latest.get(change.parameter);
+
+      if (!existing || change.timestamp >= existing.timestamp) {
+        latest.set(change.parameter, change);
+      }
+    }
+
+    if (latest.size === 0) {
+      return;
+    }
+
+    const requested = {} as Record<string, unknown>;
+
+    for (const [name, change] of latest) {
+      requested[name] = change.newValue;
+    }
+
+    let candidate: DipLadderConfig;
+
+    try {
+      // Same validation path `edit()` uses, so a restore can never produce a
+      // config boot would have refused.
+      candidate = buildDipLadderConfig(config.symbol, {
+        ...editableParametersOf(config),
+        ...requested,
+        symbolCapital: config.symbolCapital,
+      });
+    } catch (error) {
+      this.logger.error(
+        `could not restore parameters for ${strategyId} from history — leaving compiled ` +
+          `defaults in force: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+
+    for (const name of Object.keys(requested) as (keyof EditableParameters)[]) {
+      Object.assign(config, { [name]: candidate[name] });
+    }
+
+    this.logger.log(
+      `restored ${latest.size} parameter(s) for ${strategyId} from history: ` +
+        [...latest.entries()].map(([name, change]) => `${name}=${change.newValue}`).join(', '),
+    );
   }
 
   parametersOf(strategyId: string): EditableParameters | null {

@@ -111,6 +111,18 @@ export interface StoqeyIbSocketConfig {
  */
 const EXECUTIONS_REQ_ID = 1;
 
+/**
+ * How often `requestExecutions` is re-issued while connected.
+ *
+ * `reqExecutions` is a snapshot as of the moment it is called, not a standing
+ * subscription — see `startExecutionsPoll` for why calling it only once per
+ * connect left fills unrouted for as long as the socket happened to stay up.
+ * A minute bounds that gap without meaningfully adding to IB's message rate;
+ * this is unrelated to `PacingQueue`, which paces historical-data requests
+ * specifically.
+ */
+const EXECUTIONS_POLL_MS = 60_000;
+
 /** IB's bar-size wire strings, for the two sizes this system uses. */
 const BAR_SIZE_SETTING: Record<BarSize, BarSizeSetting> = {
   [BarSize.FIVE_MIN]: BarSizeSetting.MINUTES_FIVE,
@@ -136,6 +148,7 @@ export class StoqeyIbSocket implements IbSocket {
 
   private connected = false;
   private orderIdSequence = 0;
+  private executionsPollTimer: ReturnType<typeof setInterval> | null = null;
 
   /** `clientOrderId` → IB's numeric order id, for cancels and correlation. */
   private readonly orderIds = new Map<string, number>();
@@ -184,6 +197,7 @@ export class StoqeyIbSocket implements IbSocket {
     // made on, and IB Gateway logs itself out daily. The same reasoning as
     // `LiveFeedService` re-subscribing bars on every CONNECTED.
     this.requestExecutions();
+    this.startExecutionsPoll();
 
     this.connected = true;
     this.logger.log(`connected to IB Gateway at ${this.config.host}:${this.config.port}`);
@@ -209,6 +223,44 @@ export class StoqeyIbSocket implements IbSocket {
     // reqId is per-request and this is the only execution request on this
     // client, so a fixed id is safe and keeps the correlation obvious.
     this.eventApi.reqExecutions(EXECUTIONS_REQ_ID, {});
+  }
+
+  /**
+   * Re-issues `requestExecutions` every `EXECUTIONS_POLL_MS` for the life of
+   * the process.
+   *
+   * **`reqExecutions` is a snapshot, not a subscription.** It replays
+   * executions up to the moment it is called; it does not keep pushing new
+   * ones as they happen afterward. Calling it only once, at `connect()`, left
+   * a live fill unrouted for as long as the socket happened to stay
+   * connected — no lot opened, no order left `SUBMITTED` — until the *next*
+   * reconnect's fresh call replayed it, which in production meant hours of a
+   * silently drifting position and a `LOT_SUM_MISMATCH` halt the moment
+   * reconciliation next ran. Re-issuing on a short timer bounds that gap to
+   * `EXECUTIONS_POLL_MS` instead of the lifetime of the connection.
+   *
+   * Safe while briefly disconnected: the underlying client queues commands
+   * issued before the socket has (re)connected and sends them once it has, so
+   * a tick landing during a drop is delayed rather than lost. `routeFill`
+   * dedupes on `fillId`, so a re-delivered fill already recorded is a no-op —
+   * the same guarantee that already makes the reconnect-time replay safe.
+   *
+   * Started once and guarded against a second interval from a later
+   * `connect()` call (a reconnect): `requestExecutions` reads `this.eventApi`
+   * fresh on every tick, and that instance is reused rather than recreated
+   * across reconnects, so one running timer stays correct for the life of the
+   * process.
+   */
+  private startExecutionsPoll(): void {
+    if (this.executionsPollTimer) {
+      return;
+    }
+
+    this.executionsPollTimer = setInterval(() => this.requestExecutions(), EXECUTIONS_POLL_MS);
+
+    // Node keeps the process alive for a pending interval; this poll should
+    // not be the reason the daemon cannot exit.
+    this.executionsPollTimer.unref?.();
   }
 
   async disconnect(): Promise<void> {

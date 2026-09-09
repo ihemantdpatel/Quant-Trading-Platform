@@ -178,7 +178,10 @@ export function isHeld(lot: Lot): boolean {
 }
 
 /**
- * Held lots at a rung, oldest first — the FIFO disposal order.
+ * Any lots, oldest first — the FIFO ordering rule, generalized beyond one
+ * rung. `LotRebuildService`'s write-off path uses this directly: an automatic
+ * write-off disposes the oldest exposure across the whole symbol, the same
+ * ordering the ladder would itself use if it were choosing what to sell.
  *
  * Ties on `openedAt` break by `id` so the ordering is total and stable. Two
  * lots can share a timestamp when a bar fills more than one rung, and an
@@ -186,14 +189,17 @@ export function isHeld(lot: Lot): boolean {
  * is exactly the kind of nondeterminism that cannot be reconciled after a
  * restart.
  */
+export function fifoQueue(lots: Lot[]): Lot[] {
+  return [...lots].sort((a, b) =>
+    a.openedAt === b.openedAt ? compare(a.id, b.id) : compare(a.openedAt, b.openedAt),
+  );
+}
+
+/** Held lots at a rung, oldest first — the FIFO disposal order. */
 export function fifoQueueAtRung(lots: Lot[], rungPrice: number): Lot[] {
   const target = roundToCents(rungPrice);
 
-  return lots
-    .filter((lot) => isHeld(lot) && roundToCents(lot.rungPrice) === target)
-    .sort((a, b) =>
-      a.openedAt === b.openedAt ? compare(a.id, b.id) : compare(a.openedAt, b.openedAt),
-    );
+  return fifoQueue(lots.filter((lot) => isHeld(lot) && roundToCents(lot.rungPrice) === target));
 }
 
 function compare(a: string, b: string): number {

@@ -199,4 +199,115 @@ describe('ParameterService', () => {
       await expect(changes.findAll()).resolves.toEqual([]);
     });
   });
+
+  /**
+   * `restore` is what makes an edit survive a restart. `strategies.module.ts`
+   * rebuilds `DipLadderConfig` from compiled defaults on every boot, and
+   * nothing else reads `ParameterChange` history back — so these tests
+   * simulate a restart by registering a *fresh* config against the *same*
+   * change repository, exactly as `EngineModule.onModuleInit` does.
+   */
+  describe('restore', () => {
+    const reboot = (overrides = {}) => {
+      const restarted = new ParameterService(coordinator, changes);
+      const restartedConfig = buildDipLadderConfig('TQQQ', {
+        symbolCapital: 100_000,
+        ...overrides,
+      });
+      restarted.register(STRATEGY_ID, restartedConfig);
+      return { restarted, restartedConfig };
+    };
+
+    it('re-applies the latest edit onto a config rebuilt from compiled defaults', async () => {
+      await edit({ maxConcurrentRungs: 10 });
+
+      const { restarted, restartedConfig } = reboot();
+      await restarted.restore(STRATEGY_ID);
+
+      expect(restartedConfig.maxConcurrentRungs).toBe(10);
+    });
+
+    it('keeps only the latest value per field across several edits', async () => {
+      await edit({ spacingDollars: 0.5 });
+      await edit({ spacingDollars: 0.75 });
+
+      const { restarted, restartedConfig } = reboot();
+      await restarted.restore(STRATEGY_ID);
+
+      expect(restartedConfig.spacingDollars).toBe(0.75);
+    });
+
+    it('does not append a new ParameterChange record', async () => {
+      await edit({ maxConcurrentRungs: 10 });
+
+      const { restarted } = reboot();
+      await restarted.restore(STRATEGY_ID);
+
+      await expect(changes.findByStrategy(STRATEGY_ID)).resolves.toHaveLength(1);
+    });
+
+    it('is a no-op for a strategy with no edit history', async () => {
+      const { restarted, restartedConfig } = reboot();
+      await restarted.restore(STRATEGY_ID);
+
+      expect(restartedConfig).toEqual(buildDipLadderConfig('TQQQ', { symbolCapital: 100_000 }));
+    });
+
+    it('is a no-op for an unregistered strategy id', async () => {
+      await edit({ maxConcurrentRungs: 10 });
+
+      const restarted = new ParameterService(coordinator, changes);
+      await expect(restarted.restore('never-registered')).resolves.toBeUndefined();
+    });
+
+    it('ignores a history record for a parameter that is not editable', async () => {
+      // Defensive: nothing in this codebase writes a `ParameterChange` for a
+      // non-editable field (`symbol`/`symbolCapital` are excluded from
+      // `EditableParameters` — see `config.ts`), but `restore` reads history
+      // it did not itself write and must not assume every row was produced
+      // by `edit()`. A record like this filters out, and with nothing else in
+      // history `restore` is a no-op — the same outcome as no history at all.
+      await changes.append({
+        id: 'param-change-symbol:symbol',
+        changeId: 'param-change-symbol',
+        strategyId: STRATEGY_ID,
+        // Not a real `EditableParameter` — exactly the shape of row this test
+        // exists to prove `restore` tolerates, from a source `edit()` itself
+        // could never produce.
+        parameter: 'symbol' as never,
+        oldValue: 'TQQQ',
+        newValue: 'SOXL',
+        timestamp: AT,
+        stateAtChange: null,
+        reason: null,
+      });
+
+      const { restarted, restartedConfig } = reboot();
+      await restarted.restore(STRATEGY_ID);
+
+      expect(restartedConfig).toEqual(buildDipLadderConfig('TQQQ', { symbolCapital: 100_000 }));
+    });
+
+    it('leaves compiled defaults in force when a restored value fails validation', async () => {
+      // A record `buildDipLadderConfig` always refuses (`maxConcurrentRungs`
+      // must be positive) — standing in for a value that was valid when
+      // recorded but is rejected by today's build, so a bad historical
+      // record must degrade rather than block boot.
+      await changes.append({
+        id: 'param-change-bad:maxConcurrentRungs',
+        changeId: 'param-change-bad',
+        strategyId: STRATEGY_ID,
+        parameter: 'maxConcurrentRungs',
+        oldValue: 5,
+        newValue: 0,
+        timestamp: AT,
+        stateAtChange: null,
+        reason: null,
+      });
+
+      const { restarted, restartedConfig } = reboot();
+      await expect(restarted.restore(STRATEGY_ID)).resolves.toBeUndefined();
+      expect(restartedConfig.maxConcurrentRungs).toBe(5);
+    });
+  });
 });

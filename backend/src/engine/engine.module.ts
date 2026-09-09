@@ -31,6 +31,7 @@ import {
   HistoryCacheService,
 } from '../market-data/history/cache.service';
 import { LiveFeedService } from '../market-data/live/live-feed.service';
+import { OrderPollService } from '../reconciliation/order-poll.service';
 import { PostCloseReconcileService } from '../reconciliation/post-close-reconcile.service';
 import { ReplayService } from '../market-data/mock/replay.service';
 import { ReconciliationModule } from '../reconciliation/reconciliation.module';
@@ -42,6 +43,7 @@ import {
   DuplicateOrderService,
   OrderDiagnosisService,
 } from '../reconciliation/order-diagnosis.service';
+import { LotRebuildService } from '../reconciliation/lot-rebuild.service';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 import { RepositoriesModule } from '../repositories/repositories.module';
 import {
@@ -49,7 +51,9 @@ import {
   BarRepository,
   FILL_REPOSITORY,
   FillRepository,
+  LOT_REBUILD_EVENT_REPOSITORY,
   LOT_REPOSITORY,
+  LotRebuildEventRepository,
   LotRepository,
   ORDER_INTENT_REPOSITORY,
   ORDER_REPOSITORY,
@@ -109,7 +113,63 @@ import { StartupSequence } from './startup.sequence';
     // `BROKER_ADAPTER`, which this module provides — reconciling against a
     // different broker instance than the engine trades through would compare
     // the database to the wrong account.
-    ReconciliationService,
+    //
+    // A factory rather than a bare class: `ReconciliationService` needs the
+    // running `ExecutionMode` (see `docs/decisions/auto-lot-rebuild.md` — its
+    // auto-rebuild path is gated to `PAPER`), and Nest cannot resolve a raw
+    // enum value from a token the way it resolves a class or an `@Inject`
+    // symbol. `EngineService`'s own factory below reads `appConfig.executionMode`
+    // the same way, for the same reason.
+    {
+      provide: ReconciliationService,
+      useFactory: (
+        coordinator: CoordinatorService,
+        symbolHalts: SymbolHaltService,
+        broker: BrokerAdapter,
+        lots: LotRepository,
+        orders: OrderRepository,
+        rungs: RungRepository,
+        snapshots: StrategyStateSnapshotRepository,
+        fills: FillRepository,
+        rebuild: LotRebuildService,
+        rebuildEvents: LotRebuildEventRepository,
+        ladderConfig: DipLadderConfig,
+        appConfig: AppConfigService,
+      ) =>
+        new ReconciliationService(
+          coordinator,
+          symbolHalts,
+          broker,
+          lots,
+          orders,
+          rungs,
+          snapshots,
+          fills,
+          rebuild,
+          rebuildEvents,
+          ladderConfig,
+          appConfig.executionMode,
+        ),
+      inject: [
+        CoordinatorService,
+        SymbolHaltService,
+        BROKER_ADAPTER,
+        LOT_REPOSITORY,
+        ORDER_REPOSITORY,
+        RUNG_REPOSITORY,
+        STRATEGY_STATE_SNAPSHOT_REPOSITORY,
+        FILL_REPOSITORY,
+        LotRebuildService,
+        LOT_REBUILD_EVENT_REPOSITORY,
+        DIP_LADDER_CONFIG,
+        AppConfigService,
+      ],
+    },
+    // Pure computation plus one repository read (`ORDER_REPOSITORY`) — see its
+    // own header comment. Provided here, not in `ReconciliationModule`, for the
+    // same reason `ReconciliationService` is: it exists only to be called from
+    // that service.
+    LotRebuildService,
     OrderDiagnosisService,
     DuplicateOrderService,
     // A single broker instance shared by the engine and the API, so a
@@ -245,6 +305,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(EngineModule.name);
   private liveFeed: LiveFeedService | null = null;
   private postClose: PostCloseReconcileService | null = null;
+  private orderPoll: OrderPollService | null = null;
 
   constructor(
     private readonly coordinator: CoordinatorService,
@@ -330,8 +391,15 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // either order then resolves to the wrong one. Chained ahead of `run`
     // rather than injected into `StartupSequence`, which would close a cycle:
     // `EngineService` already depends on the sequence.
-    void this.engine
-      .restoreClientOrderSequence()
+    //
+    // **Parameter restore runs first in the chain**, so a runtime edit an
+    // operator made before the last restart is back in force before a single
+    // bar can reach `evaluateBar` — `ParameterService.restore` never throws
+    // (it logs and leaves compiled defaults in place on any failure), so it
+    // needs no `.catch` of its own here.
+    void this.parameters
+      .restore(ladder.id)
+      .then(() => this.engine.restoreClientOrderSequence())
       .catch((error: unknown) => {
         // Non-fatal. A failed read leaves the counter at zero, which is the
         // pre-existing behaviour — the collision risk returns, but refusing to
@@ -401,10 +469,20 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // watching, which is exactly what the job exists to notice.
     this.postClose = new PostCloseReconcileService(this.reconciliation);
     this.postClose.start();
+
+    // **Same gating, different cadence.** The post-close job closes the gap
+    // at the *end* of a session; nothing previously closed it *during* one —
+    // an order resized or cancelled in TWS mid-session was invisible to this
+    // engine until the next boot, operator-triggered `POST /reconcile`, or the
+    // nightly job. See `order-poll.service.ts` for the concrete stranding risk
+    // that leaves open.
+    this.orderPoll = new OrderPollService(this.reconciliation);
+    this.orderPoll.start();
   }
 
   onModuleDestroy(): void {
     this.liveFeed?.stop();
     this.postClose?.stop();
+    this.orderPoll?.stop();
   }
 }

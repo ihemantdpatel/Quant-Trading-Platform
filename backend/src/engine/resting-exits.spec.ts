@@ -294,6 +294,54 @@ describe('resting exit orders', () => {
 
       expect(rungsOf(coordinator, ladder)[0].status).toBe(RungStatus.HELD);
     });
+
+    it('closes the lot in full across two execution reports for the same order', async () => {
+      // IB can — and did, against a live account — deliver one resting order's
+      // fill as more than one execution report for the same clientOrderId,
+      // both carrying the same timestamp. `Fill`'s own doc comment says as much
+      // ("one order can produce several"). Firing both `fillResting` calls
+      // before awaiting reproduces the race: `onFill` dispatches synchronously
+      // to an unawaited `routeFill`, so both handlers used to read the same
+      // stale `WorkingOrder` before either applied its update. The second
+      // report would then find the lot the first had already closed and
+      // report `EXIT_FILL_UNATTRIBUTED` for a fill that was entirely genuine,
+      // leaving the shares it represented stuck HELD in the ladder's books
+      // after the broker had actually sold them.
+      const { engine, broker, coordinator, ladder } = await buildEngine(FillMode.RESTING);
+      await broker.connect();
+
+      await openOneLot(engine);
+
+      const [held] = lotsOf(coordinator, ladder);
+      const orderId = held.workingOrderId!;
+      const originalQuantity = held.quantity;
+      const first = Math.floor(originalQuantity * 0.21);
+      const second = originalQuantity - first;
+      const at = bar(100, 58).timestamp;
+
+      // Deliberately not awaited between calls — reproduces IB emitting both
+      // execution reports before this process has processed either.
+      broker.fillResting(orderId, first, held.exitTarget, at);
+      broker.fillResting(orderId, second, held.exitTarget, at);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const lots = lotsOf(coordinator, ladder);
+      const closed = lots.filter((lot) => lot.status === LotStatus.CLOSED);
+      const stillHeld = lots.filter((lot) => lot.status === LotStatus.HELD);
+
+      // Both reports attributed: nothing left HELD for shares the broker
+      // already sold, and the full original quantity accounted for as closed.
+      expect(stillHeld).toHaveLength(0);
+      expect(closed.reduce((sum, lot) => sum + lot.quantity, 0)).toBe(originalQuantity);
+
+      expect(rungsOf(coordinator, ladder)[0].status).toBe(RungStatus.RE_ARMED);
+
+      const unattributed = engine
+        .alertHistory()
+        .filter((alert) => alert.code === 'EXIT_FILL_UNATTRIBUTED');
+      expect(unattributed).toHaveLength(0);
+    });
   });
 
   describe('a restart must not duplicate a resting sell', () => {

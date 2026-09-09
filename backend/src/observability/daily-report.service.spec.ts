@@ -591,6 +591,8 @@ describe('DailyReportService', () => {
         symbols: [],
         haltedSymbols: [SYMBOL],
         ordersUpdated: 0,
+        recoveredExits: 0,
+        rebuildsApplied: 0,
       };
 
       const report = await h.service.build(SESSION, NOW);
@@ -647,6 +649,8 @@ describe('DailyReportService', () => {
         symbols: [],
         haltedSymbols: [],
         ordersUpdated: 0,
+        recoveredExits: 0,
+        rebuildsApplied: 0,
       };
       await h.intents.save(intentRecord({ intent: { limitPrice: 95 } as never }));
 

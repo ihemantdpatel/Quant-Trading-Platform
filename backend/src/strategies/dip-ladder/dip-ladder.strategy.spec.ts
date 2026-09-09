@@ -97,6 +97,10 @@ describe('DipLadderStrategy', () => {
       runningClose: null,
       sessionOpen: null,
       sessionDate: null,
+      sessionHigh: null,
+      sessionLow: null,
+      sessionCloseAt: null,
+      dailyBars: [],
     });
     expect(JSON.parse(JSON.stringify(state))).toEqual(state);
   });
@@ -263,6 +267,43 @@ describe('DipLadderStrategy', () => {
       expect(data.previousSessionClose).not.toBeNull();
       expect(data.sessionOpen).not.toBeNull();
       expect(data.sessionDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    });
+
+    /**
+     * ATR spacing has no history to fetch on its own — strategies perform no
+     * I/O — so the ladder must build it from the sessions it observes. This
+     * proves that accumulation actually happens: one synthesized daily bar per
+     * completed session, capped at `atrPeriod + 1`, each with a real OHLC
+     * derived from that session's own bars.
+     */
+    it('folds each completed session into a capped daily-bar history for ATR spacing', async () => {
+      const bars = replay.getBars('chop-range');
+      const sessionDates = [...new Set(bars.map((bar) => bar.timestamp.slice(0, 10)))];
+      const { state } = await runBars(ladder({ atrPeriod: 2 }), bars);
+      const data = state.data as unknown as {
+        dailyBars: Bar[];
+        sessionHigh: number | null;
+        sessionLow: number | null;
+      };
+
+      // One bar per completed session, minus the session still open when the
+      // replay ends — capped at atrPeriod + 1 (3), not the full session count.
+      expect(data.dailyBars.length).toBe(3);
+      expect(data.dailyBars.length).toBeLessThan(sessionDates.length);
+
+      for (const daily of data.dailyBars) {
+        expect(daily.symbol).toBe('TQQQ');
+        expect(daily.high).toBeGreaterThanOrEqual(daily.low);
+        expect(daily.high).toBeGreaterThanOrEqual(daily.open);
+        expect(daily.high).toBeGreaterThanOrEqual(daily.close);
+        expect(daily.low).toBeLessThanOrEqual(daily.open);
+        expect(daily.low).toBeLessThanOrEqual(daily.close);
+      }
+
+      // The session still in progress when the replay ends is not yet folded
+      // in — only completed sessions are.
+      expect(data.sessionHigh).not.toBeNull();
+      expect(data.sessionLow).not.toBeNull();
     });
 
     it('excludes pre/post-market bars from session tracking entirely', async () => {
