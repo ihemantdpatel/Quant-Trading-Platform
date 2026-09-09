@@ -23,6 +23,7 @@ import { LotTable } from './components/LotTable';
 import { ModeSwitch } from './components/ModeSwitch';
 import { StatusBar } from './components/StatusBar';
 import { StrategyPanel } from './components/StrategyPanel';
+import { TradeHistoryTable } from './components/TradeHistoryTable';
 import { lastMarkPrice, loadExecution, totalDeployedCost, totalRealized } from './lib/api';
 
 /** Always rendered fresh — this reports live engine state. */
@@ -60,6 +61,8 @@ export default async function ExecutionPage() {
         <LadderView rungs={data.rungs} mark={mark} unavailable={data.unavailable?.rungs ?? false} />
         <LotTable lots={data.lots} mark={mark} unavailable={data.unavailable?.lots ?? false} />
       </div>
+
+      <TradeHistoryTable lots={data.lots} unavailable={data.unavailable?.lots ?? false} />
 
       <ActivityLog
         orders={data.orders}

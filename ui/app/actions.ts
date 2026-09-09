@@ -165,6 +165,43 @@ export async function editParameters(
   };
 }
 
+/**
+ * Applies an edit to the risk layer's per-symbol capital ceiling
+ * (`RiskConfig.perSymbolLimits`, `capital-cap.ts`).
+ *
+ * A **different** config from `editParameters` above — that one edits a
+ * ladder's own `DipLadderConfig`; this edits the risk-layer ceiling shared
+ * across every strategy trading `symbol`. Kept as a separate action, posting
+ * to a separate endpoint, for the same reason the backend keeps them as
+ * separate services: they are different facts with different owners.
+ */
+export async function editRiskLimit(
+  symbol: string,
+  limit: number,
+  reason?: string,
+): Promise<ActionResult> {
+  const result = await post<{ oldValue: number | null; newValue: number; changed: boolean }>(
+    `/risk-limits/${encodeURIComponent(symbol)}`,
+    { limit, reason: reason?.trim() || null },
+  );
+
+  revalidatePath('/', 'layout');
+
+  if (!result.ok) {
+    const { message, failures } = describe(result.error);
+    return { ok: false, message, failures };
+  }
+
+  if (!result.data?.changed) {
+    return { ok: true, message: `${symbol} risk limit unchanged.` };
+  }
+
+  return {
+    ok: true,
+    message: `${symbol} risk limit updated: ${result.data.oldValue ?? '(unconstrained)'} → ${result.data.newValue}.`,
+  };
+}
+
 /** Runs a fixture through the engine so the ladder can be watched cycling. */
 export async function runReplay(fixture: string): Promise<ActionResult> {
   const result = await post<{ barsProcessed: number; intentsGenerated: number }>('/engine/replay', {

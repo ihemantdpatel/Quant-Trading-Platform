@@ -219,9 +219,9 @@ export function isStale(
 }
 
 /**
- * Default staleness threshold: three missed 5-minute bars.
+ * Default staleness threshold: three missed 1-minute bars.
  *
  * One missed bar is normal — a thin symbol may simply not print. Three in a row
  * during a session means the feed is gone, not that the market is quiet.
  */
-export const DEFAULT_STALE_THRESHOLD_MS = 15 * 60 * 1000;
+export const DEFAULT_STALE_THRESHOLD_MS = 3 * 60 * 1000;

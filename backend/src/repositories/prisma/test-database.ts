@@ -117,6 +117,7 @@ export async function resetDatabase(prisma: PrismaClient = testClient()): Promis
   await prisma.instrument.deleteMany();
   await prisma.position.deleteMany();
   await truncateParameterChanges(prisma);
+  await truncatePerSymbolLimitChanges(prisma);
 }
 
 /**
@@ -130,4 +131,11 @@ export async function resetDatabase(prisma: PrismaClient = testClient()): Promis
  */
 export async function truncateParameterChanges(prisma: PrismaClient = testClient()): Promise<void> {
   await prisma.$executeRawUnsafe('TRUNCATE TABLE `ParameterChange`');
+}
+
+/** Same reasoning as `truncateParameterChanges`, for `PerSymbolLimitChange`'s identical triggers. */
+export async function truncatePerSymbolLimitChanges(
+  prisma: PrismaClient = testClient(),
+): Promise<void> {
+  await prisma.$executeRawUnsafe('TRUNCATE TABLE `PerSymbolLimitChange`');
 }

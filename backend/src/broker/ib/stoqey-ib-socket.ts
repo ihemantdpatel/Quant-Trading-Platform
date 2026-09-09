@@ -123,8 +123,9 @@ const EXECUTIONS_REQ_ID = 1;
  */
 const EXECUTIONS_POLL_MS = 60_000;
 
-/** IB's bar-size wire strings, for the two sizes this system uses. */
+/** IB's bar-size wire strings, for the sizes this system uses. */
 const BAR_SIZE_SETTING: Record<BarSize, BarSizeSetting> = {
+  [BarSize.ONE_MIN]: BarSizeSetting.MINUTES_ONE,
   [BarSize.FIVE_MIN]: BarSizeSetting.MINUTES_FIVE,
   [BarSize.DAILY]: BarSizeSetting.DAYS_ONE,
 };

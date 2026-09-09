@@ -32,10 +32,13 @@ class FakeSource implements LiveBarSource {
   unsubscribed = 0;
   /** How many times a bar subscription has been established. */
   subscribeCount = 0;
+  /** The `barSize` most recently passed to `subscribeBars`. */
+  lastBarSize: BarSize | null = null;
 
-  subscribeBars(_contract: unknown, _barSize: BarSize, handler: (bar: Bar) => void): () => void {
+  subscribeBars(_contract: unknown, barSize: BarSize, handler: (bar: Bar) => void): () => void {
     this.handler = handler;
     this.subscribeCount += 1;
+    this.lastBarSize = barSize;
 
     return () => {
       this.unsubscribed += 1;
@@ -171,6 +174,29 @@ describe('LiveFeedService', () => {
       expect(consumer.seen).toHaveLength(1);
       expect(consumer.seen[0].close).toBe(40);
       expect(feed.barsProcessed()).toBe(1);
+    });
+
+    it('subscribes at the requested bar size, defaulting to 5-minute', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ);
+
+      expect(source.lastBarSize).toBe(BarSize.FIVE_MIN);
+    });
+
+    it('subscribes at 1-minute bars when requested — the live engine default', async () => {
+      const source = new FakeSource();
+      const consumer = new RecordingConsumer();
+      const feed = new LiveFeedService(source, consumer);
+
+      feed.start(TQQQ, BarSize.ONE_MIN);
+      source.emit(bar('2025-01-02T09:45:00.000-05:00', 40));
+      await feed.drain();
+
+      expect(source.lastBarSize).toBe(BarSize.ONE_MIN);
+      expect(consumer.seen).toHaveLength(1);
     });
 
     it('processes bars strictly one at a time and in order', async () => {

@@ -11,6 +11,12 @@
  * Blended average cost appears **once**, below the table, labelled "reference
  * only" (`PRD.md:378`).
  *
+ * **Held lots only.** A closed lot has nothing left to watch — no target
+ * distance, no age relative to an open position — so it belongs in
+ * `TradeHistoryTable`, not here. Filtering happens once, at the top, rather
+ * than per-section, so every count and total below agrees with what the rows
+ * show.
+ *
  * A Server Component — it is pure presentation over props, with no state and no
  * handlers.
  */
@@ -23,7 +29,6 @@ import {
   lotAge,
   totalDeployedCost,
   totalHeldQuantity,
-  totalRealized,
   type Lot,
 } from '../lib/api';
 
@@ -49,20 +54,17 @@ export function LotTable({
   unavailable?: boolean;
 }) {
   const held = lots.filter((lot) => lot.status === 'HELD');
-  const closed = lots.filter((lot) => lot.status === 'CLOSED');
-  const blended = blendedAverageCost(lots);
+  const blended = blendedAverageCost(held);
   // Any row served from the database because its symbol is halted. The banner
   // is per-table rather than per-row: the caveat is about the whole reading,
   // and repeating it on every row would bury it.
-  const unverified = lots.some((lot) => lot.unverified);
+  const unverified = held.some((lot) => lot.unverified);
 
   return (
     <section aria-label="Per-lot table" className="rounded-lg border border-slate-800 bg-slate-900">
       <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-800 px-4 py-3">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Lots</h2>
-        <p className="text-xs text-slate-400">
-          {held.length} held · {closed.length} closed cycle{closed.length === 1 ? '' : 's'}
-        </p>
+        <p className="text-xs text-slate-400">{held.length} held</p>
       </header>
 
       {unverified && (
@@ -77,9 +79,9 @@ export function LotTable({
         <p className="px-4 py-6 text-sm text-amber-300">
           Lots unavailable — this read failed. The engine is unaffected; positions are untouched.
         </p>
-      ) : lots.length === 0 ? (
+      ) : held.length === 0 ? (
         <p className="px-4 py-6 text-sm text-slate-500">
-          No lots yet. Replay a fixture to drive the ladder.
+          No lots held. Replay a fixture to drive the ladder.
         </p>
       ) : (
         <div className="overflow-x-auto">
@@ -107,17 +109,11 @@ export function LotTable({
                 <th scope="col" className="px-4 py-2 font-medium">
                   Distance
                 </th>
-                <th scope="col" className="px-4 py-2 font-medium">
-                  Status
-                </th>
-                <th scope="col" className="px-4 py-2 font-medium">
-                  Realized
-                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {lots.map((lot) => {
-                const distance = lot.status === 'HELD' ? distanceToTarget(lot, mark) : null;
+              {held.map((lot) => {
+                const distance = distanceToTarget(lot, mark);
 
                 return (
                   <tr key={lot.id} data-testid={`lot-row-${lot.id}`} className="text-slate-200">
@@ -140,20 +136,6 @@ export function LotTable({
                     <td data-testid="cell-distance" className="px-4 py-2 font-mono text-slate-300">
                       {distance === null ? '—' : formatPercent(distance)}
                     </td>
-                    <td className="px-4 py-2">
-                      <span
-                        className={`rounded px-2 py-0.5 text-xs font-medium ${
-                          lot.status === 'HELD'
-                            ? 'bg-sky-950 text-sky-300'
-                            : 'bg-emerald-950 text-emerald-300'
-                        }`}
-                      >
-                        {lot.status}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 font-mono text-emerald-400">
-                      {lot.realized === null ? '—' : formatCurrency(lot.realized)}
-                    </td>
                   </tr>
                 );
               })}
@@ -162,10 +144,9 @@ export function LotTable({
         </div>
       )}
 
-      <footer className="grid gap-3 border-t border-slate-800 px-4 py-3 text-sm sm:grid-cols-4">
-        <Metric label="Shares held" value={String(totalHeldQuantity(lots))} />
-        <Metric label="Deployed at cost" value={formatCurrency(totalDeployedCost(lots))} />
-        <Metric label="Realized P&L" value={formatCurrency(totalRealized(lots))} accent />
+      <footer className="grid gap-3 border-t border-slate-800 px-4 py-3 text-sm sm:grid-cols-3">
+        <Metric label="Shares held" value={String(totalHeldQuantity(held))} />
+        <Metric label="Deployed at cost" value={formatCurrency(totalDeployedCost(held))} />
         <div>
           <p className="text-xs uppercase tracking-wide text-slate-500">
             Blended average{' '}

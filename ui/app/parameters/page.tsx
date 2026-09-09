@@ -55,6 +55,11 @@ export default async function ParametersPage() {
           parameters={set.parameters}
           heldLotCount={heldLots}
           changes={data.parameterChanges.filter((c) => c.strategyId === set.strategyId)}
+          symbol={set.symbol}
+          riskLimit={set.symbol ? (data.riskLimits[set.symbol] ?? null) : null}
+          riskLimitChanges={
+            set.symbol ? data.riskLimitChanges.filter((c) => c.symbol === set.symbol) : []
+          }
         />
       ))}
     </main>

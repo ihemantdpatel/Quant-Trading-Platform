@@ -122,7 +122,8 @@ export class LiveFeedService implements OnModuleDestroy {
   /**
    * Subscribes to a symbol and starts feeding the engine.
    *
-   * 5-minute bars: the cadence the ladder evaluates on (`stories.md:226`).
+   * `barSize` sets the cadence the ladder evaluates on (`stories.md:226`); the
+   * live engine currently subscribes at 1-minute bars (`engine.module.ts`).
    *
    * ## The subscription is re-established on every reconnect
    *

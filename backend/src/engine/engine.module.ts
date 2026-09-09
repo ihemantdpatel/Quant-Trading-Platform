@@ -31,6 +31,7 @@ import {
   HistoryCacheService,
 } from '../market-data/history/cache.service';
 import { LiveFeedService } from '../market-data/live/live-feed.service';
+import { BarSize } from '../market-data/types';
 import { OrderPollService } from '../reconciliation/order-poll.service';
 import { PostCloseReconcileService } from '../reconciliation/post-close-reconcile.service';
 import { ReplayService } from '../market-data/mock/replay.service';
@@ -77,6 +78,7 @@ function isForwardableSink(sink: RiskEventSink): sink is ForwardableSink {
 }
 import { RiskEvent, RiskEventSink } from '../risk/risk-event';
 import { RiskManagerService } from '../risk/risk-manager.service';
+import { RiskParameterService } from '../risk/risk-parameter.service';
 import { RISK_EVENT_SINK, RiskModule } from '../risk/risk.module';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
@@ -87,6 +89,7 @@ import { WheelStrategy } from '../strategies/wheel/wheel.strategy';
 import { ParameterService } from '../strategies/dip-ladder/parameter.service';
 import { DIP_LADDER_CONFIG, StrategiesModule } from '../strategies/strategies.module';
 import { EngineService } from './engine.service';
+import { RiskParametersController } from '../api/risk-parameters.controller';
 import { StartupSequence } from './startup.sequence';
 
 @Module({
@@ -101,9 +104,15 @@ import { StartupSequence } from './startup.sequence';
     RiskModule,
     StrategiesModule,
   ],
-  controllers: [BacktestController, EngineController, ParametersController],
+  controllers: [
+    BacktestController,
+    EngineController,
+    ParametersController,
+    RiskParametersController,
+  ],
   providers: [
     ParameterService,
+    RiskParameterService,
     StartupSequence,
     // Story 11. Depends only on the bar cache and the backtest repository — it
     // holds no broker, so no request to `/backtest` can reach IB, and it reads
@@ -293,6 +302,7 @@ import { StartupSequence } from './startup.sequence';
     EngineService,
     BROKER_ADAPTER,
     ParameterService,
+    RiskParameterService,
     StartupSequence,
     ReconciliationService,
     OrderDiagnosisService,
@@ -314,6 +324,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     @Inject(RISK_EVENT_SINK) private readonly riskEventSink: RiskEventSink,
     @Inject(RISK_EVENT_REPOSITORY) private readonly riskEvents: RiskEventRepository,
     private readonly parameters: ParameterService,
+    private readonly riskParameters: RiskParameterService,
     private readonly startup: StartupSequence,
     private readonly engine: EngineService,
     private readonly reconciliation: ReconciliationService,
@@ -392,36 +403,52 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // rather than injected into `StartupSequence`, which would close a cycle:
     // `EngineService` already depends on the sequence.
     //
-    // **Parameter restore runs first in the chain**, so a runtime edit an
-    // operator made before the last restart is back in force before a single
-    // bar can reach `evaluateBar` — `ParameterService.restore` never throws
-    // (it logs and leaves compiled defaults in place on any failure), so it
-    // needs no `.catch` of its own here.
-    void this.parameters
-      .restore(ladder.id)
-      .then(() => this.engine.restoreClientOrderSequence())
+    // **Risk-limit restore runs before ladder parameter restore, which runs
+    // before everything else in the chain.** A runtime edit to a per-symbol
+    // risk limit or a ladder parameter, made before the last restart, must be
+    // back in force before a single bar can reach the risk manager or
+    // `evaluateBar`. `RiskParameterService.restore` reads its own audit table
+    // (`findAll`), which can genuinely fail against an unreachable database —
+    // unlike `ParameterService.restore`, whose non-fatal internals never
+    // throw — so it gets its own `.catch` here, leaving the compiled
+    // `capital.config.ts` defaults in force rather than blocking the boot.
+    void this.riskParameters
+      .restore()
       .catch((error: unknown) => {
-        // Non-fatal. A failed read leaves the counter at zero, which is the
-        // pre-existing behaviour — the collision risk returns, but refusing to
-        // boot would take the operator's only view of the ladder down with it.
         this.logger.error(
-          `could not restore the client order sequence: ${
+          `could not restore per-symbol risk limits: ${
             error instanceof Error ? error.message : String(error)
-          }. Order ids may repeat those of a previous run.`,
+          }. Compiled defaults remain in force.`,
         );
       })
-      .then(() => this.startup.run(new Date().toISOString()))
-      .then(() => this.startLiveFeed())
-      .catch((error: unknown) => {
-        // `run` already absorbs an unreachable broker (every symbol halts and
-        // the reason is on `GET /status`). Reaching here means something else
-        // failed — log it and keep serving, so the failure is visible rather
-        // than silent.
-        this.logger.error(
-          `startup sequence failed: ${error instanceof Error ? error.message : String(error)}. ` +
-            'The API is up; no bars will be processed until reconciliation succeeds.',
-        );
-      });
+      .then(() =>
+        this.parameters
+          .restore(ladder.id)
+          .then(() => this.engine.restoreClientOrderSequence())
+          .catch((error: unknown) => {
+            // Non-fatal. A failed read leaves the counter at zero, which is the
+            // pre-existing behaviour — the collision risk returns, but refusing to
+            // boot would take the operator's only view of the ladder down with it.
+            this.logger.error(
+              `could not restore the client order sequence: ${
+                error instanceof Error ? error.message : String(error)
+              }. Order ids may repeat those of a previous run.`,
+            );
+          })
+          .then(() => this.startup.run(new Date().toISOString()))
+          .then(() => this.startLiveFeed())
+          .catch((error: unknown) => {
+            // `run` already absorbs an unreachable broker (every symbol halts and
+            // the reason is on `GET /status`). Reaching here means something else
+            // failed — log it and keep serving, so the failure is visible rather
+            // than silent.
+            this.logger.error(
+              `startup sequence failed: ${
+                error instanceof Error ? error.message : String(error)
+              }. The API is up; no bars will be processed until reconciliation succeeds.`,
+            );
+          }),
+      );
   }
 
   /**
@@ -457,7 +484,10 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       this.engine,
     );
 
-    this.liveFeed.start(equityContract(this.ladderConfig.symbol));
+    // 1-minute bars: faster re-evaluation than the 5-minute default, since
+    // resting orders already capture intra-bar fills — this changes how often
+    // the ladder re-evaluates and places new orders, not fill mechanics.
+    this.liveFeed.start(equityContract(this.ladderConfig.symbol), BarSize.ONE_MIN);
     this.liveFeed.startWatchdog();
 
     // **Started alongside the live feed, and gated on the same condition.**

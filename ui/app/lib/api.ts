@@ -250,6 +250,8 @@ export interface LadderParameters {
 
 export interface ParameterSet {
   strategyId: string;
+  /** The symbol this ladder trades — joins to `riskLimits[symbol]`. */
+  symbol: string | null;
   parameters: LadderParameters;
 }
 
@@ -311,10 +313,30 @@ export interface ExecutionData {
   unavailable?: Unavailable;
 }
 
+/**
+ * One edit to the risk layer's per-symbol capital ceiling
+ * (`RiskConfig.perSymbolLimits`, `capital-cap.ts`).
+ *
+ * A different fact from `ParameterChange` above — that audits edits to one
+ * ladder's `DipLadderConfig`; this audits edits to the risk-layer ceiling
+ * shared across every strategy trading `symbol`.
+ */
+export interface RiskLimitChange {
+  id: string;
+  symbol: string;
+  oldValue: number | null;
+  newValue: number;
+  timestamp: string;
+  reason: string | null;
+}
+
 /** What the Parameters tab renders. `lots` is only for the held-lot count. */
 export interface ParametersData {
   parameters: ParameterSet[];
   parameterChanges: ParameterChange[];
+  /** Current per-symbol risk limits, keyed by symbol. Absent key = unconstrained. */
+  riskLimits: Record<string, number>;
+  riskLimitChanges: RiskLimitChange[];
   lots: Lot[];
   /** Set when the backend could not be reached at all. */
   error: string | null;
@@ -583,16 +605,25 @@ function reasonOf(result: PromiseSettledResult<unknown>): unknown {
  * to be accurate rather than approximated.
  */
 export async function loadParameters(): Promise<ParametersData> {
-  const empty: ParametersData = { parameters: [], parameterChanges: [], lots: [], error: null };
+  const empty: ParametersData = {
+    parameters: [],
+    parameterChanges: [],
+    riskLimits: {},
+    riskLimitChanges: [],
+    lots: [],
+    error: null,
+  };
 
   try {
-    const [parameters, parameterChanges, lots] = await Promise.all([
+    const [parameters, parameterChanges, riskLimits, riskLimitChanges, lots] = await Promise.all([
       get<ParameterSet[]>('/parameters'),
       get<ParameterChange[]>('/parameters/changes'),
+      get<Record<string, number>>('/risk-limits'),
+      get<RiskLimitChange[]>('/risk-limits/changes'),
       get<Lot[]>('/lots'),
     ]);
 
-    return { parameters, parameterChanges, lots, error: null };
+    return { parameters, parameterChanges, riskLimits, riskLimitChanges, lots, error: null };
   } catch (error) {
     return { ...empty, error: failure(error) };
   }

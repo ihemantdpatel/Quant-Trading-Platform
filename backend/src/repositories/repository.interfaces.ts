@@ -243,6 +243,40 @@ export interface ParameterChangeRepository {
 }
 
 /**
+ * One edit to a per-symbol risk-layer capital ceiling (`capital-cap.ts`,
+ * `RiskConfig.perSymbolLimits`).
+ *
+ * Deliberately a separate table from `ParameterChange` rather than a
+ * differently-keyed row in it: that type is scoped to `DipLadderConfig`
+ * fields and its `parameter` column is typed to the ladder's own
+ * `EditableParameter` union, keyed by strategy id. A per-symbol capital limit
+ * belongs to `RiskConfig` — a different layer, shared across every strategy
+ * that trades a symbol, not owned by any one strategy instance. Append-only
+ * for the same reason `ParameterChange` is: an audit trail that can be
+ * rewritten is not one.
+ */
+export interface PerSymbolLimitChange {
+  id: string;
+  symbol: string;
+  /**
+   * Null when the symbol had no configured limit before this edit — i.e. it
+   * was previously unconstrained by this control (`RiskConfig.perSymbolLimits`
+   * doc comment).
+   */
+  oldValue: number | null;
+  newValue: number;
+  timestamp: string;
+  reason: string | null;
+}
+
+export interface PerSymbolLimitChangeRepository {
+  append(change: PerSymbolLimitChange): Promise<void>;
+  findAll(): Promise<PerSymbolLimitChange[]>;
+  findBySymbol(symbol: string): Promise<PerSymbolLimitChange[]>;
+  clear(): Promise<void>;
+}
+
+/**
  * A persisted backtest run and its metrics (Story 11).
  *
  * `parameters` carries **the full parameter set the run used**, rather than a
@@ -304,5 +338,6 @@ export const RUNG_REPOSITORY = Symbol('RUNG_REPOSITORY');
 export const RISK_EVENT_REPOSITORY = Symbol('RISK_EVENT_REPOSITORY');
 export const LOT_REBUILD_EVENT_REPOSITORY = Symbol('LOT_REBUILD_EVENT_REPOSITORY');
 export const PARAMETER_CHANGE_REPOSITORY = Symbol('PARAMETER_CHANGE_REPOSITORY');
+export const PER_SYMBOL_LIMIT_CHANGE_REPOSITORY = Symbol('PER_SYMBOL_LIMIT_CHANGE_REPOSITORY');
 export const STRATEGY_STATE_SNAPSHOT_REPOSITORY = Symbol('STRATEGY_STATE_SNAPSHOT_REPOSITORY');
 export const BACKTEST_REPOSITORY = Symbol('BACKTEST_REPOSITORY');

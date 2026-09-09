@@ -225,10 +225,10 @@ describe('isStale', () => {
     expect(isStale(1000, 2001, 1000)).toBe(true);
   });
 
-  it('defaults to three missed 5-minute bars', () => {
+  it('defaults to three missed 1-minute bars', () => {
     // One missed bar is normal on a thin symbol; three in a session means the
     // feed is gone rather than the market being quiet.
-    expect(DEFAULT_STALE_THRESHOLD_MS).toBe(15 * 60 * 1000);
+    expect(DEFAULT_STALE_THRESHOLD_MS).toBe(3 * 60 * 1000);
   });
 
   describe('when data was expected but none has arrived', () => {

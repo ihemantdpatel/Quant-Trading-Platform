@@ -11,6 +11,7 @@
 export const ET_ZONE = 'America/New_York';
 
 export enum BarSize {
+  ONE_MIN = '1min',
   FIVE_MIN = '5min',
   DAILY = '1day',
 }
@@ -20,6 +21,7 @@ export enum BarSize {
  * falls on a legitimate boundary for its size.
  */
 export const BAR_SIZE_MINUTES: Record<BarSize, number> = {
+  [BarSize.ONE_MIN]: 1,
   [BarSize.FIVE_MIN]: 5,
   [BarSize.DAILY]: 24 * 60,
 };

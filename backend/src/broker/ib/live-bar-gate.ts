@@ -18,7 +18,7 @@
  * IB provides no marker between the last historical bar and the first live one.
  * A gap in emissions is the only signal available: historical bars arrive
  * back-to-back in a burst, whereas the smallest live cadence this system
- * subscribes to is 5 minutes. So the window is "drained" once nothing has
+ * subscribes to is 1 minute. So the window is "drained" once nothing has
  * arrived for `settleMs`.
  *
  * Erring long is the safe direction — the cost is skipping one early bar,
@@ -32,7 +32,7 @@ import { Bar } from '../../market-data/types';
  * Quiet period marking the end of the historical backfill.
  *
  * Three seconds sits far above the gap between burst emissions and far below
- * the 5-minute live cadence.
+ * the smallest live cadence this system subscribes to (currently 1 minute).
  */
 export const BACKFILL_SETTLE_MS = 3_000;
 

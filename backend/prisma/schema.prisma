@@ -320,6 +320,25 @@ model ParameterChange {
   @@index([changeId], name: "parameter_change_group")
 }
 
+/// **Append-only.** The audit trail for edits to `RiskConfig.perSymbolLimits`
+/// (`capital-cap.ts`) — kept as its own table rather than a row in
+/// `ParameterChange` because a per-symbol capital ceiling belongs to the risk
+/// layer, shared across every strategy trading a symbol, not to any one
+/// `DipLadderConfig` instance keyed by strategy id. Same enforcement as
+/// `ParameterChange`: `BEFORE UPDATE`/`BEFORE DELETE` triggers reject any
+/// attempt to rewrite a row.
+model PerSymbolLimitChange {
+  id        String   @id @db.VarChar(191)
+  symbol    String   @db.VarChar(32)
+  /// Null when the symbol had no configured limit before this edit.
+  oldValue  Decimal? @db.Decimal(18, 6)
+  newValue  Decimal  @db.Decimal(18, 6)
+  timestamp String   @db.VarChar(32)
+  reason    String?  @db.Text
+
+  @@index([symbol], name: "per_symbol_limit_change_symbol")
+}
+
 /// Story 11 persists these so results are comparable across parameter sets.
 /// Declared now because the story lists them in the Story 8 schema
 /// (`stories.md:486`); no repository implements them yet.

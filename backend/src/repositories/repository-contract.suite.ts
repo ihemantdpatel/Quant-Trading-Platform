@@ -44,6 +44,8 @@ import {
   OrderRecord,
   OrderRepository,
   ParameterChangeRepository,
+  PerSymbolLimitChange,
+  PerSymbolLimitChangeRepository,
   RiskEventRepository,
   RungRepository,
   StrategyStateSnapshotRecord,
@@ -173,6 +175,91 @@ export function parameterChangeFixture(
     reason: 'widening the target',
     ...overrides,
   };
+}
+
+export function perSymbolLimitChangeFixture(
+  id: string,
+  overrides: Partial<PerSymbolLimitChange> = {},
+): PerSymbolLimitChange {
+  return {
+    id,
+    symbol: 'TQQQ',
+    oldValue: 40_000,
+    newValue: 180_000,
+    timestamp: '2025-01-02T10:00:00.000-05:00',
+    reason: 'account funded to a larger balance',
+    ...overrides,
+  };
+}
+
+export function runPerSymbolLimitChangeRepositoryContract(
+  create: RepositoryFactory<PerSymbolLimitChangeRepository>,
+  options: { supportsClear: boolean } = { supportsClear: true },
+): void {
+  describe('PerSymbolLimitChangeRepository contract', () => {
+    let repo: PerSymbolLimitChangeRepository;
+
+    beforeEach(async () => {
+      repo = await create();
+    });
+
+    it('appends changes in order', async () => {
+      await repo.append(perSymbolLimitChangeFixture('a'));
+      await repo.append(perSymbolLimitChangeFixture('b'));
+
+      expect((await repo.findAll()).map((c) => c.id)).toEqual(['a', 'b']);
+    });
+
+    it('round-trips old and new values with the operator’s reason', async () => {
+      await repo.append(perSymbolLimitChangeFixture('a'));
+
+      const [stored] = await repo.findAll();
+      expect(stored.oldValue).toBe(40_000);
+      expect(stored.newValue).toBe(180_000);
+      expect(stored.reason).toBe('account funded to a larger balance');
+    });
+
+    it('round-trips a null oldValue — the symbol had no prior limit', async () => {
+      await repo.append(perSymbolLimitChangeFixture('a', { oldValue: null }));
+
+      expect((await repo.findAll())[0].oldValue).toBeNull();
+    });
+
+    it('filters by symbol', async () => {
+      await repo.append(perSymbolLimitChangeFixture('a'));
+      await repo.append(perSymbolLimitChangeFixture('b', { symbol: 'SPY' }));
+
+      expect((await repo.findBySymbol('SPY')).map((c) => c.id)).toEqual(['b']);
+    });
+
+    it('stores a copy', async () => {
+      const original = perSymbolLimitChangeFixture('a');
+      await repo.append(original);
+
+      original.newValue = 999;
+
+      expect((await repo.findAll())[0].newValue).toBe(180_000);
+    });
+
+    it('rejects a duplicate id rather than overwriting — the log is append-only', async () => {
+      await repo.append(perSymbolLimitChangeFixture('a'));
+
+      await expect(
+        repo.append(perSymbolLimitChangeFixture('a', { newValue: 999 })),
+      ).rejects.toThrow();
+
+      expect((await repo.findAll())[0].newValue).toBe(180_000);
+    });
+
+    if (options.supportsClear) {
+      it('clear empties the store', async () => {
+        await repo.append(perSymbolLimitChangeFixture('a'));
+        await repo.clear();
+
+        expect(await repo.findAll()).toEqual([]);
+      });
+    }
+  });
 }
 
 export function runLotRepositoryContract(create: RepositoryFactory<LotRepository>): void {

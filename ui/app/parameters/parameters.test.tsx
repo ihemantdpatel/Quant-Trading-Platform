@@ -44,6 +44,7 @@ function parametersData(overrides: Partial<ParametersData> = {}): ParametersData
     parameters: [
       {
         strategyId: 'dip-ladder:TQQQ',
+        symbol: 'TQQQ',
         parameters: {
           // A valid `SpacingMode` and a positive floor fraction: this fixture
           // previously carried 'PERCENT' and a negative floor, neither of which
@@ -65,6 +66,8 @@ function parametersData(overrides: Partial<ParametersData> = {}): ParametersData
       },
     ],
     parameterChanges: [],
+    riskLimits: {},
+    riskLimitChanges: [],
     lots: [],
     error: null,
     ...overrides,

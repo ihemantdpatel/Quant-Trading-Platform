@@ -100,8 +100,9 @@ export interface IbBrokerConfig {
 
 /**
  * 15s: fast enough that a silent loss is caught within one bar interval (the
- * ladder evaluates on 5-minute closes), slow enough to be free. The check is a
- * boolean read on an already-held object, not a network call.
+ * live feed's default cadence, currently 1-minute closes), slow enough to be
+ * free. The check is a boolean read on an already-held object, not a network
+ * call.
  */
 export const DEFAULT_LIVENESS_PROBE_MS = 15_000;
 
@@ -110,9 +111,10 @@ export const DEFAULT_LIVENESS_PROBE_MS = 15_000;
  *
  * Long enough that a Gateway which is genuinely gone costs one log line per
  * five minutes rather than a flood, short enough that an outage ending between
- * sessions is picked up well before the next open. It is also one ladder bar
- * interval, so at worst a single evaluation is missed after the Gateway
- * returns.
+ * sessions is picked up well before the next open. At the live feed's current
+ * 1-minute cadence this spans several evaluations rather than one — the
+ * five-minute figure is chosen for alert-noise/staleness reasons independent
+ * of bar interval, not to bound how many evaluations are missed.
  */
 export const DEFAULT_FAILED_RETRY_MS = 5 * 60 * 1000;
 

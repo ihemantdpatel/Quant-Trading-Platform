@@ -38,6 +38,8 @@ import {
   OrderRecord,
   OrderRepository,
   ParameterChangeRepository,
+  PerSymbolLimitChange,
+  PerSymbolLimitChangeRepository,
   RiskEventRepository,
   RungRepository,
   StrategyStateSnapshotRecord,
@@ -338,6 +340,31 @@ export class InMemoryParameterChangeRepository implements ParameterChangeReposit
 
   async findByStrategy(strategyId: string): Promise<ParameterChange[]> {
     return copy(this.changes.filter((change) => change.strategyId === strategyId));
+  }
+
+  async clear(): Promise<void> {
+    this.changes.length = 0;
+  }
+}
+
+@Injectable()
+export class InMemoryPerSymbolLimitChangeRepository implements PerSymbolLimitChangeRepository {
+  private readonly changes: PerSymbolLimitChange[] = [];
+
+  async append(change: PerSymbolLimitChange): Promise<void> {
+    if (this.changes.some((existing) => existing.id === change.id)) {
+      throw new Error(`PerSymbolLimitChange ${change.id} already exists — the log is append-only`);
+    }
+
+    this.changes.push(copy(change));
+  }
+
+  async findAll(): Promise<PerSymbolLimitChange[]> {
+    return copy(this.changes);
+  }
+
+  async findBySymbol(symbol: string): Promise<PerSymbolLimitChange[]> {
+    return copy(this.changes.filter((change) => change.symbol === symbol));
   }
 
   async clear(): Promise<void> {

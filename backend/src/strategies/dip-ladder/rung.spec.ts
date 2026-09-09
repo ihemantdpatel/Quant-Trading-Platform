@@ -1,5 +1,6 @@
 import {
   clearWorking,
+  conflictsWithWorkingRung,
   createRung,
   findRung,
   heldRungs,
@@ -10,6 +11,7 @@ import {
   lowestRungPrice,
   markHeld,
   markWorking,
+  MIN_RESTING_ORDER_GAP_DOLLARS,
   reArm,
   releaseWithoutCycle,
   Rung,
@@ -368,5 +370,40 @@ describe('highestFireableRung', () => {
     const rungs = [markWorking(createRung(95), 'co-1'), markHeld(createRung(90.25), 'lot-1')];
 
     expect(highestFireableRung(rungs, BAR)).toBeNull();
+  });
+});
+
+describe('conflictsWithWorkingRung', () => {
+  it('flags a price within the minimum gap of a WORKING rung', () => {
+    // Distinct anchor generations — a session bootstrap, a gap re-base onto a
+    // bar's exact close — can leave working orders a few cents apart on grids
+    // that never aligned. IB rejects the closer of the two.
+    const rungs = [markWorking(createRung(71.41), 'co-1')];
+
+    expect(conflictsWithWorkingRung(rungs, 71.63)).toBe(true);
+  });
+
+  it('ignores rungs that are not WORKING', () => {
+    const rungs = [createRung(71.41), markHeld(createRung(71.5), 'lot-1')];
+
+    expect(conflictsWithWorkingRung(rungs, 71.63)).toBe(false);
+  });
+
+  it('passes at exactly the minimum gap', () => {
+    const rungs = [markWorking(createRung(71.13), 'co-1')];
+
+    expect(conflictsWithWorkingRung(rungs, 71.13 + MIN_RESTING_ORDER_GAP_DOLLARS)).toBe(false);
+  });
+
+  it('does not flag a WORKING rung at the exact same price', () => {
+    const rungs = [markWorking(createRung(71.63), 'co-1')];
+
+    expect(conflictsWithWorkingRung(rungs, 71.63)).toBe(false);
+  });
+
+  it('passes when nothing is WORKING nearby', () => {
+    const rungs = [createRung(65)];
+
+    expect(conflictsWithWorkingRung(rungs, 71.63)).toBe(false);
   });
 });

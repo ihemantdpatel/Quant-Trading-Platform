@@ -34,6 +34,7 @@ import {
   InMemoryOrderIntentRepository,
   InMemoryOrderRepository,
   InMemoryParameterChangeRepository,
+  InMemoryPerSymbolLimitChangeRepository,
   InMemoryRiskEventRepository,
   InMemoryRungRepository,
   InMemoryStrategyStateSnapshotRepository,
@@ -47,6 +48,7 @@ import {
   PrismaOrderIntentRepository,
   PrismaOrderRepository,
   PrismaParameterChangeRepository,
+  PrismaPerSymbolLimitChangeRepository,
   PrismaRiskEventRepository,
   PrismaRungRepository,
   PrismaStrategyStateSnapshotRepository,
@@ -61,6 +63,7 @@ import {
   ORDER_INTENT_REPOSITORY,
   ORDER_REPOSITORY,
   PARAMETER_CHANGE_REPOSITORY,
+  PER_SYMBOL_LIMIT_CHANGE_REPOSITORY,
   RISK_EVENT_REPOSITORY,
   RUNG_REPOSITORY,
   STRATEGY_STATE_SNAPSHOT_REPOSITORY,
@@ -97,6 +100,10 @@ const repositoryProviders: Provider[] = useDatabase
       { provide: LOT_REBUILD_EVENT_REPOSITORY, useClass: PrismaLotRebuildEventRepository },
       { provide: PARAMETER_CHANGE_REPOSITORY, useClass: PrismaParameterChangeRepository },
       {
+        provide: PER_SYMBOL_LIMIT_CHANGE_REPOSITORY,
+        useClass: PrismaPerSymbolLimitChangeRepository,
+      },
+      {
         provide: STRATEGY_STATE_SNAPSHOT_REPOSITORY,
         useClass: PrismaStrategyStateSnapshotRepository,
       },
@@ -112,6 +119,10 @@ const repositoryProviders: Provider[] = useDatabase
       { provide: RISK_EVENT_REPOSITORY, useClass: InMemoryRiskEventRepository },
       { provide: LOT_REBUILD_EVENT_REPOSITORY, useClass: InMemoryLotRebuildEventRepository },
       { provide: PARAMETER_CHANGE_REPOSITORY, useClass: InMemoryParameterChangeRepository },
+      {
+        provide: PER_SYMBOL_LIMIT_CHANGE_REPOSITORY,
+        useClass: InMemoryPerSymbolLimitChangeRepository,
+      },
       {
         provide: STRATEGY_STATE_SNAPSHOT_REPOSITORY,
         useClass: InMemoryStrategyStateSnapshotRepository,
@@ -148,6 +159,7 @@ export type StorageMode = 'DURABLE' | 'IN_MEMORY';
     RISK_EVENT_REPOSITORY,
     LOT_REBUILD_EVENT_REPOSITORY,
     PARAMETER_CHANGE_REPOSITORY,
+    PER_SYMBOL_LIMIT_CHANGE_REPOSITORY,
     STRATEGY_STATE_SNAPSHOT_REPOSITORY,
     BACKTEST_REPOSITORY,
     STORAGE_MODE,
