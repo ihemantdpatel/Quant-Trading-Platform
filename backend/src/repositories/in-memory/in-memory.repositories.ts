@@ -24,12 +24,14 @@ import { RiskEvent, RiskEventSink } from '../../risk/risk-event';
 import { Lot, LotStatus } from '../../strategies/dip-ladder/lot';
 import { ParameterChange } from '../../strategies/dip-ladder/parameter-change';
 import { Rung } from '../../strategies/dip-ladder/rung';
+import { GridLot, GridLotStatus } from '../../strategies/grid/lot';
 import {
   BacktestRepository,
   BacktestResultRecord,
   BacktestRunRecord,
   BarRepository,
   FillRepository,
+  GridLotRepository,
   LotRebuildEventRecord,
   LotRebuildEventRepository,
   LotRepository,
@@ -203,6 +205,59 @@ function compare(a: string, b: string): number {
   if (a < b) return -1;
   if (a > b) return 1;
   return 0;
+}
+
+/**
+ * Grid-strategy lots, parallel to `InMemoryLotRepository` but keyed by
+ * `strategyId` rather than `symbol` — see `GridLotRepository`'s own comment
+ * for why. `symbol` is accepted on write (matching the Prisma column) but not
+ * carried in the returned `GridLot` shape, the same split `Lot`/`LotRepository`
+ * already use.
+ */
+@Injectable()
+export class InMemoryGridLotRepository implements GridLotRepository {
+  /** Keyed by strategyId, then lot id — a lot is unique within its strategy. */
+  private readonly lots = new Map<string, Map<string, GridLot>>();
+
+  // `symbol` is accepted (matching the interface and the Prisma column) but
+  // unused here — this store is keyed by strategyId alone, and a grid
+  // instance's symbol never changes within its own lifetime.
+  async save(lot: GridLot, strategyId: string, _symbol?: string): Promise<void> {
+    const byStrategy = this.lots.get(strategyId) ?? new Map<string, GridLot>();
+    byStrategy.set(lot.id, copy(lot));
+    this.lots.set(strategyId, byStrategy);
+  }
+
+  async saveAll(lots: GridLot[], strategyId: string, _symbol?: string): Promise<void> {
+    // Replaces the strategy's whole set: the strategy's state is authoritative
+    // on lot composition, matching `InMemoryLotRepository.saveAll`.
+    this.lots.set(strategyId, new Map(lots.map((lot) => [lot.id, copy(lot)])));
+  }
+
+  async findAll(): Promise<GridLot[]> {
+    return fifoGrid([...this.lots.values()].flatMap((byStrategy) => [...byStrategy.values()]));
+  }
+
+  async findByStrategy(strategyId: string): Promise<GridLot[]> {
+    return fifoGrid([...(this.lots.get(strategyId)?.values() ?? [])]);
+  }
+
+  async findHeld(strategyId: string): Promise<GridLot[]> {
+    return (await this.findByStrategy(strategyId)).filter(
+      (lot) => lot.status === GridLotStatus.HELD,
+    );
+  }
+
+  async clear(): Promise<void> {
+    this.lots.clear();
+  }
+}
+
+/** FIFO order for `GridLot`, mirroring `fifo()` above and `grid/lot.ts:fifoQueue`. */
+function fifoGrid(lots: GridLot[]): GridLot[] {
+  return copy(lots).sort((a, b) =>
+    a.openedAt === b.openedAt ? compare(a.id, b.id) : compare(a.openedAt, b.openedAt),
+  );
 }
 
 @Injectable()

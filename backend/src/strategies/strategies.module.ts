@@ -25,8 +25,10 @@ import {
   OrderPlacement,
   SpacingMode,
 } from './dip-ladder/config';
+import { buildGridConfig, GridConfig } from './grid/config';
 
 export const DIP_LADDER_CONFIG = Symbol('DIP_LADDER_CONFIG');
+export const GRID_CONFIG = Symbol('GRID_CONFIG');
 export const SENTIMENT_PROVIDER = Symbol('SENTIMENT_PROVIDER');
 
 /**
@@ -194,6 +196,43 @@ export function ladderCapital(_mode: ExecutionMode, symbol: string): number | nu
   return PAPER_SYMBOL_CAPITAL[symbol] ?? null;
 }
 
+/**
+ * The grid strategy's symbol — deliberately **the same instrument the ladder
+ * trades**, per an explicit operator decision recorded in the feature plan.
+ *
+ * The two strategies must never both be **enabled** on this symbol at once:
+ * each one's reconciliation is independently blind to the other's shares, so
+ * simultaneous live positions here would make each halt on the other's
+ * exposure as an unexplained mismatch. `EngineModule` adds a startup guard
+ * for this; it is an operational rule, not something this constant enforces
+ * by itself.
+ */
+export const GRID_SYMBOL = 'TQQQ';
+
+/**
+ * The grid strategy's fixed-dollar geometry — an operator decision, recorded
+ * here rather than left to a deployment variable, for the same reason
+ * `LADDER_SPACING_DOLLARS` is a constant. `gap` is used two ways: the
+ * distance between successive dip-buy levels below the lowest held lot, and
+ * the amount added to a lot's own fill price for its sell target.
+ */
+export const GRID_GAP_DOLLARS = 0.5;
+
+/** Whole shares per order. See `GRID_GAP_DOLLARS` for the geometry this pairs with. */
+export const GRID_QUANTITY = 50;
+
+/** How many stepped dip-buy levels the grid strategy maintains below the lowest held lot. */
+export const GRID_MAX_BUY_LEVELS = 2;
+
+/** Cap on concurrent resting sells; the oldest/lowest-priced lots (FIFO) get them. */
+export const GRID_MAX_SELL_ORDERS = 2;
+
+/**
+ * Dollars added past the last close for the flat (0-lot) entry, so the
+ * resulting limit is marketable without being a true `MARKET` order.
+ */
+export const GRID_ENTRY_BUFFER_DOLLARS = 0.05;
+
 @Module({
   imports: [AppConfigModule],
   providers: [
@@ -250,12 +289,23 @@ export function ladderCapital(_mode: ExecutionMode, symbol: string): number | nu
       inject: [AppConfigService],
     },
     {
+      provide: GRID_CONFIG,
+      useFactory: (): GridConfig =>
+        buildGridConfig(GRID_SYMBOL, {
+          gap: GRID_GAP_DOLLARS,
+          quantity: GRID_QUANTITY,
+          maxBuyLevels: GRID_MAX_BUY_LEVELS,
+          maxSellOrders: GRID_MAX_SELL_ORDERS,
+          entryBuffer: GRID_ENTRY_BUFFER_DOLLARS,
+        }),
+    },
+    {
       // Null until a paid feed is acquired (`PRD.md:199`). Provided by token so
       // acquiring one is a binding change, not a call-site change.
       provide: SENTIMENT_PROVIDER,
       useClass: NullSentimentProvider,
     },
   ],
-  exports: [CoordinatorService, DIP_LADDER_CONFIG, SENTIMENT_PROVIDER],
+  exports: [CoordinatorService, DIP_LADDER_CONFIG, GRID_CONFIG, SENTIMENT_PROVIDER],
 })
 export class StrategiesModule {}

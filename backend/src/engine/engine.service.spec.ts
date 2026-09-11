@@ -19,6 +19,7 @@ import { InMemoryRiskEventSink } from '../risk/risk-event';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { buildDipLadderConfig } from '../strategies/dip-ladder/config';
 import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
+import { buildGridConfig } from '../strategies/grid/config';
 import { GridStrategy } from '../strategies/grid/grid.strategy';
 import { equityContract, OrderType, TimeInForce } from '../strategies/types';
 import {
@@ -477,10 +478,15 @@ describe('EngineService', () => {
     });
 
     it('ignores strategies that keep no lots', async () => {
-      // A scaffold's state has no `lots` field; reading it must not break the
-      // ladder's own projection.
+      // A non-ladder strategy's state carries its own `lots` field under its
+      // own id prefix (`grid:`, not `dip-ladder:`); the ladder's projection
+      // must filter by prefix rather than merely checking the field exists.
       const { engine, coordinator } = await harness(ExecutionMode.SHADOW);
-      coordinator.register({ strategy: new GridStrategy(), enabled: true, symbols: ['TQQQ'] });
+      coordinator.register({
+        strategy: new GridStrategy(buildGridConfig('TQQQ')),
+        enabled: true,
+        symbols: ['TQQQ'],
+      });
       await coordinator.initializeAll('2025-01-02T09:30:00.000-05:00');
 
       await engine.replayFixture('chop-range');

@@ -9,19 +9,25 @@
  * A Server Component — pure presentation over props, no state, no handlers.
  */
 
-import { formatCurrency, formatDuration, type Lot } from '../lib/api';
+import { formatCurrency, formatDuration, type LotLike } from '../lib/api';
 
 export function TradeHistoryTable({
   lots,
   unavailable = false,
 }: {
-  lots: Lot[];
   /**
-   * True when the `/lots` read failed on this load.
+   * Closed lots from **either** strategy. `LotLike` carries no rung, so the
+   * dip ladder's and the grid strategy's closed cycles can be merged into one
+   * shared history table — each row still shows its own fill/exit price and
+   * realized P&L regardless of which strategy produced it.
+   */
+  lots: LotLike[];
+  /**
+   * True when the underlying read failed on this load.
    *
-   * Mirrors `LotTable`'s flag: both tables read the same endpoint, so a failed
-   * read empties both, and each says so rather than rendering a silent "no
-   * trades" that would be indistinguishable from a genuinely quiet history.
+   * Mirrors `LotTable`'s flag: both tables read the same endpoint(s), so a
+   * failed read empties both, and each says so rather than rendering a silent
+   * "no trades" that would be indistinguishable from a genuinely quiet history.
    */
   unavailable?: boolean;
 }) {

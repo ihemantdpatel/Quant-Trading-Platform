@@ -29,7 +29,7 @@ import {
   lotAge,
   totalDeployedCost,
   totalHeldQuantity,
-  type Lot,
+  type LotLike,
 } from '../lib/api';
 
 export function LotTable({
@@ -37,14 +37,17 @@ export function LotTable({
   mark,
   now,
   unavailable = false,
+  title = 'Lots',
+  emptyMessage = 'No lots held. Replay a fixture to drive the strategy.',
+  showRungColumn = true,
 }: {
-  lots: Lot[];
+  lots: LotLike[];
   /** Last traded price, or null when the engine has seen no fills. */
   mark: number | null;
   /** Injectable clock so age rendering is deterministic under test. */
   now?: number;
   /**
-   * True when the `/lots` read failed on this load.
+   * True when the underlying read failed on this load.
    *
    * Rendered distinctly from an empty ladder: both produce zero rows, but
    * "could not read" and "holding nothing" are opposite facts, and showing the
@@ -52,6 +55,19 @@ export function LotTable({
    * position when they may be fully extended.
    */
   unavailable?: boolean;
+  /**
+   * Distinguishes which strategy's lots this instance renders — the same
+   * component is reused for the dip ladder's `/lots` and the grid strategy's
+   * `/grid/lots`, and an operator needs to tell them apart at a glance.
+   */
+  title?: string;
+  emptyMessage?: string;
+  /**
+   * The dip ladder's rows carry a rung price; a grid lot has none — the
+   * strategy keeps no persisted level ledger to fill it from. Rather than
+   * rendering a column of dashes for every grid row, the caller omits it.
+   */
+  showRungColumn?: boolean;
 }) {
   const held = lots.filter((lot) => lot.status === 'HELD');
   const blended = blendedAverageCost(held);
@@ -59,11 +75,16 @@ export function LotTable({
   // is per-table rather than per-row: the caveat is about the whole reading,
   // and repeating it on every row would bury it.
   const unverified = held.some((lot) => lot.unverified);
+  // Auto-detected rather than a caller-supplied flag: this table now renders
+  // a shared holdings view combining more than one strategy's lots, tagged
+  // client-side (`page.tsx`) — the column earns its place only when there is
+  // more than one strategy's worth of rows to distinguish.
+  const showStrategyColumn = held.some((lot) => lot.strategy);
 
   return (
-    <section aria-label="Per-lot table" className="rounded-lg border border-slate-800 bg-slate-900">
+    <section aria-label={title} className="rounded-lg border border-slate-800 bg-slate-900">
       <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-800 px-4 py-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Lots</h2>
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">{title}</h2>
         <p className="text-xs text-slate-400">{held.length} held</p>
       </header>
 
@@ -80,9 +101,7 @@ export function LotTable({
           Lots unavailable — this read failed. The engine is unaffected; positions are untouched.
         </p>
       ) : held.length === 0 ? (
-        <p className="px-4 py-6 text-sm text-slate-500">
-          No lots held. Replay a fixture to drive the ladder.
-        </p>
+        <p className="px-4 py-6 text-sm text-slate-500">{emptyMessage}</p>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[54rem] text-sm">
@@ -91,9 +110,16 @@ export function LotTable({
                 <th scope="col" className="px-4 py-2 font-medium">
                   Lot
                 </th>
-                <th scope="col" className="px-4 py-2 font-medium">
-                  Rung
-                </th>
+                {showStrategyColumn && (
+                  <th scope="col" className="px-4 py-2 font-medium">
+                    Strategy
+                  </th>
+                )}
+                {showRungColumn && (
+                  <th scope="col" className="px-4 py-2 font-medium">
+                    Rung
+                  </th>
+                )}
                 <th scope="col" className="px-4 py-2 font-medium">
                   Fill price
                 </th>
@@ -118,9 +144,16 @@ export function LotTable({
                 return (
                   <tr key={lot.id} data-testid={`lot-row-${lot.id}`} className="text-slate-200">
                     <td className="px-4 py-2 font-mono text-xs text-slate-400">{lot.id}</td>
-                    <td data-testid="cell-rung" className="px-4 py-2 font-mono">
-                      {formatCurrency(lot.rungPrice)}
-                    </td>
+                    {showStrategyColumn && (
+                      <td data-testid="cell-strategy" className="px-4 py-2 text-slate-300">
+                        {lot.strategy ?? '—'}
+                      </td>
+                    )}
+                    {showRungColumn && (
+                      <td data-testid="cell-rung" className="px-4 py-2 font-mono">
+                        {formatCurrency(lot.rungPrice ?? null)}
+                      </td>
+                    )}
                     <td data-testid="cell-fill" className="px-4 py-2 font-mono">
                       {formatCurrency(lot.fillPrice)}
                     </td>

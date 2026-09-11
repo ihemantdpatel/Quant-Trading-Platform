@@ -14,8 +14,13 @@
 
 import { loadExecution } from './api';
 
+// `/grid/lots` must precede `/lots` — both match `url.endsWith(...)` for a
+// `/grid/lots` request, and `Array.find` takes the first hit, so the more
+// specific path has to come first or every grid-lots request would be
+// misidentified as a ladder-lots one.
 const ENDPOINTS = [
   '/status',
+  '/grid/lots',
   '/lots',
   '/rungs',
   '/positions',

@@ -1,17 +1,17 @@
 import { runStrategyContractSuite } from './contract-test-suite';
-import { GridStrategy } from './grid/grid.strategy';
 import { LeapsStrategy } from './leaps/leaps.strategy';
 import { WheelPhase, WheelStrategy } from './wheel/wheel.strategy';
 import { flatBar } from './contract-test-suite';
 import { StrategyContext } from './types';
 
 /**
- * The Story 2 exit criterion: **all three scaffolds pass the shared contract
- * suite** (`stories.md:196`). Each calls the same exported suite, so the rules
- * cannot drift per plugin — a strategy either passes the one definition or
- * visibly does not run it.
+ * The Story 2 exit criterion was **all three scaffolds pass the shared
+ * contract suite** (`stories.md:196`). `GridStrategy` has since been given
+ * real behaviour and carries its own contract-suite run in
+ * `grid/grid.strategy.contract.spec.ts` — it is no longer inert, so it no
+ * longer belongs in this file's "scaffolds are inert" assertions. Wheel and
+ * Leaps remain exactly as Story 2 left them, pending Story 16.
  */
-runStrategyContractSuite({ name: 'GridStrategy', create: () => new GridStrategy() });
 runStrategyContractSuite({ name: 'WheelStrategy', create: () => new WheelStrategy() });
 runStrategyContractSuite({ name: 'LeapsStrategy', create: () => new LeapsStrategy() });
 
@@ -29,7 +29,6 @@ function context(strategyId: string, symbols = ['TQQQ']): StrategyContext {
 
 describe('scaffolded strategies are inert', () => {
   const scaffolds = [
-    { name: 'grid', create: () => new GridStrategy() },
     { name: 'wheel', create: () => new WheelStrategy() },
     { name: 'leaps', create: () => new LeapsStrategy() },
   ];
@@ -53,14 +52,14 @@ describe('scaffolded strategies are inert', () => {
     expect(create().id).toMatch(/^[a-z-]+$/);
   });
 
-  it('the three scaffolds have distinct ids', () => {
+  it('the scaffolds have distinct ids', () => {
     const ids = scaffolds.map(({ create }) => create().id);
 
-    expect(new Set(ids).size).toBe(3);
+    expect(new Set(ids).size).toBe(2);
   });
 
   it('carries the context symbols into initial state', async () => {
-    const strategy = new GridStrategy();
+    const strategy = new WheelStrategy();
     const state = await strategy.initialize(context(strategy.id, ['TQQQ', 'SPY']));
 
     expect(state.symbols).toEqual(['TQQQ', 'SPY']);
@@ -76,13 +75,6 @@ describe('scaffold seed state names what Story 16 will implement', () => {
     const state = await strategy.initialize(context(strategy.id));
 
     expect(state.data).toEqual({ phase: WheelPhase.CASH_SECURED_PUT, assignedShares: 0 });
-  });
-
-  it('the grid starts with no levels', async () => {
-    const strategy = new GridStrategy();
-    const state = await strategy.initialize(context(strategy.id));
-
-    expect(state.data).toEqual({ gridLevels: [] });
   });
 
   it('leaps starts with no positions and no evaluation timestamp', async () => {

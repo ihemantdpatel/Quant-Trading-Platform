@@ -31,8 +31,9 @@ import { Bar, BarSize } from '../../market-data/types';
 import { RiskEvent, RiskEventType } from '../../risk/risk-event';
 import { RiskDecision, RiskIntent, RiskReason } from '../../risk/types';
 import { Lot, LotStatus } from '../../strategies/dip-ladder/lot';
-import { EditableParameter, ParameterChange } from '../../strategies/dip-ladder/parameter-change';
+import { ParameterChange } from '../../strategies/dip-ladder/parameter-change';
 import { Rung, RungStatus } from '../../strategies/dip-ladder/rung';
+import { GridLot, GridLotStatus } from '../../strategies/grid/lot';
 import { JsonValue, OrderIntent, StrategyState } from '../../strategies/types';
 import {
   BacktestRepository,
@@ -40,6 +41,7 @@ import {
   BacktestRunRecord,
   BarRepository,
   FillRepository,
+  GridLotRepository,
   LotRebuildEventRecord,
   LotRebuildEventRepository,
   LotRepository,
@@ -433,6 +435,121 @@ function toLot(row: {
     openedAt: row.openedAt,
     exitTarget: toNumber(row.exitTarget),
     status: row.status as LotStatus,
+    closedAt: row.closedAt,
+    exitPrice: toNumberOrNull(row.exitPrice),
+    workingOrderId: row.workingOrderId,
+  };
+}
+
+/**
+ * Grid-strategy lots, parallel to `PrismaLotRepository` on `GridLot`'s own
+ * table. Replacement (`saveAll`) is keyed by `strategyId` rather than
+ * `symbol` — see `GridLotRepository`'s interface comment.
+ */
+@Injectable()
+export class PrismaGridLotRepository implements GridLotRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async save(lot: GridLot, strategyId: string, symbol: string): Promise<void> {
+    const data = gridLotData(lot, strategyId, symbol);
+
+    await this.prisma.gridLot.upsert({
+      where: { id: lot.id },
+      create: { id: lot.id, ...data },
+      update: data,
+    });
+  }
+
+  /**
+   * Replaces the strategy's whole set, transactionally — the same reasoning
+   * as `PrismaLotRepository.saveAll`: a crash between the delete and the
+   * inserts must not leave a state a restart could misread as "flat".
+   */
+  async saveAll(lots: GridLot[], strategyId: string, symbol: string): Promise<void> {
+    const ids = lots.map((lot) => lot.id);
+
+    await this.prisma.$transaction([
+      this.prisma.gridLot.deleteMany({
+        where: ids.length === 0 ? { strategyId } : { strategyId, id: { notIn: ids } },
+      }),
+      ...lots.map((lot) => {
+        const data = gridLotData(lot, strategyId, symbol);
+        return this.prisma.gridLot.upsert({
+          where: { id: lot.id },
+          create: { id: lot.id, ...data },
+          update: data,
+        });
+      }),
+    ]);
+  }
+
+  async findAll(): Promise<GridLot[]> {
+    const rows = await this.prisma.gridLot.findMany({ orderBy: GRID_LOT_FIFO_ORDER });
+
+    return rows.map(toGridLot);
+  }
+
+  async findByStrategy(strategyId: string): Promise<GridLot[]> {
+    const rows = await this.prisma.gridLot.findMany({
+      where: { strategyId },
+      orderBy: GRID_LOT_FIFO_ORDER,
+    });
+
+    return rows.map(toGridLot);
+  }
+
+  async findHeld(strategyId: string): Promise<GridLot[]> {
+    const rows = await this.prisma.gridLot.findMany({
+      where: { strategyId, status: GridLotStatus.HELD },
+      orderBy: GRID_LOT_FIFO_ORDER,
+    });
+
+    return rows.map(toGridLot);
+  }
+
+  async clear(): Promise<void> {
+    await this.prisma.gridLot.deleteMany();
+  }
+}
+
+const GRID_LOT_FIFO_ORDER: Prisma.GridLotOrderByWithRelationInput[] = [
+  { openedAt: 'asc' },
+  { id: 'asc' },
+];
+
+function gridLotData(lot: GridLot, strategyId: string, symbol: string) {
+  return {
+    strategyId,
+    symbol,
+    fillPrice: toDecimal(lot.fillPrice),
+    quantity: lot.quantity,
+    openedAt: lot.openedAt,
+    sellTarget: toDecimal(lot.sellTarget),
+    status: lot.status,
+    closedAt: lot.closedAt,
+    exitPrice: toDecimalOrNull(lot.exitPrice),
+    workingOrderId: lot.workingOrderId,
+  };
+}
+
+function toGridLot(row: {
+  id: string;
+  fillPrice: Prisma.Decimal;
+  quantity: number;
+  openedAt: string;
+  sellTarget: Prisma.Decimal;
+  status: string;
+  closedAt: string | null;
+  exitPrice: Prisma.Decimal | null;
+  workingOrderId: string | null;
+}): GridLot {
+  return {
+    id: row.id,
+    fillPrice: toNumber(row.fillPrice),
+    quantity: row.quantity,
+    openedAt: row.openedAt,
+    sellTarget: toNumber(row.sellTarget),
+    status: row.status as GridLotStatus,
     closedAt: row.closedAt,
     exitPrice: toNumberOrNull(row.exitPrice),
     workingOrderId: row.workingOrderId,
@@ -1007,7 +1124,7 @@ function toParameterChange(row: {
     id: row.id,
     changeId: row.changeId,
     strategyId: row.strategyId,
-    parameter: row.parameter as EditableParameter,
+    parameter: row.parameter,
     oldValue: fromJson<JsonValue>(row.oldValue),
     newValue: fromJson<JsonValue>(row.newValue),
     timestamp: row.timestamp,

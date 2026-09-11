@@ -76,7 +76,15 @@ export interface ParameterChange {
   /** Shared by every field in the same edit request. */
   changeId: string;
   strategyId: string;
-  parameter: EditableParameter;
+  /**
+   * Widened to `string` rather than `EditableParameter`: this type (and the
+   * repository/table it is persisted through) is shared across every
+   * strategy's parameter editor, not owned by the ladder alone — the grid
+   * strategy's `GridParameterService` writes into the same audit trail with
+   * its own, disjoint editable-field union. Each service still narrows via
+   * its own `isEditable*Parameter` guard before trusting a value read back.
+   */
+  parameter: string;
   oldValue: JsonValue;
   newValue: JsonValue;
   /** ISO-8601. When the edit was applied. */

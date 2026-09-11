@@ -21,6 +21,7 @@ import request from 'supertest';
 import { AppModule } from '../app.module';
 import { LADDER_SPACING_DOLLARS } from '../strategies/strategies.module';
 import { DailyReport } from '../observability/daily-report.service';
+import { CoordinatorService } from '../strategies/coordinator.service';
 
 jest.setTimeout(120_000);
 
@@ -58,6 +59,16 @@ describe('Story 12: the daily report over HTTP', () => {
 
     app = moduleRef.createNestApplication();
     await app.init();
+
+    // This suite is about the dip ladder's own rung/report behaviour, but the
+    // current operator default boots the grid strategy enabled on TQQQ and
+    // the ladder disabled. `coordinator.enable` initializes on demand, so
+    // this is deterministic regardless of the app's own (unawaited) startup
+    // chain — and it must happen before the replay below, which dispatches
+    // bars to whichever strategies are enabled.
+    const coordinator = app.get(CoordinatorService);
+    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    coordinator.disable('grid:TQQQ');
 
     // Drive a real session through the full engine path, so everything the
     // report reads is evidence the engine wrote rather than fixture data

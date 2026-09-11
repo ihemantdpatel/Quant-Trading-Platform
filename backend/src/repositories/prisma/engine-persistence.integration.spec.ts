@@ -31,6 +31,7 @@ import { InMemoryRiskEventSink } from '../../risk/risk-event';
 import { buildRiskConfig } from '../../risk/risk.config';
 import {
   PrismaFillRepository,
+  PrismaGridLotRepository,
   PrismaLotRebuildEventRepository,
   PrismaLotRepository,
   PrismaOrderIntentRepository,
@@ -129,6 +130,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
         new PrismaLotRebuildEventRepository(service),
         ladderConfig,
         ExecutionMode.PAPER,
+        new PrismaGridLotRepository(service),
       ),
       broker,
     );

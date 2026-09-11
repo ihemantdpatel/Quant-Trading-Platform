@@ -50,6 +50,14 @@ describe('Story 9: reconciliation over HTTP', () => {
     halts = app.get(SymbolHaltService);
     lots = app.get(LOT_REPOSITORY);
     coordinator = app.get(CoordinatorService);
+
+    // This suite is about the dip ladder's own reconciliation behaviour, but
+    // the current operator default boots the grid strategy enabled on TQQQ
+    // and the ladder disabled. `coordinator.enable` initializes on demand,
+    // so this is deterministic regardless of the app's own (unawaited)
+    // startup chain.
+    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    coordinator.disable('grid:TQQQ');
   });
 
   afterEach(async () => {

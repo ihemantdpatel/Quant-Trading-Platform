@@ -18,6 +18,7 @@ import { EngineService, EntryHaltCode } from '../engine/engine.service';
 import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
+import { CoordinatorService } from '../strategies/coordinator.service';
 
 /**
  * Replaying a full fixture is ~936 bars through the whole path, and under
@@ -41,6 +42,16 @@ describe('Story 6: engine HTTP API', () => {
 
     broker = app.get<MockBrokerAdapter>(BROKER_ADAPTER);
     engine = app.get(EngineService);
+
+    // This whole suite is about the dip ladder's own behaviour, but the
+    // current operator default boots the grid strategy enabled on TQQQ and
+    // the ladder disabled (`EngineModule.ladderEnabled`/`gridEnabled`).
+    // `coordinator.enable` initializes on demand, so this is deterministic
+    // regardless of whether the app's own (unawaited) startup chain has
+    // reached the ladder yet.
+    const coordinator = app.get(CoordinatorService);
+    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    coordinator.disable('grid:TQQQ');
   });
 
   afterEach(async () => {
@@ -424,10 +435,15 @@ describe('Story 6: engine HTTP API', () => {
       // Regression: a scaffold's state carries no lots or rungs, and reading
       // those fields off it returned `undefined` — which broke `GET /lots` for
       // the ladder as well. The engine now filters to ladder instances.
+      //
+      // Uses `wheel`, not `grid`: the grid strategy was given real behaviour
+      // and is no longer inert, so it no longer demonstrates "a scaffold
+      // contributes nothing" — wheel and leaps remain exactly as Story 2 left
+      // them, pending Story 16.
       const before = await replay();
       await request(app.getHttpServer()).post('/engine/reset');
 
-      await request(app.getHttpServer()).post('/strategies/grid/enable').expect(200);
+      await request(app.getHttpServer()).post('/strategies/wheel/enable').expect(200);
       const after = await replay();
 
       // A scaffold contributes nothing, so the ladder still produces intents at
@@ -442,7 +458,7 @@ describe('Story 6: engine HTTP API', () => {
       // What the regression is actually about: the ladder views still work with
       // a scaffold enabled.
       const strategies = await request(app.getHttpServer()).get('/strategies').expect(200);
-      expect(strategies.body.find((entry: { id: string }) => entry.id === 'grid').enabled).toBe(
+      expect(strategies.body.find((entry: { id: string }) => entry.id === 'wheel').enabled).toBe(
         true,
       );
 

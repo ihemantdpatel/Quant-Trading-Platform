@@ -10,7 +10,7 @@
  * synthetic bars through the engine running the session under observation.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import ExecutionPage from './page';
 import { loadExecution, type ExecutionData } from './lib/api';
 
@@ -56,6 +56,7 @@ function executionData(overrides: Partial<ExecutionData> = {}): ExecutionData {
     fills: [],
     riskEvents: [],
     strategies: [{ id: 'dip-ladder:TQQQ', enabled: true, symbols: ['TQQQ'], initialized: true }],
+    gridLots: [],
     error: null,
     ...overrides,
   };
@@ -78,7 +79,7 @@ describe('Execution page', () => {
     expect(screen.getByText(/nothing is submitted/i)).toBeInTheDocument();
   });
 
-  it('renders the ladder and lot table together', async () => {
+  it('renders the ladder and the shared holdings table together', async () => {
     mockLoad.mockResolvedValue(
       executionData({
         rungs: [
@@ -115,8 +116,174 @@ describe('Execution page', () => {
 
     expect(screen.getByRole('region', { name: /^ladder$/i })).toBeInTheDocument();
     expect(screen.getByTestId('rung-95')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: /^holdings$/i })).toBeInTheDocument();
     expect(screen.getByTestId('lot-row-TQQQ-lot-1')).toBeInTheDocument();
     expect(screen.getByText(/reference only/i)).toBeInTheDocument();
+  });
+
+  it('renders the ladder’s and the grid strategy’s lots together in one shared holdings table', async () => {
+    mockLoad.mockResolvedValue(
+      executionData({
+        lots: [
+          {
+            id: 'TQQQ-lot-1',
+            symbol: 'TQQQ',
+            rungPrice: 95,
+            fillPrice: 95,
+            quantity: 10,
+            openedAt: '2024-03-04T09:50:00-05:00',
+            exitTarget: 99.75,
+            status: 'HELD',
+            closedAt: null,
+            exitPrice: null,
+            realized: null,
+          },
+        ],
+        gridLots: [
+          {
+            id: 'TQQQ-grid-lot-1',
+            symbol: 'TQQQ',
+            fillPrice: 100,
+            quantity: 50,
+            openedAt: '2024-03-04T09:50:00-05:00',
+            exitTarget: 101,
+            status: 'HELD',
+            closedAt: null,
+            exitPrice: null,
+            realized: null,
+            workingOrderId: 'co-1',
+          },
+        ],
+      }),
+    );
+
+    render(await ExecutionPage());
+
+    const holdings = screen.getByRole('region', { name: /^holdings$/i });
+
+    expect(within(holdings).getByTestId('lot-row-TQQQ-lot-1')).toBeInTheDocument();
+    expect(within(holdings).getByTestId('lot-row-TQQQ-grid-lot-1')).toBeInTheDocument();
+    // Tagged so an operator can tell which strategy opened which row, now
+    // that both share one table.
+    expect(
+      within(within(holdings).getByTestId('lot-row-TQQQ-lot-1')).getByTestId('cell-strategy'),
+    ).toHaveTextContent('Dip ladder');
+    expect(
+      within(within(holdings).getByTestId('lot-row-TQQQ-grid-lot-1')).getByTestId('cell-strategy'),
+    ).toHaveTextContent('Grid');
+    // Only one panel now — not a second "Grid — Lots" region.
+    expect(screen.queryByRole('region', { name: /^grid — lots$/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the holdings table when no strategy is enabled and neither holds anything', async () => {
+    mockLoad.mockResolvedValue(
+      executionData({
+        strategies: [
+          { id: 'dip-ladder:TQQQ', enabled: false, symbols: ['TQQQ'], initialized: false },
+        ],
+      }),
+    );
+
+    render(await ExecutionPage());
+
+    expect(screen.queryByRole('region', { name: /^holdings$/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the ladder panel when the ladder is disabled and holds nothing', async () => {
+    mockLoad.mockResolvedValue(
+      executionData({
+        strategies: [
+          { id: 'dip-ladder:TQQQ', enabled: false, symbols: ['TQQQ'], initialized: false },
+        ],
+      }),
+    );
+
+    render(await ExecutionPage());
+
+    expect(screen.queryByRole('region', { name: /^ladder$/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the ladder panel once the ladder is disabled even when its old rungs are still in the database', async () => {
+    // A disabled strategy's rungs are still served from the database
+    // (flagged `unverified`), the same as its lots — but a rung describes
+    // the ladder's own bookkeeping, not a broker fact like a held share, so
+    // it must not keep the Ladder panel showing once the grid strategy (with
+    // no rung concept of its own) is the one actually trading the symbol.
+    mockLoad.mockResolvedValue(
+      executionData({
+        strategies: [
+          { id: 'dip-ladder:TQQQ', enabled: false, symbols: ['TQQQ'], initialized: false },
+          { id: 'grid:TQQQ', enabled: true, symbols: ['TQQQ'], initialized: true },
+        ],
+        rungs: [
+          {
+            price: 95,
+            status: 'RE_ARMED',
+            lotId: null,
+            workingOrderId: null,
+            completedCycles: 1,
+            lastExitAt: '2024-03-04T10:00:00-05:00',
+            held: false,
+            fireable: false,
+            unverified: true,
+          },
+        ],
+      }),
+    );
+
+    render(await ExecutionPage());
+
+    expect(screen.queryByRole('region', { name: /^ladder$/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps the holdings table visible when the ladder is disabled but still holding a real position', async () => {
+    // A disabled strategy's real broker position does not stop existing —
+    // `GET /lots` serves it from the database, flagged `unverified`, and the
+    // dashboard must not hide the one place that shows it.
+    mockLoad.mockResolvedValue(
+      executionData({
+        strategies: [
+          { id: 'dip-ladder:TQQQ', enabled: false, symbols: ['TQQQ'], initialized: false },
+        ],
+        lots: [
+          {
+            id: 'TQQQ-lot-1',
+            symbol: 'TQQQ',
+            rungPrice: 95,
+            fillPrice: 95,
+            quantity: 10,
+            openedAt: '2024-03-04T09:50:00-05:00',
+            exitTarget: 99.75,
+            status: 'HELD',
+            closedAt: null,
+            exitPrice: null,
+            realized: null,
+            unverified: true,
+          },
+        ],
+      }),
+    );
+
+    render(await ExecutionPage());
+
+    expect(screen.getByRole('region', { name: /^holdings$/i })).toBeInTheDocument();
+    expect(screen.getByTestId('lot-row-TQQQ-lot-1')).toBeInTheDocument();
+  });
+
+  it('shows the holdings table once the grid strategy is enabled, even while flat, with no ladder panel', async () => {
+    mockLoad.mockResolvedValue(
+      executionData({
+        strategies: [
+          { id: 'dip-ladder:TQQQ', enabled: false, symbols: ['TQQQ'], initialized: false },
+          { id: 'grid:TQQQ', enabled: true, symbols: ['TQQQ'], initialized: true },
+        ],
+      }),
+    );
+
+    render(await ExecutionPage());
+
+    expect(screen.getByRole('region', { name: /^holdings$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: /^ladder$/i })).not.toBeInTheDocument();
   });
 
   it('offers replay controls against the mock broker', async () => {

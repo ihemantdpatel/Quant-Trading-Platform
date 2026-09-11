@@ -23,6 +23,7 @@ import { BarSize } from '../market-data/types';
 import { LotRebuildService, RebuildAction } from './lot-rebuild.service';
 import {
   InMemoryFillRepository,
+  InMemoryGridLotRepository,
   InMemoryLotRebuildEventRepository,
   InMemoryLotRepository,
   InMemoryOrderIntentRepository,
@@ -42,6 +43,7 @@ import {
 } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { Lot, LotStatus } from '../strategies/dip-ladder/lot';
 import { Rung, RungStatus } from '../strategies/dip-ladder/rung';
+import { GridLot, GridLotStatus } from '../strategies/grid/lot';
 import { ReconciliationStatus } from './lot-sum-assertion';
 import {
   HALT_BROKER_UNAVAILABLE,
@@ -66,6 +68,8 @@ function buildHarness(
     snapshots?: InMemoryStrategyStateSnapshotRepository;
     fills?: InMemoryFillRepository;
     rebuildEvents?: InMemoryLotRebuildEventRepository;
+    /** The grid strategy's own lots for the same symbol — see `siblingHeldQuantity`. */
+    gridLots?: InMemoryGridLotRepository;
     broker?: MockBrokerAdapter;
     symbols?: string[];
     // Defaults to PAPER, matching production — see
@@ -74,6 +78,8 @@ function buildHarness(
     // pass a mode other than PAPER, or a symbol not covered by `ladderConfig`,
     // rather than relying on the rebuild attempt happening to fail.
     mode?: ExecutionMode;
+    /** Registers the ladder disabled — see `releaseStaleDisabledSells`. */
+    enabled?: boolean;
   } = {},
 ) {
   const lots = options.lots ?? new InMemoryLotRepository();
@@ -96,7 +102,7 @@ function buildHarness(
           ? ladderConfig
           : buildDipLadderConfig(symbol, { symbolCapital: 100_000 }),
       ),
-      enabled: true,
+      enabled: options.enabled ?? true,
       symbols: [symbol],
     });
   }
@@ -108,6 +114,7 @@ function buildHarness(
   const fills = options.fills ?? new InMemoryFillRepository();
   const rebuild = new LotRebuildService(orders, fills);
   const rebuildEvents = options.rebuildEvents ?? new InMemoryLotRebuildEventRepository();
+  const gridLots = options.gridLots ?? new InMemoryGridLotRepository();
 
   const reconciliation = new ReconciliationService(
     coordinator,
@@ -122,6 +129,7 @@ function buildHarness(
     rebuildEvents,
     ladderConfig,
     options.mode ?? ExecutionMode.PAPER,
+    gridLots,
   );
   jest.spyOn(reconciliation['logger'], 'log').mockImplementation(() => undefined);
   jest.spyOn(reconciliation['logger'], 'error').mockImplementation(() => undefined);
@@ -160,6 +168,7 @@ function buildHarness(
     snapshots,
     fills,
     rebuildEvents,
+    gridLots,
     broker,
     coordinator,
     halts,
@@ -188,6 +197,21 @@ function heldLot(id: string, overrides: Partial<Lot> = {}): Lot {
     openedAt: '2025-01-02T09:45:00.000-05:00',
     exitTarget: 99.75,
     status: LotStatus.HELD,
+    closedAt: null,
+    exitPrice: null,
+    workingOrderId: null,
+    ...overrides,
+  };
+}
+
+function heldGridLot(id: string, overrides: Partial<GridLot> = {}): GridLot {
+  return {
+    id,
+    fillPrice: 90,
+    quantity: 100,
+    openedAt: '2025-01-02T09:45:00.000-05:00',
+    sellTarget: 90.5,
+    status: GridLotStatus.HELD,
     closedAt: null,
     exitPrice: null,
     workingOrderId: null,
@@ -563,6 +587,58 @@ describe('Story 9: startup reconciliation', () => {
 
       expect(result.reconciliation.clean).toBe(false);
       expect(restarted.halts.haltFor('TQQQ')?.code).toBe(HALT_BROKER_UNAVAILABLE);
+    });
+  });
+
+  describe('cross-strategy holdings (grid trading the same symbol)', () => {
+    // The grid strategy trades the same symbol by design (`GRID_SYMBOL` in
+    // `strategies.module.ts`), and a real position left behind when switching
+    // which strategy is enabled must not read as this ladder's own mismatch —
+    // see `siblingHeldQuantity` on `ReconciliationService`.
+    it('reconciles when the grid strategy already accounts for the rest of the broker position', async () => {
+      const { lots, rungs, snapshots, broker, gridLots } = buildHarness();
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 100 })], 'TQQQ');
+      await gridLots.saveAll(
+        [heldGridLot('TQQQ-grid-lot-1', { quantity: 200 })],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 300, averageCost: 90 });
+
+      const restarted = buildHarness({ lots, rungs, snapshots, broker, gridLots });
+      const result = await restarted.startup.run(NOW);
+
+      expect(restarted.halts.isHalted('TQQQ')).toBe(false);
+      expect(result.reconciliation.symbols[0].verdict.status).toBe(ReconciliationStatus.MATCHED);
+      expect(result.reconciliation.symbols[0].verdict.lotQuantity).toBe(100);
+    });
+
+    it('still halts when the ladder and grid lots together do not explain the broker position', async () => {
+      // `mode: LIVE` — see the note under 'injected quantity mismatch' above;
+      // PAPER's auto-rebuild would otherwise try to close this gap itself.
+      const { lots, rungs, snapshots, broker, gridLots } = buildHarness();
+      await lots.saveAll([heldLot('TQQQ-lot-1', { quantity: 100 })], 'TQQQ');
+      await gridLots.saveAll(
+        [heldGridLot('TQQQ-grid-lot-1', { quantity: 150 })],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+      broker.seedPosition({ symbol: 'TQQQ', quantity: 300, averageCost: 90 });
+
+      const restarted = buildHarness({
+        lots,
+        rungs,
+        snapshots,
+        broker,
+        gridLots,
+        mode: ExecutionMode.LIVE,
+      });
+      const result = await restarted.startup.run(NOW);
+
+      expect(restarted.halts.isHalted('TQQQ')).toBe(true);
+      expect(result.reconciliation.symbols[0].verdict.status).toBe(
+        ReconciliationStatus.QUANTITY_MISMATCH,
+      );
     });
   });
 
@@ -1253,6 +1329,54 @@ describe('open-order reconciliation across a restart', () => {
     const restored = harness.engine.ladderLots().find((lot) => lot.id === 'TQQQ-lot-1');
     expect(restored!.status).toBe(LotStatus.HELD);
     expect(restored!.workingOrderId).toBeNull();
+  });
+
+  it('releases a disabled ladder’s stale working-order mark directly in the database', async () => {
+    // The gap `releaseStaleDisabledSells` closes: a disabled strategy has no
+    // live state for the branch above to mutate, so without its own fallback
+    // a lot whose DAY sell expired at the close would keep a stale
+    // `workingOrderId` forever — `OrderDiagnosisService` would then report it
+    // `UNBACKED` rather than `missing`, and `POST /orders/place-missing`
+    // would have no candidate to rest a fresh sell against.
+    const lots = new InMemoryLotRepository();
+    await lots.saveAll([heldLot('TQQQ-lot-1', { workingOrderId: 'co-expired-sell' })], 'TQQQ');
+
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+    broker.seedPosition({ symbol: 'TQQQ', quantity: 100, averageCost: 95 });
+
+    const harness = buildHarness({ lots, broker, enabled: false });
+    await harness.startup.run(NOW);
+
+    const persisted = await lots.findBySymbol('TQQQ');
+    const lot = persisted.find((candidate) => candidate.id === 'TQQQ-lot-1');
+    expect(lot!.status).toBe(LotStatus.HELD);
+    expect(lot!.workingOrderId).toBeNull();
+  });
+
+  it('leaves a disabled ladder’s working-order mark alone when its sell is still resting', async () => {
+    const lots = new InMemoryLotRepository();
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+    await broker.submit({
+      clientOrderId: 'co-still-resting',
+      contract: equityContract('TQQQ'),
+      side: 'SELL',
+      quantity: 100,
+      orderType: 'LMT',
+      limitPrice: 99.75,
+      timeInForce: 'DAY',
+      timestamp: NOW,
+    });
+    await lots.saveAll([heldLot('TQQQ-lot-1', { workingOrderId: 'co-still-resting' })], 'TQQQ');
+    broker.seedPosition({ symbol: 'TQQQ', quantity: 100, averageCost: 95 });
+
+    const harness = buildHarness({ lots, broker, enabled: false });
+    await harness.startup.run(NOW);
+
+    const persisted = await lots.findBySymbol('TQQQ');
+    const lot = persisted.find((candidate) => candidate.id === 'TQQQ-lot-1');
+    expect(lot!.workingOrderId).toBe('co-still-resting');
   });
 
   it('closes a held lot whose resting exit already filled but was never routed', async () => {

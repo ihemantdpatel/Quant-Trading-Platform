@@ -14,7 +14,7 @@
 
 import { render, screen, within } from '@testing-library/react';
 import { LotTable } from './LotTable';
-import type { Lot } from '../lib/api';
+import type { Lot, LotLike } from '../lib/api';
 
 const NOW = Date.parse('2024-03-04T11:00:00-05:00');
 
@@ -27,6 +27,23 @@ function lot(overrides: Partial<Lot> = {}): Lot {
     quantity: 10,
     openedAt: '2024-03-04T09:50:00-05:00',
     exitTarget: 99.75,
+    status: 'HELD',
+    closedAt: null,
+    exitPrice: null,
+    realized: null,
+    ...overrides,
+  };
+}
+
+/** A grid-shaped lot — no `rungPrice`, unlike `lot()` above. */
+function gridLikeLot(overrides: Partial<LotLike> = {}): LotLike {
+  return {
+    id: 'TQQQ-grid-lot-1',
+    symbol: 'TQQQ',
+    fillPrice: 100,
+    quantity: 50,
+    openedAt: '2024-03-04T09:50:00-05:00',
+    exitTarget: 101,
     status: 'HELD',
     closedAt: null,
     exitPrice: null,
@@ -152,5 +169,58 @@ describe('LotTable', () => {
     );
 
     expect(screen.getByText(/no lots held/i)).toBeInTheDocument();
+  });
+
+  it('omits the Rung column and cell when showRungColumn is false', () => {
+    // The grid strategy's own lots have no rung — this is how its instance of
+    // the table (reused rather than duplicated) renders them. `rungPrice` is
+    // left on the fixture to prove the column is hidden even when the field
+    // is present, not merely when it is absent.
+    render(<LotTable lots={[lot()]} mark={95} now={NOW} showRungColumn={false} />);
+
+    expect(screen.queryByText('Rung')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('cell-rung')).not.toBeInTheDocument();
+    expect(screen.getByTestId('cell-fill')).toHaveTextContent('$95.00');
+  });
+
+  it('shows no Strategy column when no lot carries a strategy tag', () => {
+    render(<LotTable lots={[lot()]} mark={95} now={NOW} />);
+
+    expect(screen.queryByText('Strategy')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('cell-strategy')).not.toBeInTheDocument();
+  });
+
+  it('adds a Strategy column when lots are tagged, for a shared holdings view', () => {
+    render(
+      <LotTable
+        lots={[
+          lot({ id: 'TQQQ-lot-1', strategy: 'Dip ladder' }),
+          gridLikeLot({ id: 'TQQQ-grid-lot-1', strategy: 'Grid' }),
+        ]}
+        mark={95}
+        now={NOW}
+      />,
+    );
+
+    expect(
+      within(screen.getByTestId('lot-row-TQQQ-lot-1')).getByTestId('cell-strategy'),
+    ).toHaveTextContent('Dip ladder');
+    expect(
+      within(screen.getByTestId('lot-row-TQQQ-grid-lot-1')).getByTestId('cell-strategy'),
+    ).toHaveTextContent('Grid');
+    // A grid row still renders in the shared Rung column — a dash, not an
+    // omitted cell, since some rows in this table genuinely have a rung.
+    expect(
+      within(screen.getByTestId('lot-row-TQQQ-grid-lot-1')).getByTestId('cell-rung'),
+    ).toHaveTextContent('—');
+  });
+
+  it('renders a custom title and empty message', () => {
+    render(
+      <LotTable lots={[]} mark={null} now={NOW} title="Grid — Lots" emptyMessage="Nothing here." />,
+    );
+
+    expect(screen.getByRole('region', { name: /^grid — lots$/i })).toBeInTheDocument();
+    expect(screen.getByText('Nothing here.')).toBeInTheDocument();
   });
 });

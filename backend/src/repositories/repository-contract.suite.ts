@@ -30,12 +30,14 @@ import { RiskReason } from '../risk/types';
 import { Lot, LotStatus } from '../strategies/dip-ladder/lot';
 import { ParameterChange } from '../strategies/dip-ladder/parameter-change';
 import { Rung, RungStatus } from '../strategies/dip-ladder/rung';
+import { GridLot, GridLotStatus } from '../strategies/grid/lot';
 import { equityContract, OrderType, TimeInForce } from '../strategies/types';
 import {
   BacktestRepository,
   BacktestRunRecord,
   BarRepository,
   FillRepository,
+  GridLotRepository,
   LotRebuildEventRecord,
   LotRebuildEventRepository,
   LotRepository,
@@ -64,6 +66,21 @@ export function lotFixture(overrides: Partial<Lot> = {}): Lot {
     openedAt: '2025-01-02T10:00:00.000-05:00',
     exitTarget: 99.75,
     status: LotStatus.HELD,
+    closedAt: null,
+    exitPrice: null,
+    workingOrderId: null,
+    ...overrides,
+  };
+}
+
+export function gridLotFixture(overrides: Partial<GridLot> = {}): GridLot {
+  return {
+    id: 'TQQQ-grid-lot-1',
+    fillPrice: 95,
+    quantity: 50,
+    openedAt: '2025-01-02T10:00:00.000-05:00',
+    sellTarget: 95.5,
+    status: GridLotStatus.HELD,
     closedAt: null,
     exitPrice: null,
     workingOrderId: null,
@@ -411,6 +428,156 @@ export function runLotRepositoryContract(create: RepositoryFactory<LotRepository
 
     it('clear removes everything', async () => {
       await repo.save(lotFixture(), 'TQQQ');
+      await repo.clear();
+
+      expect(await repo.findAll()).toEqual([]);
+    });
+  });
+}
+
+/**
+ * `GridLotRepository` contract — parallel to `runLotRepositoryContract`, keyed
+ * by `strategyId` rather than `symbol` (see the interface's own comment for
+ * why). The properties that matter are the same ones the ladder's suite
+ * asserts: isolation and FIFO ordering survive the persistence round trip.
+ */
+export function runGridLotRepositoryContract(create: RepositoryFactory<GridLotRepository>): void {
+  describe('GridLotRepository contract', () => {
+    let repo: GridLotRepository;
+
+    beforeEach(async () => {
+      repo = await create();
+    });
+
+    it('saves and reads back a lot', async () => {
+      await repo.save(gridLotFixture(), 'grid:TQQQ', 'TQQQ');
+
+      expect(await repo.findByStrategy('grid:TQQQ')).toEqual([gridLotFixture()]);
+    });
+
+    it('stores a copy — mutating the caller’s object cannot alter stored state', async () => {
+      const original = gridLotFixture();
+      await repo.save(original, 'grid:TQQQ', 'TQQQ');
+
+      original.fillPrice = 1;
+      original.status = GridLotStatus.CLOSED;
+
+      const [stored] = await repo.findByStrategy('grid:TQQQ');
+      expect(stored.fillPrice).toBe(95);
+      expect(stored.status).toBe(GridLotStatus.HELD);
+    });
+
+    it('returns a copy — mutating a read result cannot alter stored state', async () => {
+      await repo.save(gridLotFixture(), 'grid:TQQQ', 'TQQQ');
+
+      const read = await repo.findByStrategy('grid:TQQQ');
+      read[0].fillPrice = 1;
+
+      expect((await repo.findByStrategy('grid:TQQQ'))[0].fillPrice).toBe(95);
+    });
+
+    it('orders lots FIFO by openedAt', async () => {
+      await repo.saveAll(
+        [
+          gridLotFixture({ id: 'c', openedAt: '2025-01-02T12:00:00.000-05:00' }),
+          gridLotFixture({ id: 'a', openedAt: '2025-01-02T10:00:00.000-05:00' }),
+          gridLotFixture({ id: 'b', openedAt: '2025-01-02T11:00:00.000-05:00' }),
+        ],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+
+      expect((await repo.findByStrategy('grid:TQQQ')).map((l) => l.id)).toEqual(['a', 'b', 'c']);
+    });
+
+    it('breaks openedAt ties by id so the ordering is total and stable', async () => {
+      const at = '2025-01-02T10:00:00.000-05:00';
+      await repo.saveAll(
+        [gridLotFixture({ id: 'z', openedAt: at }), gridLotFixture({ id: 'a', openedAt: at })],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+
+      expect((await repo.findByStrategy('grid:TQQQ')).map((l) => l.id)).toEqual(['a', 'z']);
+    });
+
+    it('saveAll replaces the strategy’s whole set', async () => {
+      await repo.saveAll(
+        [gridLotFixture({ id: 'a' }), gridLotFixture({ id: 'b' })],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+      await repo.saveAll([gridLotFixture({ id: 'c' })], 'grid:TQQQ', 'TQQQ');
+
+      expect((await repo.findByStrategy('grid:TQQQ')).map((l) => l.id)).toEqual(['c']);
+    });
+
+    it('saveAll with an empty set clears the strategy', async () => {
+      await repo.saveAll([gridLotFixture({ id: 'a' })], 'grid:TQQQ', 'TQQQ');
+      await repo.saveAll([], 'grid:TQQQ', 'TQQQ');
+
+      expect(await repo.findByStrategy('grid:TQQQ')).toEqual([]);
+    });
+
+    it('keeps strategies separate', async () => {
+      await repo.save(gridLotFixture({ id: 'tqqq-1' }), 'grid:TQQQ', 'TQQQ');
+      await repo.save(gridLotFixture({ id: 'spy-1' }), 'grid:SPY', 'SPY');
+
+      expect(await repo.findByStrategy('grid:TQQQ')).toHaveLength(1);
+      expect(await repo.findAll()).toHaveLength(2);
+    });
+
+    it('saveAll for one strategy leaves another strategy untouched', async () => {
+      await repo.save(gridLotFixture({ id: 'spy-1' }), 'grid:SPY', 'SPY');
+      await repo.saveAll([gridLotFixture({ id: 'tqqq-1' })], 'grid:TQQQ', 'TQQQ');
+
+      expect((await repo.findByStrategy('grid:SPY')).map((l) => l.id)).toEqual(['spy-1']);
+    });
+
+    it('findHeld excludes closed lots', async () => {
+      await repo.saveAll(
+        [
+          gridLotFixture({ id: 'held' }),
+          gridLotFixture({ id: 'closed', status: GridLotStatus.CLOSED }),
+        ],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+
+      expect((await repo.findHeld('grid:TQQQ')).map((l) => l.id)).toEqual(['held']);
+    });
+
+    it('round-trips a closed lot’s exit price and timestamp', async () => {
+      await repo.save(
+        gridLotFixture({
+          id: 'closed',
+          status: GridLotStatus.CLOSED,
+          closedAt: '2025-01-03T11:00:00.000-05:00',
+          exitPrice: 96.1,
+        }),
+        'grid:TQQQ',
+        'TQQQ',
+      );
+
+      const [stored] = await repo.findByStrategy('grid:TQQQ');
+      expect(stored.closedAt).toBe('2025-01-03T11:00:00.000-05:00');
+      expect(stored.exitPrice).toBe(96.1);
+    });
+
+    it('round-trips fractional prices without drift', async () => {
+      await repo.save(gridLotFixture({ fillPrice: 87.33, sellTarget: 87.83 }), 'grid:TQQQ', 'TQQQ');
+
+      const [stored] = await repo.findByStrategy('grid:TQQQ');
+      expect(stored.fillPrice).toBe(87.33);
+      expect(stored.sellTarget).toBe(87.83);
+    });
+
+    it('returns an empty array for an unknown strategy', async () => {
+      expect(await repo.findByStrategy('grid:NOPE')).toEqual([]);
+    });
+
+    it('clear removes everything', async () => {
+      await repo.save(gridLotFixture(), 'grid:TQQQ', 'TQQQ');
       await repo.clear();
 
       expect(await repo.findAll()).toEqual([]);

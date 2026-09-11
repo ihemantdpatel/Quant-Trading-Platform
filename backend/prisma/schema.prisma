@@ -215,6 +215,34 @@ model Rung {
   @@id([symbol, price])
 }
 
+/// `GridLot` — the durable unit of the grid strategy, parallel to `Lot` but
+/// deliberately **not** the same table: `Lot` has no `strategyId` column and
+/// is structurally ladder-specific (`rungPrice`), so extending it would mean
+/// touching dip-ladder-owned schema, which the grid strategy must not do.
+/// `strategyId` is present here from the start (e.g. `grid:TQQQ`) so a future
+/// second grid instance on another symbol needs no migration to coexist.
+model GridLot {
+  id             String   @id @db.VarChar(191)
+  strategyId     String   @db.VarChar(128)
+  symbol         String   @db.VarChar(32)
+  /// What this lot actually paid. The only basis for its sell target.
+  fillPrice      Decimal  @db.Decimal(18, 6)
+  quantity       Int
+  /// ISO-8601 ET. The FIFO sort key.
+  openedAt       String   @db.VarChar(32)
+  /// Frozen at open from the `gap` in force at that moment. Stored, never
+  /// recomputed — mirrors `Lot.exitTarget`'s reasoning exactly.
+  sellTarget     Decimal  @db.Decimal(18, 6)
+  status         String   @db.VarChar(16)
+  closedAt       String?  @db.VarChar(32)
+  exitPrice      Decimal? @db.Decimal(18, 6)
+  /// The resting SELL working against this lot, or null when none is.
+  workingOrderId String?  @db.VarChar(191)
+
+  @@index([symbol, openedAt, id], name: "grid_lot_symbol_fifo")
+  @@index([strategyId, status], name: "grid_lot_strategy_status")
+}
+
 /// A registered strategy instance and whether it is enabled.
 model StrategyInstance {
   id        String  @id @db.VarChar(128)

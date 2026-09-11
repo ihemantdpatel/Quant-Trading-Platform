@@ -40,7 +40,7 @@
  */
 
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { ReconciliationService } from './reconciliation.service';
+import { OrderOnlyReconciler } from './order-reconciler';
 
 export interface OrderPollConfig {
   /** How often to re-ask the broker for its open orders during a session. */
@@ -58,7 +58,7 @@ export class OrderPollService implements OnModuleDestroy {
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
-    private readonly reconciliation: ReconciliationService,
+    private readonly reconciliation: OrderOnlyReconciler,
     config: Partial<OrderPollConfig> = {},
   ) {
     this.config = { ...DEFAULT_ORDER_POLL_CONFIG, ...config };
@@ -104,7 +104,7 @@ export class OrderPollService implements OnModuleDestroy {
         return;
       }
 
-      if (report.ordersUpdated > 0) {
+      if (report.ordersUpdated !== undefined && report.ordersUpdated > 0) {
         this.logger.log(
           `periodic order reconciliation corrected ${report.ordersUpdated} stale order row(s) ` +
             `across ${report.symbols.length} symbol(s)`,

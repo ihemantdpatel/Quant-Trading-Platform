@@ -30,7 +30,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { DateTime } from 'luxon';
 import { ET_ZONE } from '../market-data/types';
 import { SESSION_CLOSE } from '../market-data/session';
-import { ReconciliationService } from './reconciliation.service';
+import { OrderOnlyReconciler } from './order-reconciler';
 
 export interface PostCloseReconcileConfig {
   /**
@@ -55,7 +55,7 @@ export class PostCloseReconcileService implements OnModuleDestroy {
   private lastRunDate: string | null = null;
 
   constructor(
-    private readonly reconciliation: ReconciliationService,
+    private readonly reconciliation: OrderOnlyReconciler,
     config: Partial<PostCloseReconcileConfig> = {},
   ) {
     this.config = { ...DEFAULT_POST_CLOSE_CONFIG, ...config };
@@ -168,8 +168,11 @@ export class PostCloseReconcileService implements OnModuleDestroy {
       }
 
       this.logger.log(
-        `post-close reconciliation done — ${report.ordersUpdated} stale order row(s) corrected ` +
-          `across ${report.symbols.length} symbol(s)`,
+        'post-close reconciliation done' +
+          (report.ordersUpdated !== undefined
+            ? ` — ${report.ordersUpdated} stale order row(s) corrected`
+            : '') +
+          ` across ${report.symbols.length} symbol(s)`,
       );
     } catch (error) {
       this.logger.error(

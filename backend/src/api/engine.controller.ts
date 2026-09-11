@@ -30,6 +30,7 @@ import { IBBrokerAdapter } from '../broker/ib/ib-broker.adapter';
 import { AppConfigService } from '../config/app-config.service';
 import { ExecutionMode } from '../config/execution-mode';
 import { EngineService } from '../engine/engine.service';
+import { GridReconciliationService } from '../reconciliation/grid-reconciliation.service';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
 import {
   DuplicateOrderService,
@@ -41,11 +42,16 @@ import { RISK_CONFIG, SYMBOL_CAPITAL } from '../risk/risk.module';
 import { RiskConfig } from '../risk/risk.config';
 import { evaluateStartupAssertions, SymbolCapital } from '../risk/startup-assertions';
 import { CoordinatorService } from '../strategies/coordinator.service';
+import { DIP_LADDER_ID_PREFIX } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { Rung, RungStatus } from '../strategies/dip-ladder/rung';
 import { Lot, LotStatus } from '../strategies/dip-ladder/lot';
+import { GRID_ID_PREFIX } from '../strategies/grid/grid.strategy';
+import { GridLot, GridLotStatus } from '../strategies/grid/lot';
 import {
   FILL_REPOSITORY,
   FillRepository,
+  GRID_LOT_REPOSITORY,
+  GridLotRepository,
   LOT_REPOSITORY,
   LotRepository,
   ORDER_INTENT_REPOSITORY,
@@ -70,6 +76,27 @@ function symbolOfLot(lot: Lot): string {
   return lot.id.split('-lot-')[0];
 }
 
+/**
+ * Why a row was served from the database instead of live strategy state.
+ *
+ * `HALTED` — a reconciliation mismatch stopped this symbol; `haltWith`
+ * deliberately restores nothing into strategy state, so the database is the
+ * only place the position still exists.
+ *
+ * `DISABLED` — the strategy that traded this symbol is not currently
+ * enabled, so nothing initialized its live state this boot
+ * (`initializeAll` only initializes enabled strategies). A real broker
+ * position it opened before being switched off does not stop existing just
+ * because the strategy is off, and would otherwise render as flat — not
+ * halted, so outside the halted fallback, and absent from live state, so
+ * absent from the live read too.
+ *
+ * Either way trading is unaffected — a halt already refuses to trade, and a
+ * disabled strategy processes no bars — only the *visibility* of a real
+ * position differs from the "verified against the broker this boot" case.
+ */
+type UnverifiedReason = 'HALTED' | 'DISABLED';
+
 /** A lot as the dashboard renders it, including derived display fields. */
 interface LotView {
   id: string;
@@ -85,20 +112,20 @@ interface LotView {
   /** Realized P&L for a closed lot, null while held. */
   realized: number | null;
   /**
-   * True when this row came from the database rather than live strategy state,
-   * because its symbol is halted and reconciliation deliberately restored
-   * nothing into the ladder.
+   * True when this row came from the database rather than live strategy
+   * state — see `UnverifiedReason`.
    *
-   * Carried per row rather than as a response-level flag because a halt is
-   * per-symbol: one halted symbol must not label another symbol's live lots as
-   * unverified. The dashboard uses it to say *why* the numbers may disagree
-   * with the broker — which is the question an operator is holding while
-   * resolving the halt.
+   * Carried per row rather than as a response-level flag because both halts
+   * and disablement are per-symbol: one affected symbol must not label
+   * another symbol's live lots as unverified. The dashboard uses it to say
+   * *why* the numbers may disagree with the broker.
    */
   unverified: boolean;
+  /** Why, when `unverified` is true. Null otherwise. */
+  unverifiedReason: UnverifiedReason | null;
 }
 
-/** A rung as the dashboard renders it. `unverified` as in `LotView`. */
+/** A rung as the dashboard renders it. `unverified`/`unverifiedReason` as in `LotView`. */
 interface RungView {
   price: number;
   status: RungStatus;
@@ -109,6 +136,32 @@ interface RungView {
   held: boolean;
   fireable: boolean;
   unverified: boolean;
+  unverifiedReason: UnverifiedReason | null;
+}
+
+/**
+ * A grid lot as the dashboard renders it — deliberately shaped like `LotView`
+ * (`exitTarget` rather than `sellTarget`, no `rungPrice`) so the same table
+ * component can render either strategy's lots without an adapter.
+ *
+ * `workingOrderId` is exposed for the same reason `RungView` exposes it: it
+ * joins a held lot with no resting sell to its finding in `GET
+ * /orders/diagnosis`, and to its row in `GET /orders`.
+ */
+interface GridLotView {
+  id: string;
+  symbol: string;
+  fillPrice: number;
+  quantity: number;
+  openedAt: string;
+  exitTarget: number;
+  status: GridLotStatus;
+  closedAt: string | null;
+  exitPrice: number | null;
+  realized: number | null;
+  workingOrderId: string | null;
+  unverified: boolean;
+  unverifiedReason: UnverifiedReason | null;
 }
 
 @Controller()
@@ -118,6 +171,7 @@ export class EngineController {
     private readonly coordinator: CoordinatorService,
     private readonly killSwitch: KillSwitchService,
     private readonly reconciliation: ReconciliationService,
+    private readonly gridReconciliation: GridReconciliationService,
     private readonly orderDiagnosis: OrderDiagnosisService,
     private readonly duplicateOrders: DuplicateOrderService,
     private readonly symbolHalts: SymbolHaltService,
@@ -131,6 +185,9 @@ export class EngineController {
     // and rungs still exist. See `getLots`.
     @Inject(LOT_REPOSITORY) private readonly lotRepository: LotRepository,
     @Inject(RUNG_REPOSITORY) private readonly rungRepository: RungRepository,
+    // Read-only, and only for a halted symbol — the grid counterpart to
+    // `lotRepository` above. See `getGridLots`.
+    @Inject(GRID_LOT_REPOSITORY) private readonly gridLotRepository: GridLotRepository,
     @Inject(RISK_EVENT_REPOSITORY) private readonly riskEvents: RiskEventRepository,
     @Inject(STORAGE_MODE) private readonly storageMode: StorageMode,
     @Inject(RISK_CONFIG) private readonly riskConfig: RiskConfig,
@@ -190,44 +247,77 @@ export class EngineController {
   async getLots(): Promise<LotView[]> {
     // A halted symbol restored from the database has an **empty** ladder in
     // memory: `haltWith` restores nothing, deliberately, so the exit path can
-    // never read composition nobody verified. That is right for trading and
-    // wrong for looking — it blanked the very panel an operator opens to
-    // compare the database against the broker and resolve the halt.
+    // never read composition nobody verified. A *disabled* ladder is the same
+    // shape of gap from a different cause — `initializeAll` only initializes
+    // enabled strategies, so a symbol the ladder traded before being switched
+    // off is just as absent from live state. Both are right for trading and
+    // wrong for looking — either blanks the very panel an operator opens to
+    // check what a symbol is actually holding.
     //
     // Serving the persisted rows is read-only and cannot reach a strategy:
     // nothing is written back into the coordinator, so `processBar` still
     // returns before `dispatchBar` and the symbol still trades in neither
-    // direction. The halt is unchanged; only its visibility is.
+    // direction (or not at all, if disabled). Only visibility changes.
     //
-    // The persisted rows **replace** a halted symbol's live rows rather than
-    // adding to them. A halt raised mid-session (via `POST /reconcile`, or on
-    // a lot-sum failure) leaves the ladder populated in memory, so appending
-    // would show every lot twice and double the totals derived from them. One
-    // authority per symbol: halted → the database, otherwise → the ladder.
-    const halted = this.symbolHalts.haltedSymbols();
+    // The persisted rows **replace** a fallback symbol's live rows rather
+    // than adding to them — a halt raised mid-session leaves the ladder
+    // populated in memory, so appending would show every lot twice. One
+    // authority per symbol: halted or disabled → the database, otherwise →
+    // the ladder.
+    const fallback = this.fallbackSymbols(DIP_LADDER_ID_PREFIX);
     const live = this.engine
       .ladderLots()
-      .filter((lot) => !halted.includes(symbolOfLot(lot)))
-      .map((lot) => this.toLotView(lot, false));
+      .filter((lot) => !fallback.has(symbolOfLot(lot)))
+      .map((lot) => this.toLotView(lot, null));
 
-    return [...live, ...(await this.haltedLots(halted))];
+    return [...live, ...(await this.fallbackLots(fallback))];
   }
 
   /**
-   * Persisted lots for every halted symbol, flagged `unverified`.
+   * The union of a strategy's halted symbols and its disabled ones, each
+   * tagged with why — the set `getLots`/`getRungs`/`getGridLots` must read
+   * from the database instead of live state.
+   *
+   * A symbol reaches `DISABLED` only when the matching strategy is
+   * registered under `prefix` with no live state at all this boot — a
+   * strategy that traded and was then halted still carries live state (it is
+   * simply not used for that symbol's view), so the two sets do not overlap
+   * in practice. The halted check runs first regardless, so a halt's reason
+   * always wins if they ever did.
+   */
+  private fallbackSymbols(prefix: string): Map<string, UnverifiedReason> {
+    const fallback = new Map<string, UnverifiedReason>();
+
+    for (const symbol of this.symbolHalts.haltedSymbols()) {
+      fallback.set(symbol, 'HALTED');
+    }
+
+    for (const snapshot of this.coordinator.snapshots()) {
+      const symbol = snapshot.symbols[0];
+
+      if (snapshot.id.startsWith(prefix) && !snapshot.state && symbol && !fallback.has(symbol)) {
+        fallback.set(symbol, 'DISABLED');
+      }
+    }
+
+    return fallback;
+  }
+
+  /**
+   * Persisted lots for every fallback symbol, flagged `unverified`.
    *
    * A failed read degrades to `[]` rather than throwing. The live rows above
    * are already in hand, and a database hiccup must not blank the panel for
    * the symbols that *are* healthy — that is the coupling this whole change
    * exists to remove.
    */
-  private async haltedLots(symbols: string[]): Promise<LotView[]> {
+  private async fallbackLots(fallback: Map<string, UnverifiedReason>): Promise<LotView[]> {
     const views: LotView[] = [];
 
-    for (const symbol of symbols) {
+    for (const [symbol, reason] of fallback) {
       try {
         const lots = await this.lotRepository.findBySymbol(symbol);
-        views.push(...lots.map((lot) => this.toLotView(lot, true)));
+        views.push(...lots.map((lot) => this.toLotView(lot, reason)));
       } catch {
         // Reported by the halt banner already; an empty section is not worth
         // failing the whole read for.
@@ -237,7 +327,7 @@ export class EngineController {
     return views;
   }
 
-  private toLotView(lot: Lot, unverified: boolean): LotView {
+  private toLotView(lot: Lot, unverifiedReason: UnverifiedReason | null): LotView {
     return {
       id: lot.id,
       symbol: symbolOfLot(lot),
@@ -253,41 +343,43 @@ export class EngineController {
         lot.status === LotStatus.CLOSED && lot.exitPrice !== null
           ? Math.round((lot.exitPrice - lot.fillPrice) * lot.quantity * 100) / 100
           : null,
-      unverified,
+      unverified: unverifiedReason !== null,
+      unverifiedReason,
     };
   }
 
   /** Rungs distinguishing held / working / re-armed / pending with their prices. */
   @Get('rungs')
   async getRungs(): Promise<RungView[]> {
-    // Same reasoning as `getLots`, including the substitution: a halted
+    // Same reasoning as `getLots`, including the substitution: a fallback
     // symbol's rungs come from the database and its in-memory rungs are
-    // dropped, so a mid-session halt cannot render the ladder twice.
-    const halted = this.symbolHalts.haltedSymbols();
+    // dropped, so a mid-session halt (or the ladder being disabled) cannot
+    // render the ladder twice.
+    const fallback = this.fallbackSymbols(DIP_LADDER_ID_PREFIX);
     const live = this.engine
       .ladderRungsBySymbol()
-      .filter(({ symbol }) => !halted.includes(symbol))
-      .flatMap(({ rungs }) => rungs.map((rung) => this.toRungView(rung, false)));
+      .filter(({ symbol }) => !fallback.has(symbol))
+      .flatMap(({ rungs }) => rungs.map((rung) => this.toRungView(rung, null)));
 
-    return [...live, ...(await this.haltedRungs(halted))];
+    return [...live, ...(await this.fallbackRungs(fallback))];
   }
 
-  private async haltedRungs(symbols: string[]): Promise<RungView[]> {
+  private async fallbackRungs(fallback: Map<string, UnverifiedReason>): Promise<RungView[]> {
     const views: RungView[] = [];
 
-    for (const symbol of symbols) {
+    for (const [symbol, reason] of fallback) {
       try {
         const rungs = await this.rungRepository.findBySymbol(symbol);
-        views.push(...rungs.map((rung) => this.toRungView(rung, true)));
+        views.push(...rungs.map((rung) => this.toRungView(rung, reason)));
       } catch {
-        // As in `haltedLots` — degrade to omitting this symbol's rungs.
+        // As in `fallbackLots` — degrade to omitting this symbol's rungs.
       }
     }
 
     return views;
   }
 
-  private toRungView(rung: Rung, unverified: boolean): RungView {
+  private toRungView(rung: Rung, unverifiedReason: UnverifiedReason | null): RungView {
     return {
       price: rung.price,
       status: rung.status,
@@ -304,10 +396,81 @@ export class EngineController {
       // alone would report a WORKING rung as fireable and tell an operator the
       // ladder is armed at a level where an order is already committed.
       //
-      // Always false for an unverified row: the symbol is halted, so no level
-      // is armed regardless of what the persisted ledger says.
-      fireable: !unverified && rung.lotId === null && !rung.workingOrderId,
-      unverified,
+      // Always false for an unverified row: the symbol is halted or the
+      // ladder disabled, so no level is armed regardless of what the
+      // persisted ledger says.
+      fireable: unverifiedReason === null && rung.lotId === null && !rung.workingOrderId,
+      unverified: unverifiedReason !== null,
+      unverifiedReason,
+    };
+  }
+
+  /**
+   * Grid lots — the grid counterpart to `GET /lots`.
+   *
+   * Same fallback substitution as `getLots`: a halt, or the grid strategy
+   * being disabled, restores nothing into its live state either, so an
+   * affected symbol's lots are served from `GridLot` instead, flagged
+   * `unverified`.
+   *
+   * There is no grid counterpart to `GET /rungs` — the strategy keeps no
+   * persisted level ledger to project (see `GridStrategy`'s own doc comment).
+   */
+  @Get('grid/lots')
+  async getGridLots(): Promise<GridLotView[]> {
+    const fallback = this.fallbackSymbols(GRID_ID_PREFIX);
+    const live = this.engine
+      .gridLotsBySymbol()
+      .filter(({ symbol }) => !fallback.has(symbol))
+      .flatMap(({ symbol, lots }) => lots.map((lot) => this.toGridLotView(lot, symbol, null)));
+
+    return [...live, ...(await this.fallbackGridLots(fallback))];
+  }
+
+  /**
+   * Persisted grid lots for every fallback symbol, flagged `unverified`.
+   *
+   * `GridLotRepository` is keyed by `strategyId`, not `symbol` — reconstructed
+   * here as `grid:${symbol}`, the same convention `GridStrategy`'s own
+   * constructor uses, since one grid instance trades exactly one symbol.
+   */
+  private async fallbackGridLots(fallback: Map<string, UnverifiedReason>): Promise<GridLotView[]> {
+    const views: GridLotView[] = [];
+
+    for (const [symbol, reason] of fallback) {
+      try {
+        const lots = await this.gridLotRepository.findByStrategy(`${GRID_ID_PREFIX}${symbol}`);
+        views.push(...lots.map((lot) => this.toGridLotView(lot, symbol, reason)));
+      } catch {
+        // As in `fallbackLots` — degrade to omitting this symbol's grid lots.
+      }
+    }
+
+    return views;
+  }
+
+  private toGridLotView(
+    lot: GridLot,
+    symbol: string,
+    unverifiedReason: UnverifiedReason | null,
+  ): GridLotView {
+    return {
+      id: lot.id,
+      symbol,
+      fillPrice: lot.fillPrice,
+      quantity: lot.quantity,
+      openedAt: lot.openedAt,
+      exitTarget: lot.sellTarget,
+      status: lot.status,
+      closedAt: lot.closedAt,
+      exitPrice: lot.exitPrice,
+      realized:
+        lot.status === GridLotStatus.CLOSED && lot.exitPrice !== null
+          ? Math.round((lot.exitPrice - lot.fillPrice) * lot.quantity * 100) / 100
+          : null,
+      workingOrderId: lot.workingOrderId,
+      unverified: unverifiedReason !== null,
+      unverifiedReason,
     };
   }
 
@@ -407,6 +570,12 @@ export class EngineController {
       // must be able to tell "scheduled but not yet due" from "ran and found
       // nothing", which absence alone cannot express.
       orderReconciliation: this.reconciliation.lastOrderReconcile(),
+      // The grid strategy's own reports, reported separately rather than
+      // merged into the two fields above — its verdict shape differs from
+      // the ladder's, and collapsing them would either lose which strategy a
+      // finding belongs to or silently prefer one over the other.
+      gridReconciliation: this.gridReconciliation.lastReconciliation(),
+      gridOrderReconciliation: this.gridReconciliation.lastOrderReconcile(),
       // **Active alerts only.** A resolved alert is history, and rendering it
       // as a live banner told an operator the engine was halted when it had
       // already recovered. The full record, resolved rows included, is at
@@ -469,11 +638,37 @@ export class EngineController {
    * No order is ever cancelled and no position is ever traded by this route —
    * `reconcileAll` has no path to either, which is what makes exposing it to a
    * button acceptable.
+   *
+   * **Runs the grid strategy's own `reconcileAll` too, merged into the
+   * response the dashboard already reads.** `ui/app/actions.ts` parses
+   * `clean`/`haltedSymbols`/`symbols`/`ordersUpdated` off the top level of
+   * this response, so adding a second, differently-shaped reconciler must not
+   * silently stop being reflected in the fields it already reads — merging
+   * rather than nesting keeps that contract intact. The full, separately-typed
+   * reports are still included under `ladder`/`grid` for a caller that wants
+   * the per-strategy detail the merge cannot express (each verdict shape
+   * differs). Sequential, not parallel: two independent, infrequent operator
+   * actions against one broker connection, not a path where their latency is
+   * worth racing.
    */
   @Post('reconcile')
   @HttpCode(HttpStatus.OK)
   async reconcile(): Promise<unknown> {
-    return this.reconciliation.reconcileAll(new Date().toISOString());
+    const now = new Date().toISOString();
+    const ladder = await this.reconciliation.reconcileAll(now);
+    const grid = await this.gridReconciliation.reconcileAll(now);
+
+    return {
+      ranAt: now,
+      clean: ladder.clean && grid.clean,
+      haltedSymbols: [...ladder.haltedSymbols, ...grid.haltedSymbols],
+      symbols: [...ladder.symbols, ...grid.symbols],
+      ordersUpdated: ladder.ordersUpdated,
+      recoveredExits: ladder.recoveredExits,
+      rebuildsApplied: ladder.rebuildsApplied,
+      ladder,
+      grid,
+    };
   }
 
   /**
@@ -582,8 +777,13 @@ export class EngineController {
   @Get('halts')
   getHalts(): unknown {
     return {
+      // Shared across both strategies — `SymbolHaltService` is a single
+      // instance both `ReconciliationService` and `GridReconciliationService`
+      // halt through, so this list already reflects a grid-raised halt with
+      // no change needed here.
       symbols: this.symbolHalts.active(),
       reconciliation: this.reconciliation.lastReconciliation(),
+      gridReconciliation: this.gridReconciliation.lastReconciliation(),
     };
   }
 
