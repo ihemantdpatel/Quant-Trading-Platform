@@ -1,21 +1,26 @@
 /**
- * Pending-order panel tests (`PRD.md:379`).
+ * Activity panel tests (`PRD.md:379`).
  *
- * The properties asserted here are the ones that stop the panel lying about
- * live broker exposure:
+ * Two kinds of property live here now that Pending orders, Orders & fills, and
+ * Risk events are one tabbed panel rather than three:
  *
- * 1. **Only open orders appear.** A filled or cancelled order is history;
- *    showing it as pending would report exposure that no longer exists.
- * 2. **A partial shows its unfilled remainder**, not the size originally
- *    submitted — the remainder is what is still working at the broker.
- * 3. **The panel is not truncated.** The history log is capped at 12 rows, and
- *    the whole reason this panel is separate is that a resting order must not
- *    scroll out of view behind a busy session.
+ * 1. **The tab switch itself** — Pending is the default view, and only one
+ *    view's content is on screen at a time.
+ * 2. **What the Pending tab shows**, which is the one that stops it lying
+ *    about live broker exposure:
+ *    - Only open orders appear. A filled or cancelled order is history;
+ *      showing it as pending would report exposure that no longer exists.
+ *    - A partial shows its unfilled remainder, not the size originally
+ *      submitted — the remainder is what is still working at the broker.
+ *    - The list is not truncated. The history tab is capped at 12 rows, and
+ *      the whole reason Pending is separate is that a resting order must not
+ *      scroll out of view behind a busy session.
  */
 
 import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { ActivityLog } from './ActivityLog';
-import type { Fill, Order } from '../lib/api';
+import type { Fill, Order, RiskEvent } from '../lib/api';
 
 function order(overrides: Partial<Order> = {}): Order {
   return {
@@ -44,6 +49,17 @@ function fill(overrides: Partial<Fill> = {}): Fill {
     price: 95,
     commission: 1,
     timestamp: '2024-03-04T09:51:00-05:00',
+    ...overrides,
+  };
+}
+
+function riskEvent(overrides: Partial<RiskEvent> = {}): RiskEvent {
+  return {
+    type: 'REJECTION',
+    reason: 'CAPITAL_CAP',
+    detail: 'capital cap breached',
+    timestamp: '2024-03-04T09:52:00-05:00',
+    approvedQuantity: null,
     ...overrides,
   };
 }
@@ -134,5 +150,74 @@ describe('ActivityLog pending orders', () => {
     renderLog([], [], 'SHADOW');
 
     expect(screen.getByText(/SHADOW submits nothing/i)).toBeInTheDocument();
+  });
+});
+
+describe('ActivityLog tabs', () => {
+  it('shows Pending orders by default', () => {
+    render(<ActivityLog orders={[order()]} fills={[]} riskEvents={[riskEvent()]} mode="PAPER" />);
+
+    expect(screen.getByTestId('pending-order-co-1')).toBeInTheDocument();
+    expect(screen.queryByText('capital cap breached')).not.toBeInTheDocument();
+  });
+
+  it('switches to Orders & fills, showing submitted orders', async () => {
+    const user = userEvent.setup();
+    render(<ActivityLog orders={[order()]} fills={[]} riskEvents={[riskEvent()]} mode="PAPER" />);
+
+    await user.click(screen.getByRole('tab', { name: /^orders & fills/i }));
+
+    // Delegated to OrdersFillsHistory's own Submitted/Filled tabs, which
+    // default to Submitted.
+    expect(screen.getByTestId('order-row-co-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('pending-order-co-1')).not.toBeInTheDocument();
+  });
+
+  it('switches to Risk events', async () => {
+    const user = userEvent.setup();
+    render(<ActivityLog orders={[order()]} fills={[]} riskEvents={[riskEvent()]} mode="PAPER" />);
+
+    await user.click(screen.getByRole('tab', { name: /^risk events/i }));
+
+    expect(screen.getByText('capital cap breached')).toBeInTheDocument();
+    expect(screen.queryByTestId('pending-order-co-1')).not.toBeInTheDocument();
+  });
+
+  it('reports the risk event count in its tab label', () => {
+    render(
+      <ActivityLog orders={[]} fills={[]} riskEvents={[riskEvent(), riskEvent()]} mode="PAPER" />,
+    );
+
+    expect(screen.getByRole('tab', { name: 'Risk events (2)' })).toBeInTheDocument();
+  });
+
+  it('marks the active tab via aria-selected', async () => {
+    const user = userEvent.setup();
+    render(<ActivityLog orders={[]} fills={[]} riskEvents={[]} mode="PAPER" />);
+
+    expect(screen.getByRole('tab', { name: /^pending orders/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+
+    await user.click(screen.getByRole('tab', { name: /^risk events/i }));
+
+    expect(screen.getByRole('tab', { name: /^risk events/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    expect(screen.getByRole('tab', { name: /^pending orders/i })).toHaveAttribute(
+      'aria-selected',
+      'false',
+    );
+  });
+
+  it('shows an empty state on Risk events when there are none', async () => {
+    const user = userEvent.setup();
+    render(<ActivityLog orders={[]} fills={[]} riskEvents={[]} mode="PAPER" />);
+
+    await user.click(screen.getByRole('tab', { name: /^risk events/i }));
+
+    expect(screen.getByText(/no rejections, resizes, or halts/i)).toBeInTheDocument();
   });
 });

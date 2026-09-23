@@ -68,6 +68,8 @@ import { ExecutionMode } from '../config/execution-mode';
 import {
   FILL_REPOSITORY,
   FillRepository,
+  GRID_LOT_REPOSITORY,
+  GridLotRepository,
   LOT_REBUILD_EVENT_REPOSITORY,
   LOT_REPOSITORY,
   LotRebuildEventRepository,
@@ -89,6 +91,7 @@ import {
 } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { closeLot, Lot, LotStatus } from '../strategies/dip-ladder/lot';
 import { reArm, Rung, RungStatus } from '../strategies/dip-ladder/rung';
+import { GRID_ID_PREFIX } from '../strategies/grid/grid.strategy';
 import { DIP_LADDER_CONFIG } from '../strategies/strategies.module';
 import { JsonValue } from '../strategies/types';
 import {
@@ -217,6 +220,14 @@ export class ReconciliationService implements OnModuleInit {
     // `docs/decisions/auto-lot-rebuild.md` for what a second symbol requires.
     @Inject(DIP_LADDER_CONFIG) private readonly ladderConfig: DipLadderConfig,
     private readonly mode: ExecutionMode,
+    // The grid strategy's own lots for the *same* symbol — see
+    // `siblingHeldQuantity`. Both strategies are registered against
+    // `GRID_SYMBOL === DIP_LADDER_SYMBOL` (`strategies.module.ts`), and a
+    // symbol's holdings are a fact about the broker account, not about which
+    // strategy happens to be enabled — so this reconciliation must know what
+    // the grid strategy already claims before deciding what its own lots are
+    // supposed to explain.
+    @Inject(GRID_LOT_REPOSITORY) private readonly gridLots: GridLotRepository,
   ) {}
 
   /**
@@ -590,7 +601,15 @@ export class ReconciliationService implements OnModuleInit {
 
     // A symbol the broker does not list is flat, which is a real answer and not
     // missing data.
-    const brokerQuantity = positions.find((p) => p.symbol === symbol)?.quantity ?? 0;
+    //
+    // **Adjusted for the grid strategy's own holdings on this symbol.** The
+    // broker reports one net position per symbol regardless of which strategy
+    // accumulated it, so the ladder's lots only need to explain the share of
+    // it the grid strategy does not already claim — otherwise a real position
+    // left behind by switching strategies reads as this ladder's own mismatch
+    // (see `siblingHeldQuantity`).
+    const rawBrokerQuantity = positions.find((p) => p.symbol === symbol)?.quantity ?? 0;
+    const brokerQuantity = rawBrokerQuantity - (await this.siblingHeldQuantity(symbol));
 
     // **Version is checked before the state is trusted** (`stories.md:514`).
     // Rejected rather than coerced: a snapshot written by a different schema
@@ -636,7 +655,11 @@ export class ReconciliationService implements OnModuleInit {
         symbol,
         recovery.lots,
         recovery.rungs,
-        positions,
+        // Adjusted the same way `brokerQuantity` above is — `attemptRebuild`
+        // re-derives the broker quantity from this array itself, and it must
+        // see the same grid-adjusted figure or it would reconstruct lots for
+        // shares the grid strategy already accounts for.
+        this.withAdjustedQuantity(positions, symbol, brokerQuantity),
         now,
       );
 
@@ -996,15 +1019,27 @@ export class ReconciliationService implements OnModuleInit {
     // `null` is "could not ask", not "nothing resting" — see `reconcileAll`.
     // The persisted ledger stands unchanged, which keeps WORKING rungs blocked
     // rather than risking a duplicate order at a level already taken.
-    if (!state || openOrders === null) {
-      if (openOrders === null) {
-        this.logger.warn(
-          `${symbol}: open orders could not be read from the broker — resting-order state ` +
-            'left as persisted. A rung whose order expired will stay blocked until the next ' +
-            'successful reconciliation.',
-        );
-      }
+    if (openOrders === null) {
+      this.logger.warn(
+        `${symbol}: open orders could not be read from the broker — resting-order state ` +
+          'left as persisted. A rung whose order expired will stay blocked until the next ' +
+          'successful reconciliation.',
+      );
 
+      return;
+    }
+
+    if (!state) {
+      // Disabled, not halted. There is no rung ledger to release (nothing
+      // places a BUY for a disabled strategy) and no live state to adopt an
+      // orphan into — but a HELD lot's stale `workingOrderId` is exactly as
+      // real a gap as it is for an enabled strategy: once its DAY sell
+      // expires at the close, leaving the mark set means `diagnose()` keeps
+      // reporting it `UNBACKED` forever rather than `missing`, and
+      // `POST /orders/place-missing` never gets a candidate to rest a fresh
+      // one against. See `DisabledStrategyProtectionService`, which depends
+      // on this release having already happened before it diagnoses.
+      await this.releaseStaleDisabledSells(symbol, openOrders);
       return;
     }
 
@@ -1067,6 +1102,46 @@ export class ReconciliationService implements OnModuleInit {
     // The engine's in-memory working-order registry is rebuilt from what the
     // broker actually holds, so a fill on an adopted order finds its rung.
     this.onOpenOrdersReconciled?.(strategyId, symbol, restingForSymbol);
+  }
+
+  /**
+   * The disabled-strategy counterpart to the SELL-side release above —
+   * operates on the persisted `Lot` row directly since there is no live
+   * state to mutate. Never adopts an orphan BUY (a disabled strategy places
+   * none) and never touches rungs (bar-driven bookkeeping with no meaning
+   * for a strategy nothing is running — see `OrderDiagnosisService`'s
+   * "diagnosed from the database" section for the same reasoning applied to
+   * reads rather than writes).
+   */
+  private async releaseStaleDisabledSells(symbol: string, openOrders: OpenOrder[]): Promise<void> {
+    const lots = await this.lots.findBySymbol(symbol);
+    const restingSellIds = new Set(
+      openOrders
+        .filter((order) => order.symbol === symbol && order.side === 'SELL')
+        .map((order) => order.clientOrderId),
+    );
+
+    let released = 0;
+    const updated = lots.map((lot) => {
+      if (
+        lot.status === LotStatus.HELD &&
+        lot.workingOrderId &&
+        !restingSellIds.has(lot.workingOrderId)
+      ) {
+        released += 1;
+        return { ...lot, workingOrderId: null };
+      }
+
+      return lot;
+    });
+
+    if (released > 0) {
+      await this.lots.saveAll(updated, symbol);
+      this.logger.log(
+        `${symbol}: released ${released} disabled-strategy lot working-order mark(s) whose sell ` +
+          'is no longer at the broker',
+      );
+    }
   }
 
   /**
@@ -1206,6 +1281,48 @@ export class ReconciliationService implements OnModuleInit {
       // and `RebuildOutcome.applied` is what would have made it reconcile.
       rebuildAction,
     };
+  }
+
+  /**
+   * Shares of `symbol` already claimed by the grid strategy's own held lots —
+   * the ladder's lot sum only has to explain what remains.
+   *
+   * **Why this must not fail open.** A read that threw and was swallowed to
+   * `0` would let the ladder treat every grid-held share as its own to
+   * explain, which can silently produce a false `MATCHED` verdict — the exact
+   * "unknown must halt, not resume" failure the lot-sum assertion otherwise
+   * refuses to make (`lot-sum-assertion.ts`'s own header comment). The grid
+   * lot table is a plain database read, not a broker call, so it is not
+   * wrapped the way `brokerPositions`/`brokerOpenOrders` are — a failure here
+   * propagates and fails the whole reconciliation loudly, the same way a
+   * failed `this.lots.findBySymbol` read already does above.
+   */
+  private async siblingHeldQuantity(symbol: string): Promise<number> {
+    const held = await this.gridLots.findHeld(`${GRID_ID_PREFIX}${symbol}`);
+    return held.reduce((sum, lot) => sum + lot.quantity, 0);
+  }
+
+  /**
+   * Substitutes `symbol`'s reported quantity in a broker position list —
+   * used to carry the grid-adjusted figure into `attemptRebuild`, which
+   * re-derives its own broker quantity from the array rather than accepting
+   * one directly.
+   */
+  private withAdjustedQuantity(
+    positions: BrokerPosition[],
+    symbol: string,
+    quantity: number,
+  ): BrokerPosition[] {
+    if (!positions.some((p) => p.symbol === symbol)) {
+      // No entry to adjust. Only reachable when the grid strategy claims
+      // shares the broker does not report for this symbol at all — already a
+      // genuine divergence the assertion above will halt on regardless, so a
+      // placeholder entry is only there to keep `attemptRebuild`'s own lookup
+      // consistent with the mismatch just found, not to fabricate a position.
+      return quantity === 0 ? positions : [...positions, { symbol, quantity, averageCost: 0 }];
+    }
+
+    return positions.map((p) => (p.symbol === symbol ? { ...p, quantity } : p));
   }
 
   /**

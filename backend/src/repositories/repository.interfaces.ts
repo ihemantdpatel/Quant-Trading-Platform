@@ -20,6 +20,7 @@ import { RiskDecision } from '../risk/types';
 import { Lot } from '../strategies/dip-ladder/lot';
 import { ParameterChange } from '../strategies/dip-ladder/parameter-change';
 import { Rung } from '../strategies/dip-ladder/rung';
+import { GridLot } from '../strategies/grid/lot';
 import { OrderIntent } from '../strategies/types';
 
 /**
@@ -107,6 +108,23 @@ export interface RungRepository {
   saveAll(rungs: Rung[], symbol: string): Promise<void>;
   findBySymbol(symbol: string): Promise<Rung[]>;
   findAll(): Promise<Rung[]>;
+  clear(): Promise<void>;
+}
+
+/**
+ * Grid-strategy lots — parallel to `LotRepository`, on `GridLot`'s own table.
+ *
+ * Keyed by `strategyId` as well as `symbol`: unlike the ladder (one instance
+ * per process today), a `GridLot` row must be attributable to a specific grid
+ * instance from the start, since the schema carries no dip-ladder-style
+ * assumption that only one strategy ever holds lots for a symbol.
+ */
+export interface GridLotRepository {
+  save(lot: GridLot, strategyId: string, symbol: string): Promise<void>;
+  saveAll(lots: GridLot[], strategyId: string, symbol: string): Promise<void>;
+  findAll(): Promise<GridLot[]>;
+  findByStrategy(strategyId: string): Promise<GridLot[]>;
+  findHeld(strategyId: string): Promise<GridLot[]>;
   clear(): Promise<void>;
 }
 
@@ -335,6 +353,7 @@ export const ORDER_REPOSITORY = Symbol('ORDER_REPOSITORY');
 export const FILL_REPOSITORY = Symbol('FILL_REPOSITORY');
 export const LOT_REPOSITORY = Symbol('LOT_REPOSITORY');
 export const RUNG_REPOSITORY = Symbol('RUNG_REPOSITORY');
+export const GRID_LOT_REPOSITORY = Symbol('GRID_LOT_REPOSITORY');
 export const RISK_EVENT_REPOSITORY = Symbol('RISK_EVENT_REPOSITORY');
 export const LOT_REBUILD_EVENT_REPOSITORY = Symbol('LOT_REBUILD_EVENT_REPOSITORY');
 export const PARAMETER_CHANGE_REPOSITORY = Symbol('PARAMETER_CHANGE_REPOSITORY');

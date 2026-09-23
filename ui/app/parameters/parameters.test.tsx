@@ -8,9 +8,9 @@
  * operator before they commit an edit.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import ParametersPage from './page';
-import { loadParameters, type Lot, type ParametersData } from '../lib/api';
+import { loadParameters, type GridLot, type Lot, type ParametersData } from '../lib/api';
 
 jest.mock('../lib/api', () => {
   const actual = jest.requireActual('../lib/api');
@@ -39,36 +39,59 @@ function lot(id: string, status: Lot['status']): Lot {
   };
 }
 
+function gridLot(id: string, status: GridLot['status']): GridLot {
+  return {
+    id,
+    symbol: 'TQQQ',
+    fillPrice: 100,
+    quantity: 50,
+    openedAt: '2024-03-04T09:50:00-05:00',
+    exitTarget: 101,
+    status,
+    closedAt: null,
+    exitPrice: null,
+    realized: null,
+    workingOrderId: null,
+  };
+}
+
+const LADDER_SET = {
+  strategyId: 'dip-ladder:TQQQ',
+  symbol: 'TQQQ',
+  parameters: {
+    // A valid `SpacingMode` and a positive floor fraction: this fixture
+    // previously carried 'PERCENT' and a negative floor, neither of which the
+    // backend would accept.
+    spacingMode: 'PERCENTAGE' as const,
+    spacingPercent: 0.03,
+    spacingDollars: 1,
+    takeProfitPercent: 0.05,
+    takeProfitDollars: null,
+    sizePerRung: 0.2,
+    fixedQuantity: null,
+    hardFloorPercent: 0.25,
+    maxConcurrentRungs: 5,
+    escalationFactor: 1,
+    atrMultiple: 1,
+    atrPeriod: 14,
+    exitMode: 'PER_LOT' as const,
+  },
+};
+
+const GRID_SET = {
+  strategyId: 'grid:TQQQ',
+  symbol: 'TQQQ',
+  parameters: { gap: 0.5, quantity: 50, maxBuyLevels: 2, maxSellOrders: 2 },
+};
+
 function parametersData(overrides: Partial<ParametersData> = {}): ParametersData {
   return {
-    parameters: [
-      {
-        strategyId: 'dip-ladder:TQQQ',
-        symbol: 'TQQQ',
-        parameters: {
-          // A valid `SpacingMode` and a positive floor fraction: this fixture
-          // previously carried 'PERCENT' and a negative floor, neither of which
-          // the backend would accept.
-          spacingMode: 'PERCENTAGE',
-          spacingPercent: 0.03,
-          spacingDollars: 1,
-          takeProfitPercent: 0.05,
-          takeProfitDollars: null,
-          sizePerRung: 0.2,
-          fixedQuantity: null,
-          hardFloorPercent: 0.25,
-          maxConcurrentRungs: 5,
-          escalationFactor: 1,
-          atrMultiple: 1,
-          atrPeriod: 14,
-          exitMode: 'PER_LOT',
-        },
-      },
-    ],
+    parameters: [LADDER_SET],
     parameterChanges: [],
     riskLimits: {},
     riskLimitChanges: [],
     lots: [],
+    gridLots: [],
     error: null,
     ...overrides,
   };
@@ -114,5 +137,62 @@ describe('Parameters page', () => {
 
     expect(screen.getByRole('alert')).toHaveTextContent(/fetch failed/i);
     expect(screen.queryByRole('region', { name: /parameter editor/i })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Both strategies' parameters are always present in `GET /parameters`
+   * regardless of which is enabled (`ParametersController`'s own doc
+   * comment), so this page must dispatch each entry to the right editor by
+   * strategy id — never render the grid's four fields inside the ladder's
+   * form, or vice versa.
+   */
+  describe('a grid strategy entry', () => {
+    it('renders the grid editor rather than the ladder one for a grid: id', async () => {
+      mockLoad.mockResolvedValue(parametersData({ parameters: [GRID_SET] }));
+
+      render(await ParametersPage());
+
+      const editor = screen.getByRole('region', { name: /parameter editor/i });
+      expect(within(editor).getByLabelText('Gap ($)')).toBeInTheDocument();
+      expect(within(editor).queryByLabelText('Spacing mode')).not.toBeInTheDocument();
+    });
+
+    it('counts the grid strategy’s own held lots, not the ladder’s', async () => {
+      mockLoad.mockResolvedValue(
+        parametersData({
+          parameters: [GRID_SET],
+          // The ladder's lots must not leak into the grid editor's count.
+          lots: [lot('a', 'HELD'), lot('b', 'HELD')],
+          gridLots: [gridLot('TQQQ-grid-lot-1', 'HELD')],
+        }),
+      );
+
+      render(await ParametersPage());
+
+      expect(screen.getByTestId('frozen-lot-notice')).toHaveTextContent('1 held lot ');
+    });
+
+    it('renders both strategies’ editors side by side, each with its own held-lot count', async () => {
+      mockLoad.mockResolvedValue(
+        parametersData({
+          parameters: [LADDER_SET, GRID_SET],
+          lots: [lot('a', 'HELD')],
+          gridLots: [gridLot('TQQQ-grid-lot-1', 'HELD'), gridLot('TQQQ-grid-lot-2', 'HELD')],
+        }),
+      );
+
+      render(await ParametersPage());
+
+      const editors = screen.getAllByRole('region', { name: /parameter editor/i });
+      expect(editors).toHaveLength(2);
+
+      const notices = screen.getAllByTestId('frozen-lot-notice');
+      expect(notices.map((n) => n.textContent)).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining('1 held lot '),
+          expect.stringContaining('2 held lots'),
+        ]),
+      );
+    });
   });
 });

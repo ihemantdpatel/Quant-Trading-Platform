@@ -11,6 +11,9 @@
 import {
   blendedAverageCost,
   distanceToTarget,
+  heldLotCountFor,
+  isDipLadderEnabled,
+  isGridEnabled,
   lastMarkPrice,
   lotAge,
   totalDeployedCost,
@@ -20,6 +23,7 @@ import {
   formatPercent,
   type Fill,
   type Lot,
+  type StrategySummary,
 } from './api';
 
 function lot(overrides: Partial<Lot> = {}): Lot {
@@ -148,5 +152,52 @@ describe('formatting', () => {
   it('formats currency and percentages', () => {
     expect(formatCurrency(99.75)).toBe('$99.75');
     expect(formatPercent(0.05)).toBe('5.00%');
+  });
+});
+
+function strategy(overrides: Partial<StrategySummary> = {}): StrategySummary {
+  return {
+    id: 'dip-ladder:TQQQ',
+    enabled: true,
+    symbols: ['TQQQ'],
+    initialized: true,
+    ...overrides,
+  };
+}
+
+describe('isDipLadderEnabled / isGridEnabled', () => {
+  it('is true only when a matching instance is both registered and enabled', () => {
+    expect(isDipLadderEnabled([strategy({ id: 'dip-ladder:TQQQ', enabled: true })])).toBe(true);
+    expect(isDipLadderEnabled([strategy({ id: 'dip-ladder:TQQQ', enabled: false })])).toBe(false);
+    expect(isGridEnabled([strategy({ id: 'grid:TQQQ', enabled: true })])).toBe(true);
+    expect(isGridEnabled([strategy({ id: 'grid:TQQQ', enabled: false })])).toBe(false);
+  });
+
+  it('does not cross-match the other strategy’s id prefix', () => {
+    const strategies = [strategy({ id: 'dip-ladder:TQQQ', enabled: true })];
+
+    expect(isGridEnabled(strategies)).toBe(false);
+  });
+
+  it('is false for an empty or unrelated list', () => {
+    expect(isDipLadderEnabled([])).toBe(false);
+    expect(isGridEnabled([strategy({ id: 'wheel:TQQQ', enabled: true })])).toBe(false);
+  });
+});
+
+describe('heldLotCountFor', () => {
+  const ladderLots = [lot({ id: 'a', status: 'HELD' }), lot({ id: 'b', status: 'CLOSED' })];
+  const gridLots = [
+    lot({ id: 'c', status: 'HELD' }),
+    lot({ id: 'd', status: 'HELD' }),
+    lot({ id: 'e', status: 'CLOSED' }),
+  ];
+
+  it('counts the ladder’s own held lots for a dip-ladder id', () => {
+    expect(heldLotCountFor('dip-ladder:TQQQ', ladderLots, gridLots)).toBe(1);
+  });
+
+  it('counts the grid strategy’s own held lots for a grid id, never the ladder’s', () => {
+    expect(heldLotCountFor('grid:TQQQ', ladderLots, gridLots)).toBe(2);
   });
 });

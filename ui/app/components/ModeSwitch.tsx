@@ -13,6 +13,12 @@
  * from the real rule; deferring to the backend means the UI cannot permit what
  * boot would refuse, and the operator sees the *specific* missing value rather
  * than a generic "not allowed".
+ *
+ * **Unbordered on purpose.** `OverviewPanel` renders this as the content of
+ * its "Execution mode" tab, alongside "Status" (connection health and P&L,
+ * combined back into one tab) and `StrategyPanel` under "Strategies" — state
+ * that used to be two always-visible blocks, collapsed to one panel switched
+ * by tab so the page still fits on a tablet screen. The tab supplies the box.
  */
 
 import { useState, useTransition } from 'react';
@@ -38,10 +44,7 @@ export function ModeSwitch({ mode }: { mode: ExecutionMode }) {
   }
 
   return (
-    <section
-      aria-label="Execution mode"
-      className="rounded-lg border border-slate-800 bg-slate-900 p-4"
-    >
+    <section aria-label="Execution mode" className="p-4">
       <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
         Execution mode
       </h2>

@@ -80,7 +80,10 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             component's hidden-when-IB-is-bound gate.
           */}
           <div className="grid gap-4 lg:grid-cols-2">
-            <ReconcileButton lastRun={status?.orderReconciliation ?? null} />
+            <ReconcileButton
+              lastRun={status?.orderReconciliation ?? null}
+              gridLastRun={status?.gridOrderReconciliation ?? null}
+            />
             <PendingOrders />
           </div>
 

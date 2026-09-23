@@ -43,6 +43,25 @@
  * with no resting sell, or a fireable rung with no resting buy — never from the
  * absence of orders in general. Placing on an empty book would open positions
  * the ladder never decided to open.
+ *
+ * ## A disabled strategy's held lots are diagnosed from the database
+ *
+ * `coordinator.getState(snapshot.id)` is `null` for a disabled strategy —
+ * `initializeAll` never created live state for it — and reading only that
+ * state left a disabled strategy's real shares invisible here even though
+ * `GET /lots`/`GET /grid/lots` already serve them from the database for the
+ * identical reason (`engine.controller.ts`'s `fallbackLots`). The gap that
+ * left open: switching a strategy off stopped anything from maintaining its
+ * held lots' protective sells, and this service — the one an operator would
+ * use to notice and fix exactly that — could not see them either, so
+ * `POST /orders/place-missing` had nothing to act on.
+ *
+ * The fallback is **SELL-side only**. A disabled strategy's persisted lots
+ * are diagnosed for `MATCHED`/`UNBACKED`/`missing` exactly as live lots are
+ * (`diagnoseHeldLotSells`), but there is no rung/BUY-side fallback: a
+ * disabled strategy must never be proposed a *new* entry, and inventing one
+ * from a persisted rung would do exactly that. A halted symbol is still
+ * skipped entirely, as before — that check runs first.
  */
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
@@ -52,6 +71,12 @@ import {
   OpenOrder,
   OrderSide,
 } from '../broker/broker-adapter.interface';
+import {
+  GRID_LOT_REPOSITORY,
+  GridLotRepository,
+  LOT_REPOSITORY,
+  LotRepository,
+} from '../repositories/repository.interfaces';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import {
   DIP_LADDER_ID_PREFIX,
@@ -59,7 +84,26 @@ import {
 } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
+import { GRID_ID_PREFIX, GridStrategy } from '../strategies/grid/grid.strategy';
+import { GridLotStatus } from '../strategies/grid/lot';
 import { SymbolHaltService } from './symbol-halt.service';
+
+/**
+ * A held lot's SELL-side facts, normalized across `Lot` (the ladder) and
+ * `GridLot` — the shape `diagnoseHeldLotSells` needs, regardless of whether
+ * it came from live strategy state or the database fallback for a disabled
+ * strategy (see `diagnose`'s header comment).
+ */
+interface HeldLotForDiagnosis {
+  id: string;
+  quantity: number;
+  workingOrderId: string | null;
+  /** `exitTarget` for the ladder, `sellTarget` for grid. */
+  exitTarget: number;
+  openedAt: string;
+  /** The ladder's rung price this lot filled at; always null for a grid lot. */
+  rungPrice: number | null;
+}
 
 /** Rounds to cents so a broker price and a ladder price compare equal. */
 function roundPrice(value: number): number {
@@ -174,6 +218,10 @@ export class OrderDiagnosisService {
     private readonly coordinator: CoordinatorService,
     private readonly halts: SymbolHaltService,
     @Inject(BROKER_ADAPTER) private readonly broker: BrokerAdapter,
+    // Read-only, and only consulted for a disabled strategy — see the class
+    // header's "diagnosed from the database" section.
+    @Inject(LOT_REPOSITORY) private readonly lots: LotRepository,
+    @Inject(GRID_LOT_REPOSITORY) private readonly gridLots: GridLotRepository,
   ) {}
 
   /**
@@ -235,14 +283,37 @@ export class OrderDiagnosisService {
       }
 
       const state = this.coordinator.getState(snapshot.id);
+      const restingIds = new Set(openOrders.map((order) => order.clientOrderId));
+      const symbolOrders = openOrders.filter((order) => order.symbol === symbol);
 
       if (!state) {
+        // Disabled, not halted — see the class header's "diagnosed from the
+        // database" section. SELL-side only: no rung to fall back to, and a
+        // disabled strategy must never be proposed a new entry.
+        const persisted = await this.persistedHeldLots(symbol);
+
+        this.diagnoseHeldLotSells(
+          persisted.map((lot) => ({
+            id: lot.id,
+            quantity: lot.quantity,
+            workingOrderId: lot.workingOrderId,
+            exitTarget: lot.exitTarget,
+            openedAt: lot.openedAt,
+            rungPrice: lot.rungPrice,
+          })),
+          symbol,
+          snapshot.id,
+          restingIds,
+          symbolOrders,
+          diagnosis,
+          claims,
+        );
+
         continue;
       }
 
       const lots = DipLadderStrategy.lotsOf(state) ?? [];
       const rungs = DipLadderStrategy.rungsOf(state) ?? [];
-      const restingIds = new Set(openOrders.map((order) => order.clientOrderId));
 
       for (const rung of rungs) {
         if (!rung.workingOrderId) {
@@ -266,64 +337,29 @@ export class OrderDiagnosisService {
         }
       }
 
-      for (const lot of lots) {
-        if (lot.status !== LotStatus.HELD || !lot.workingOrderId) {
-          continue;
-        }
-
-        if (restingIds.has(lot.workingOrderId)) {
-          claims.set(lot.workingOrderId, { symbol, claimedBy: `lot ${lot.id}` });
-        } else {
-          diagnosis.unbacked.push({
-            kind: OrderFindingKind.UNBACKED,
-            symbol,
-            clientOrderId: lot.workingOrderId,
-            rungPrice: lot.rungPrice,
-            lotId: lot.id,
-            side: 'SELL',
-          });
-        }
-      }
-
       // **Missing orders — derived from a claim, never from an empty book.**
       //
       // A HELD lot with no `workingOrderId` is an unprotected position: the
       // ladder decided on its exit target when the lot opened, and no order is
       // carrying that decision. This is the gap with real money behind it.
-      const symbolOrders = openOrders.filter((order) => order.symbol === symbol);
-
-      for (const lot of lots) {
-        if (lot.status !== LotStatus.HELD || lot.workingOrderId) {
-          continue;
-        }
-
-        // The broker is the authority, not the (absent) in-memory mark: a sell
-        // at this price and quantity already covers these shares whatever the
-        // lot record says. Same price+quantity match as `restingSellIdFor`, and
-        // deliberately coarse for the same reason — a declined placement is
-        // recoverable, a position sold twice is not.
-        const covered = symbolOrders.some(
-          (order) =>
-            order.side === 'SELL' &&
-            roundPrice(order.limitPrice) === roundPrice(lot.exitTarget) &&
-            order.quantity === lot.quantity,
-        );
-
-        if (covered) {
-          continue;
-        }
-
-        diagnosis.missing.push({
-          symbol,
-          strategyId: snapshot.id,
-          side: 'SELL',
-          quantity: lot.quantity,
-          limitPrice: lot.exitTarget,
-          reason: `lot ${lot.id} is held since ${lot.openedAt} with no resting sell`,
-          lotId: lot.id,
-          rungPrice: lot.rungPrice,
-        });
-      }
+      this.diagnoseHeldLotSells(
+        lots
+          .filter((lot) => lot.status === LotStatus.HELD)
+          .map((lot) => ({
+            id: lot.id,
+            quantity: lot.quantity,
+            workingOrderId: lot.workingOrderId,
+            exitTarget: lot.exitTarget,
+            openedAt: lot.openedAt,
+            rungPrice: lot.rungPrice,
+          })),
+        symbol,
+        snapshot.id,
+        restingIds,
+        symbolOrders,
+        diagnosis,
+        claims,
+      );
 
       // A rung the ladder marked WORKING whose order the broker does not list
       // is *not* reported as missing — it is `UNBACKED`, and releasing it is
@@ -362,11 +398,62 @@ export class OrderDiagnosisService {
       }
     }
 
-    // Orders at the broker that no ladder claims.
+    // The grid strategy's own claims — the same shape of walk as the ladder's
+    // above, but over `GridLot[]` only: this strategy keeps no rung ledger, so
+    // there is no persisted claim for the BUY side and therefore no `UNBACKED`
+    // or `missing` finding for a dip-buy level, only for a lot's own sell.
+    for (const snapshot of this.coordinator.snapshots()) {
+      if (!snapshot.id.startsWith(GRID_ID_PREFIX)) {
+        continue;
+      }
+
+      const symbol = snapshot.symbols[0];
+
+      if (!symbol) {
+        continue;
+      }
+
+      if (this.halts.isHalted(symbol)) {
+        diagnosis.skippedSymbols.push(symbol);
+        continue;
+      }
+
+      const state = this.coordinator.getState(snapshot.id);
+      const restingIds = new Set(openOrders.map((order) => order.clientOrderId));
+      const symbolOrders = openOrders.filter((order) => order.symbol === symbol);
+
+      // The grid strategy keeps no rung-equivalent BUY-side ledger even while
+      // enabled, so unlike the ladder above there is nothing this fallback
+      // gives up by covering a disabled instance the same way as a live one —
+      // both reduce to the same SELL-side-only diagnosis. See the class
+      // header's "diagnosed from the database" section.
+      const lots = state
+        ? (GridStrategy.lotsOf(state) ?? []).filter((lot) => lot.status === GridLotStatus.HELD)
+        : await this.persistedHeldGridLots(snapshot.id);
+
+      this.diagnoseHeldLotSells(
+        lots.map((lot) => ({
+          id: lot.id,
+          quantity: lot.quantity,
+          workingOrderId: lot.workingOrderId,
+          exitTarget: lot.sellTarget,
+          openedAt: lot.openedAt,
+          rungPrice: null,
+        })),
+        symbol,
+        snapshot.id,
+        restingIds,
+        symbolOrders,
+        diagnosis,
+        claims,
+      );
+    }
+
+    // Orders at the broker that no strategy claims.
     const diagnosedSymbols = new Set(
       this.coordinator
         .snapshots()
-        .filter((s) => s.id.startsWith(DIP_LADDER_ID_PREFIX))
+        .filter((s) => s.id.startsWith(DIP_LADDER_ID_PREFIX) || s.id.startsWith(GRID_ID_PREFIX))
         .map((s) => s.symbols[0])
         .filter((s): s is string => Boolean(s) && !this.halts.isHalted(s)),
     );
@@ -414,6 +501,112 @@ export class OrderDiagnosisService {
     );
 
     return diagnosis;
+  }
+
+  /**
+   * Classifies one strategy's held lots against the broker's resting sells —
+   * `MATCHED` (via `claims`), `UNBACKED`, and `missing` — the SELL-side walk
+   * shared by the ladder and the grid strategy, and by live strategy state
+   * and the disabled-strategy database fallback alike. `lots` is expected
+   * pre-filtered to `HELD`.
+   */
+  private diagnoseHeldLotSells(
+    lots: HeldLotForDiagnosis[],
+    symbol: string,
+    strategyId: string,
+    restingIds: Set<string>,
+    symbolOrders: OpenOrder[],
+    diagnosis: OrderDiagnosis,
+    claims: Map<string, { symbol: string; claimedBy: string }>,
+  ): void {
+    for (const lot of lots) {
+      if (!lot.workingOrderId) {
+        continue;
+      }
+
+      if (restingIds.has(lot.workingOrderId)) {
+        claims.set(lot.workingOrderId, { symbol, claimedBy: `lot ${lot.id}` });
+      } else {
+        diagnosis.unbacked.push({
+          kind: OrderFindingKind.UNBACKED,
+          symbol,
+          clientOrderId: lot.workingOrderId,
+          rungPrice: lot.rungPrice,
+          lotId: lot.id,
+          side: 'SELL',
+        });
+      }
+    }
+
+    for (const lot of lots) {
+      if (lot.workingOrderId) {
+        continue;
+      }
+
+      // The broker is the authority, not the (absent) in-memory mark: a sell
+      // at this price and quantity already covers these shares whatever the
+      // lot record says. Same price+quantity match as `restingSellIdFor`, and
+      // deliberately coarse for the same reason — a declined placement is
+      // recoverable, a position sold twice is not.
+      const covered = symbolOrders.some(
+        (order) =>
+          order.side === 'SELL' &&
+          roundPrice(order.limitPrice) === roundPrice(lot.exitTarget) &&
+          order.quantity === lot.quantity,
+      );
+
+      if (covered) {
+        continue;
+      }
+
+      diagnosis.missing.push({
+        symbol,
+        strategyId,
+        side: 'SELL',
+        quantity: lot.quantity,
+        limitPrice: lot.exitTarget,
+        reason: `lot ${lot.id} is held since ${lot.openedAt} with no resting sell`,
+        lotId: lot.id,
+        rungPrice: lot.rungPrice,
+      });
+    }
+  }
+
+  /**
+   * A disabled ladder's held lots, read from the database — the only place
+   * they exist once `initializeAll` never created live state for it.
+   *
+   * Degrades to `[]` on a failed read rather than throwing: the live-state
+   * findings for other symbols are already computed, and a database hiccup
+   * must not blank the whole diagnosis for the symbols that *are* healthy —
+   * the same reasoning `engine.controller.ts`'s `fallbackLots` follows.
+   */
+  private async persistedHeldLots(symbol: string) {
+    try {
+      const lots = await this.lots.findBySymbol(symbol);
+      return lots.filter((lot) => lot.status === LotStatus.HELD);
+    } catch (error) {
+      this.logger.warn(
+        `could not read persisted lots for ${symbol} while diagnosing a disabled ladder: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return [];
+    }
+  }
+
+  /** The grid counterpart to `persistedHeldLots`, keyed by strategy id. */
+  private async persistedHeldGridLots(strategyId: string) {
+    try {
+      const lots = await this.gridLots.findByStrategy(strategyId);
+      return lots.filter((lot) => lot.status === GridLotStatus.HELD);
+    } catch (error) {
+      this.logger.warn(
+        `could not read persisted grid lots for ${strategyId} while diagnosing a disabled ` +
+          `grid instance: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    }
   }
 
   /**

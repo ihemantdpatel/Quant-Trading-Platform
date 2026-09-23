@@ -1,5 +1,6 @@
 import { Bar, BarSize, Tick } from '../market-data/types';
 import { CoordinatorService } from './coordinator.service';
+import { buildGridConfig } from './grid/config';
 import { GridStrategy } from './grid/grid.strategy';
 import { LeapsStrategy } from './leaps/leaps.strategy';
 import { Strategy } from './strategy.interface';
@@ -102,7 +103,11 @@ describe('CoordinatorService', () => {
       const ladder = new RecordingStrategy('dip-ladder:TQQQ');
 
       coordinator.register({ strategy: ladder, enabled: true, symbols: ['TQQQ'] });
-      coordinator.register({ strategy: new GridStrategy(), enabled: false, symbols: ['TQQQ'] });
+      coordinator.register({
+        strategy: new GridStrategy(buildGridConfig('TQQQ')),
+        enabled: false,
+        symbols: ['TQQQ'],
+      });
       coordinator.register({ strategy: new WheelStrategy(), enabled: false, symbols: ['TQQQ'] });
       coordinator.register({ strategy: new LeapsStrategy(), enabled: false, symbols: ['TQQQ'] });
 

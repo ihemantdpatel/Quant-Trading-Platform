@@ -24,13 +24,22 @@
 
 import { useState, useTransition } from 'react';
 import { reconcileNow, type ActionResult } from '../actions';
-import type { OrderReconciliationReport } from '../lib/api';
+import type { GridOrderReconciliationReport, OrderReconciliationReport } from '../lib/api';
 
 export function ReconcileButton({
   lastRun = null,
+  gridLastRun = null,
 }: {
-  /** The scheduled post-close job's last run, when it has fired. */
+  /** The dip ladder's scheduled post-close job last run, when it has fired. */
   lastRun?: OrderReconciliationReport | null;
+  /**
+   * The grid strategy's own scheduled job last run — a separate job from
+   * `lastRun`, shown alongside it rather than merged: an operator needs to
+   * know whether *each* strategy's job has actually fired, not just whichever
+   * ran most recently. A narrower shape than `lastRun` — see
+   * `GridOrderReconciliationReport`.
+   */
+  gridLastRun?: GridOrderReconciliationReport | null;
 }) {
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
@@ -102,15 +111,25 @@ export function ReconcileButton({
       )}
 
       {/*
-        The scheduled job's last run. Shown because "no news" is ambiguous
-        otherwise: an operator cannot tell a job that ran and found nothing
-        from one that never fired at all.
+        Each strategy's scheduled job last run, shown separately rather than
+        merged into one line — an operator needs to know whether *each* job
+        has actually fired, not just whichever ran most recently. "No news" is
+        ambiguous otherwise: a job that ran and found nothing must not look
+        like one that never fired at all.
       */}
       {lastRun && (
         <p className="mt-2 text-xs text-slate-500">
-          Post-close job last ran {lastRun.ranAt}
+          Ladder post-close job last ran {lastRun.ranAt}
           {lastRun.brokerReachable
             ? ` — ${lastRun.ordersUpdated} order row(s) corrected.`
+            : ' — the broker could not be reached, so the ledger was left unchanged.'}
+        </p>
+      )}
+      {gridLastRun && (
+        <p className="mt-1 text-xs text-slate-500">
+          Grid post-close job last ran {gridLastRun.ranAt}
+          {gridLastRun.brokerReachable
+            ? ` — checked ${gridLastRun.symbols.length} symbol(s).`
             : ' — the broker could not be reached, so the ledger was left unchanged.'}
         </p>
       )}

@@ -21,6 +21,7 @@ import { EngineService } from '../engine/engine.service';
 import { ReplayService } from '../market-data/mock/replay.service';
 import {
   InMemoryFillRepository,
+  InMemoryGridLotRepository,
   InMemoryLotRepository,
   InMemoryOrderIntentRepository,
   InMemoryOrderRepository,
@@ -36,19 +37,23 @@ import { buildDipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/c
 import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { Lot, LotStatus } from '../strategies/dip-ladder/lot';
 import { Rung, RungStatus } from '../strategies/dip-ladder/rung';
+import { buildGridConfig } from '../strategies/grid/config';
+import { GridStrategy } from '../strategies/grid/grid.strategy';
+import { GridLot, GridLotStatus } from '../strategies/grid/lot';
 import { DuplicateOrderService, OrderDiagnosisService } from './order-diagnosis.service';
 import { SymbolHaltService } from './symbol-halt.service';
 
 const NOW = '2025-01-20T10:00:00.000-05:00';
 const STRATEGY_ID = 'dip-ladder:TQQQ';
 
-function buildHarness(options: { symbolCapital?: number } = {}) {
+function buildHarness(options: { symbolCapital?: number; enabled?: boolean } = {}) {
   const broker = new MockBrokerAdapter({ fillMode: FillMode.MARKET_AWARE });
   const coordinator = new CoordinatorService();
   const lots = new InMemoryLotRepository();
   const rungs = new InMemoryRungRepository();
   const orders = new InMemoryOrderRepository();
   const snapshots = new InMemoryStrategyStateSnapshotRepository();
+  const gridLots = new InMemoryGridLotRepository();
 
   coordinator.register({
     // RESTING, because the whole subject here is orders that sit at the broker
@@ -59,7 +64,7 @@ function buildHarness(options: { symbolCapital?: number } = {}) {
         orderPlacement: OrderPlacement.RESTING,
       }),
     ),
-    enabled: true,
+    enabled: options.enabled ?? true,
     symbols: ['TQQQ'],
   });
 
@@ -67,12 +72,13 @@ function buildHarness(options: { symbolCapital?: number } = {}) {
   jest.spyOn(halts['logger'], 'error').mockImplementation(() => undefined);
   jest.spyOn(halts['logger'], 'warn').mockImplementation(() => undefined);
 
-  const diagnosis = new OrderDiagnosisService(coordinator, halts, broker);
+  const diagnosis = new OrderDiagnosisService(coordinator, halts, broker, lots, gridLots);
   jest.spyOn(diagnosis['logger'], 'log').mockImplementation(() => undefined);
 
   const duplicates = new DuplicateOrderService(diagnosis, broker);
   jest.spyOn(duplicates['logger'], 'log').mockImplementation(() => undefined);
 
+  const fills = new InMemoryFillRepository();
   const engine = new EngineService(
     new ReplayService(),
     coordinator,
@@ -85,7 +91,7 @@ function buildHarness(options: { symbolCapital?: number } = {}) {
     broker,
     new InMemoryOrderIntentRepository(),
     orders,
-    new InMemoryFillRepository(),
+    fills,
     lots,
     rungs,
     ExecutionMode.PAPER,
@@ -96,7 +102,19 @@ function buildHarness(options: { symbolCapital?: number } = {}) {
   jest.spyOn(engine['logger'], 'warn').mockImplementation(() => undefined);
   jest.spyOn(engine['logger'], 'error').mockImplementation(() => undefined);
 
-  return { broker, coordinator, halts, diagnosis, duplicates, engine, lots, rungs };
+  return {
+    broker,
+    coordinator,
+    halts,
+    diagnosis,
+    duplicates,
+    engine,
+    lots,
+    rungs,
+    gridLots,
+    fills,
+    orders,
+  };
 }
 
 afterEach(() => {
@@ -636,6 +654,120 @@ describe('EngineService.placeMissingOrders', () => {
     expect(lots[0].workingOrderId).not.toBeNull();
   });
 
+  describe('for a disabled ladder', () => {
+    it('persists the working-order mark straight to the database, since there is no live state to flush', async () => {
+      const h = buildHarness({ enabled: false });
+      await h.lots.saveAll([heldLot('lot-1')], 'TQQQ');
+      await ready(h, 96);
+
+      const result = await h.engine.placeMissingOrders([candidate]);
+
+      expect(result.placed).toHaveLength(1);
+
+      const persisted = await h.lots.findBySymbol('TQQQ');
+      expect(persisted.find((l) => l.id === 'lot-1')?.workingOrderId).not.toBeNull();
+    });
+
+    it('closes the lot in the database when the placed sell fills, instead of silently dropping the fill', async () => {
+      // The bug this closes: `dispatchFill` used to bail out entirely when
+      // `coordinator.getState` was null, which it always is for a disabled
+      // strategy — so a real, broker-confirmed sell would vanish with no
+      // `Fill` row, no closed lot, and no realized P&L, leaving the database
+      // showing the lot HELD forever until reconciliation found the mismatch
+      // and halted the symbol for what was actually a successful trade.
+      const h = buildHarness({ enabled: false });
+      await h.lots.saveAll([heldLot('lot-1')], 'TQQQ');
+      await ready(h, 96);
+
+      const placement = await h.engine.placeMissingOrders([candidate]);
+      expect(placement.placed).toHaveLength(1);
+
+      const resting = await h.broker.getOpenOrders();
+      const sell = resting.find((order) => order.side === 'SELL');
+      expect(sell).toBeDefined();
+
+      h.broker.fillResting(sell!.clientOrderId, 100, 99.75, NOW);
+      // The fill router is a fire-and-forget subscriber chained onto a
+      // promise (`fillQueues`) — flush a macrotask so it has genuinely
+      // completed before asserting, the same technique
+      // `resting-orders.spec.ts` uses.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const fillRecords = await h.fills.findAll();
+      expect(fillRecords).toHaveLength(1);
+      expect(fillRecords[0]).toMatchObject({ clientOrderId: sell!.clientOrderId, price: 99.75 });
+
+      const persisted = await h.lots.findBySymbol('TQQQ');
+      const closed = persisted.find((l) => l.id === 'lot-1');
+      expect(closed?.status).toBe(LotStatus.CLOSED);
+      expect(closed?.exitPrice).toBe(99.75);
+      expect(closed?.workingOrderId).toBeNull();
+    });
+
+    it('undoes the database mark when the placed sell is rejected by the broker', async () => {
+      const h = buildHarness({ enabled: false });
+      await h.lots.saveAll([heldLot('lot-1')], 'TQQQ');
+      await ready(h, 96);
+      jest.spyOn(h.broker, 'submit').mockResolvedValue({
+        clientOrderId: 'co-x',
+        status: 'REJECTED',
+        rejectReason: 'test',
+      } as never);
+
+      await h.engine.placeMissingOrders([candidate]);
+
+      const persisted = await h.lots.findBySymbol('TQQQ');
+      expect(persisted.find((l) => l.id === 'lot-1')?.workingOrderId).toBeNull();
+    });
+
+    it('recovers and closes a lot from the persisted workingOrderId when the in-memory map has nothing at all', async () => {
+      // Simulates an order placed by an *earlier* process — the in-memory
+      // `workingOrders` map of this fresh engine has never heard of
+      // `co-legacy`, and nothing here calls `placeMissingOrders` or
+      // otherwise populates it. Only the persisted `Lot.workingOrderId`
+      // records the pairing. A disabled strategy's `reconcileOpenOrders`
+      // never adopts it on restart either (it bails on the same null live
+      // state) — `recoverWorkingOrder`'s SELL-side fallback is what closes
+      // this the moment the fill actually arrives, regardless of adoption.
+      const h = buildHarness({ enabled: false });
+      await h.lots.saveAll([heldLot('lot-1', { workingOrderId: 'co-legacy' })], 'TQQQ');
+      await h.orders.save({
+        clientOrderId: 'co-legacy',
+        brokerOrderId: null,
+        symbol: 'TQQQ',
+        side: 'SELL',
+        quantity: 100,
+        limitPrice: 99.75,
+        status: 'SUBMITTED' as never,
+        rejectReason: null,
+        strategyId: STRATEGY_ID,
+        createdAt: NOW,
+      });
+      await h.broker.connect();
+      await h.broker.submit({
+        clientOrderId: 'co-legacy',
+        contract: { symbol: 'TQQQ', secType: 'STK', currency: 'USD', exchange: 'SMART' } as never,
+        side: 'SELL',
+        quantity: 100,
+        orderType: 'LMT',
+        limitPrice: 99.75,
+        timeInForce: 'DAY',
+        timestamp: NOW,
+      });
+
+      h.broker.fillResting('co-legacy', 100, 99.75, NOW);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const fillRecords = await h.fills.findAll();
+      expect(fillRecords).toHaveLength(1);
+
+      const persisted = await h.lots.findBySymbol('TQQQ');
+      const closed = persisted.find((l) => l.id === 'lot-1');
+      expect(closed?.status).toBe(LotStatus.CLOSED);
+      expect(closed?.exitPrice).toBe(99.75);
+    });
+  });
+
   it('reports a risk rejection rather than forcing the order through', async () => {
     // A tiny allocation makes the capital cap bind. The order is refused with
     // the risk manager's own reason, not resized to something it never
@@ -653,5 +785,250 @@ describe('EngineService.placeMissingOrders', () => {
 
     expect(submit).not.toHaveBeenCalled();
     expect(result.declined[0].reason).toContain('global capital cap');
+  });
+});
+
+/**
+ * A disabled strategy is never initialized, so `coordinator.getState(id)` is
+ * `null` for it — nothing in this suite calls `initializeAll`, which is
+ * exactly the shape a live boot produces for a disabled registration. These
+ * tests deliberately do **not** call `seedLadder`/seed live state at all, so
+ * `diagnose()` is forced onto the database fallback these cases exist to
+ * prove — mirroring the real gap: a strategy switched off while still
+ * holding real shares, with no live state left to diagnose against.
+ */
+describe('OrderDiagnosisService — disabled strategy database fallback', () => {
+  it('flags a disabled ladder’s persisted held lot with no resting sell as missing', async () => {
+    const h = buildHarness({ enabled: false });
+    await h.lots.saveAll([heldLot('TQQQ-lot-1')], 'TQQQ');
+    withOpenOrders(h.broker, []);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.missing).toHaveLength(1);
+    expect(result.missing[0]).toMatchObject({
+      side: 'SELL',
+      limitPrice: 99.75,
+      quantity: 100,
+      lotId: 'TQQQ-lot-1',
+      strategyId: STRATEGY_ID,
+    });
+  });
+
+  it('matches a disabled ladder’s persisted lot to its still-resting sell rather than reporting an orphan', async () => {
+    const h = buildHarness({ enabled: false });
+    await h.lots.saveAll([heldLot('TQQQ-lot-1', { workingOrderId: 'co-0' })], 'TQQQ');
+    withOpenOrders(h.broker, [
+      { clientOrderId: 'co-0', side: 'SELL', limitPrice: 99.75, quantity: 100 },
+    ]);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0]).toMatchObject({ claimedBy: 'lot TQQQ-lot-1', side: 'SELL' });
+    expect(result.orphans).toEqual([]);
+    expect(result.missing).toEqual([]);
+  });
+
+  it('reports a disabled ladder’s persisted lot whose sell has gone as unbacked, not missing', async () => {
+    const h = buildHarness({ enabled: false });
+    await h.lots.saveAll([heldLot('TQQQ-lot-1', { workingOrderId: 'co-gone' })], 'TQQQ');
+    withOpenOrders(h.broker, []);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.unbacked).toHaveLength(1);
+    expect(result.unbacked[0]).toMatchObject({
+      clientOrderId: 'co-gone',
+      lotId: 'TQQQ-lot-1',
+      side: 'SELL',
+    });
+    expect(result.missing).toEqual([]);
+  });
+
+  it('never proposes a new entry for a disabled ladder — no rung fallback exists', async () => {
+    // The gap this closes is SELL-side protection for real shares, not a
+    // reason for a strategy nothing is running to start opening positions.
+    // Rungs aren't persisted independently of the lots that hold them in
+    // this fixture, but the absence of a rung *repository* read here is the
+    // point: a disabled ladder with a fireable-looking gap must not surface
+    // a BUY candidate the way the live branch does.
+    const h = buildHarness({ enabled: false });
+    await h.lots.saveAll([heldLot('TQQQ-lot-1', { workingOrderId: 'co-0' })], 'TQQQ');
+    withOpenOrders(h.broker, [
+      { clientOrderId: 'co-0', side: 'SELL', limitPrice: 99.75, quantity: 100 },
+    ]);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.missing.some((m) => m.side === 'BUY')).toBe(false);
+  });
+
+  it('closes the observed live gap: place-missing can now protect a disabled ladder’s real lots', async () => {
+    // The end-to-end shape of the bug this suite exists to close: eight held
+    // lots left over from a now-disabled ladder, zero resting sells, and an
+    // operator who previously had no way to see — let alone fix — it through
+    // this system's own tooling.
+    const h = buildHarness({ enabled: false });
+    await h.lots.saveAll(
+      [heldLot('TQQQ-lot-1'), heldLot('TQQQ-lot-2', { fillPrice: 90, exitTarget: 94.76 })],
+      'TQQQ',
+    );
+    withOpenOrders(h.broker, []);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.missing).toHaveLength(2);
+    expect(result.missing.map((m) => m.lotId).sort()).toEqual(['TQQQ-lot-1', 'TQQQ-lot-2']);
+  });
+
+  it('flags a disabled grid instance’s persisted held lot with no resting sell as missing', async () => {
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.MARKET_AWARE });
+    const coordinator = new CoordinatorService();
+
+    coordinator.register({
+      strategy: new GridStrategy(buildGridConfig('TQQQ', { quantity: 50, gap: 1 })),
+      enabled: false,
+      symbols: ['TQQQ'],
+    });
+
+    const halts = new SymbolHaltService();
+    jest.spyOn(halts['logger'], 'error').mockImplementation(() => undefined);
+    jest.spyOn(halts['logger'], 'warn').mockImplementation(() => undefined);
+
+    const lots = new InMemoryLotRepository();
+    const gridLots = new InMemoryGridLotRepository();
+    const diagnosis = new OrderDiagnosisService(coordinator, halts, broker, lots, gridLots);
+    jest.spyOn(diagnosis['logger'], 'log').mockImplementation(() => undefined);
+
+    await gridLots.saveAll(
+      [
+        {
+          id: 'TQQQ-grid-lot-1',
+          fillPrice: 95,
+          quantity: 50,
+          openedAt: '2025-01-20T09:45:00.000-05:00',
+          sellTarget: 96,
+          status: GridLotStatus.HELD,
+          closedAt: null,
+          exitPrice: null,
+          workingOrderId: null,
+        },
+      ],
+      'grid:TQQQ',
+      'TQQQ',
+    );
+    jest.spyOn(broker, 'getOpenOrders').mockResolvedValue([]);
+
+    const result = await diagnosis.diagnose(NOW);
+
+    expect(result.missing).toHaveLength(1);
+    expect(result.missing[0]).toMatchObject({
+      side: 'SELL',
+      limitPrice: 96,
+      lotId: 'TQQQ-grid-lot-1',
+      strategyId: 'grid:TQQQ',
+    });
+  });
+});
+
+/**
+ * The grid strategy's own coverage of `OrderDiagnosisService` — added
+ * alongside the dashboard's "Pending orders" panel becoming grid-aware. The
+ * ladder's suite above proves the rung side; this proves the lot-only shape
+ * the grid strategy diagnoses (no rung ledger, so only the SELL side can be
+ * claimed, unbacked, or reported missing).
+ */
+describe('OrderDiagnosisService — grid strategy', () => {
+  const GRID_ID = 'grid:TQQQ';
+
+  function buildGridHarness(options: { gridEnabled?: boolean } = {}) {
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.MARKET_AWARE });
+    const coordinator = new CoordinatorService();
+
+    coordinator.register({
+      strategy: new GridStrategy(buildGridConfig('TQQQ', { quantity: 50, gap: 1 })),
+      enabled: options.gridEnabled ?? true,
+      symbols: ['TQQQ'],
+    });
+
+    const halts = new SymbolHaltService();
+    jest.spyOn(halts['logger'], 'error').mockImplementation(() => undefined);
+    jest.spyOn(halts['logger'], 'warn').mockImplementation(() => undefined);
+
+    const lots = new InMemoryLotRepository();
+    const gridLots = new InMemoryGridLotRepository();
+    const diagnosis = new OrderDiagnosisService(coordinator, halts, broker, lots, gridLots);
+    jest.spyOn(diagnosis['logger'], 'log').mockImplementation(() => undefined);
+
+    return { broker, coordinator, halts, diagnosis, lots, gridLots };
+  }
+
+  function gridLot(id: string, overrides: Partial<GridLot> = {}): GridLot {
+    return {
+      id,
+      fillPrice: 95,
+      quantity: 50,
+      openedAt: '2025-01-20T09:45:00.000-05:00',
+      sellTarget: 96,
+      status: GridLotStatus.HELD,
+      closedAt: null,
+      exitPrice: null,
+      workingOrderId: null,
+      ...overrides,
+    };
+  }
+
+  function seedGrid(coordinator: CoordinatorService, lots: GridLot[]): void {
+    const state = coordinator.getState(GRID_ID) ?? { strategyId: GRID_ID, data: {} };
+    const data = state.data as Record<string, unknown>;
+    data.lots = lots;
+    coordinator.setState(GRID_ID, state as never);
+  }
+
+  it('matches a grid lot’s resting sell to its own claim rather than reporting it as an orphan', async () => {
+    const h = buildGridHarness();
+    seedGrid(h.coordinator, [gridLot('TQQQ-grid-lot-1', { workingOrderId: 'co-0' })]);
+    withOpenOrders(h.broker, [
+      { clientOrderId: 'co-0', side: 'SELL', limitPrice: 96, quantity: 50 },
+    ]);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.matched).toHaveLength(1);
+    expect(result.matched[0]).toMatchObject({ claimedBy: 'lot TQQQ-grid-lot-1', side: 'SELL' });
+    expect(result.orphans).toEqual([]);
+  });
+
+  it('flags a held grid lot with no resting sell as missing', async () => {
+    const h = buildGridHarness();
+    seedGrid(h.coordinator, [gridLot('TQQQ-grid-lot-1')]);
+    withOpenOrders(h.broker, []);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.missing).toHaveLength(1);
+    expect(result.missing[0]).toMatchObject({
+      side: 'SELL',
+      limitPrice: 96,
+      lotId: 'TQQQ-grid-lot-1',
+      strategyId: GRID_ID,
+    });
+  });
+
+  it('reports a grid lot’s sell that has gone as unbacked, not as missing', async () => {
+    const h = buildGridHarness();
+    seedGrid(h.coordinator, [gridLot('TQQQ-grid-lot-1', { workingOrderId: 'co-gone' })]);
+    withOpenOrders(h.broker, []);
+
+    const result = await h.diagnosis.diagnose(NOW);
+
+    expect(result.unbacked).toHaveLength(1);
+    expect(result.unbacked[0]).toMatchObject({
+      clientOrderId: 'co-gone',
+      lotId: 'TQQQ-grid-lot-1',
+      side: 'SELL',
+    });
+    expect(result.missing).toEqual([]);
   });
 });

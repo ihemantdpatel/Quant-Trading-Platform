@@ -23,6 +23,7 @@ import {
   runBacktestRepositoryContract,
   runBarRepositoryContract,
   runFillRepositoryContract,
+  runGridLotRepositoryContract,
   runLotRebuildEventRepositoryContract,
   runLotRepositoryContract,
   runOrderIntentRepositoryContract,
@@ -38,6 +39,7 @@ import {
   PrismaBacktestRepository,
   PrismaBarRepository,
   PrismaFillRepository,
+  PrismaGridLotRepository,
   PrismaLotRebuildEventRepository,
   PrismaLotRepository,
   PrismaOrderIntentRepository,
@@ -87,6 +89,11 @@ describeWithDatabase('Prisma repositories', () => {
   runRungRepositoryContract(async () => {
     await resetDatabase(prisma);
     return new PrismaRungRepository(asService(prisma));
+  });
+
+  runGridLotRepositoryContract(async () => {
+    await resetDatabase(prisma);
+    return new PrismaGridLotRepository(asService(prisma));
   });
 
   runOrderIntentRepositoryContract(async () => {

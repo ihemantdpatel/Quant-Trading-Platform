@@ -27,6 +27,7 @@
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { BROKER_ADAPTER, BrokerAdapter } from '../broker/broker-adapter.interface';
+import { GridReconciliationService } from '../reconciliation/grid-reconciliation.service';
 import {
   ReconciliationReport,
   ReconciliationService,
@@ -48,6 +49,12 @@ export class StartupSequence {
     private readonly coordinator: CoordinatorService,
     private readonly reconciliation: ReconciliationService,
     @Inject(BROKER_ADAPTER) private readonly broker: BrokerAdapter,
+    /**
+     * Optional so the many tests that construct a sequence directly need not
+     * supply one; absent, the grid strategy simply is not reconciled — safe,
+     * since it stays unregistered or disabled in that case.
+     */
+    private readonly gridReconciliation: GridReconciliationService | null = null,
   ) {}
 
   /**
@@ -66,6 +73,11 @@ export class StartupSequence {
     await this.coordinator.initializeAll(now);
 
     const reconciliation = await this.reconciliation.reconcileAll(now);
+
+    // The grid strategy's own, smaller reconciliation, run alongside the
+    // ladder's — both must complete before the gate opens, so a grid position
+    // is verified before any bar can reach it, exactly like the ladder.
+    await this.gridReconciliation?.reconcileAll(now);
 
     // The gate opens even when symbols halted. A halt is per-symbol and the
     // engine enforces it per-symbol; refusing to process bars at all would

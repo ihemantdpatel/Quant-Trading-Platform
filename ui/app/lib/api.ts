@@ -38,10 +38,19 @@ export type RungStatus = 'HELD' | 'WORKING' | 'RE_ARMED' | 'PENDING';
 export type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'FAILED';
 export type OrderStatus = 'SUBMITTED' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
 
-export interface Lot {
+/**
+ * The fields `LotTable`/`TradeHistoryTable` (and the arithmetic below) need
+ * from a held or closed position, regardless of which strategy produced it.
+ *
+ * `Lot` (the dip ladder) and `GridLot` both satisfy this — that structural
+ * overlap is what lets those two components render either strategy's
+ * positions without an adapter layer. `rungPrice` is the one field that does
+ * not generalize: a grid lot has no rung, so it is optional here and the
+ * column that renders it is conditional (`LotTable`'s `showRungColumn`).
+ */
+export interface LotLike {
   id: string;
   symbol: string;
-  rungPrice: number;
   fillPrice: number;
   quantity: number;
   openedAt: string;
@@ -56,12 +65,36 @@ export interface Lot {
    * True when this row was read from the database because its symbol is
    * halted, rather than from live strategy state.
    *
-   * A halt restores nothing into the ladder, so these are the only records of
-   * the position that remain — and they have **not** been verified against the
-   * broker, which is the whole reason the symbol is halted. Optional so an
+   * A halt restores nothing into the strategy, so these are the only records
+   * of the position that remain — and they have **not** been verified against
+   * the broker, which is the whole reason the symbol is halted. Optional so an
    * older backend omitting the field reads as verified.
    */
   unverified?: boolean;
+  /** The dip ladder's level this lot filled at. Absent for a grid lot. */
+  rungPrice?: number;
+  /**
+   * Which strategy opened this lot — attached client-side when merging
+   * `Lot[]` and `GridLot[]` into one shared holdings view (`page.tsx`).
+   * Absent on either raw type; a symbol's current holdings are one fact
+   * about the broker account, not two separate ones split by strategy, so
+   * this is the tag that lets a combined table still say which is which.
+   */
+  strategy?: string;
+}
+
+export interface Lot extends LotLike {
+  rungPrice: number;
+}
+
+/**
+ * A grid strategy's lot, from `GET /grid/lots`. No `rungPrice` — the grid
+ * strategy keeps no persisted level ledger to fill from (`GridStrategy`'s own
+ * doc comment) — and `workingOrderId`, the resting-sell handle `Rung` gives
+ * the ladder for free via `Lot.workingOrderId`-equivalent bookkeeping.
+ */
+export interface GridLot extends LotLike {
+  workingOrderId: string | null;
 }
 
 export interface Rung {
@@ -167,12 +200,37 @@ export interface Status {
   /** Null until the startup sequence has run. */
   reconciliation?: ReconciliationReport | null;
   /**
-   * The post-close order reconciliation's last run. Null until it has fired.
+   * The dip ladder's post-close order reconciliation last run. Null until it
+   * has fired.
    *
    * Optional so an older backend without the scheduled job renders unchanged
    * rather than breaking the dashboard.
    */
   orderReconciliation?: OrderReconciliationReport | null;
+  /**
+   * The grid strategy's own order reconciliation last run — a separate job
+   * from `orderReconciliation` above, not a duplicate of it. Reported
+   * separately rather than merged into one "last reconciliation" field: the
+   * two strategies run independent jobs, and collapsing them would either
+   * lose which strategy a report belongs to or silently hide one that never
+   * fired behind the other's more recent run.
+   *
+   * A different, narrower shape than `OrderReconciliationReport` — this run
+   * carries no `ordersUpdated`, since the grid strategy's job releases a
+   * stale `workingOrderId` but does not correct historic `Order` rows the way
+   * the ladder's `reconcileOrderHistory` does.
+   */
+  gridOrderReconciliation?: GridOrderReconciliationReport | null;
+}
+
+/**
+ * The grid strategy's order-only reconciliation result. See
+ * `Status.gridOrderReconciliation`.
+ */
+export interface GridOrderReconciliationReport {
+  ranAt: string;
+  symbols: string[];
+  brokerReachable: boolean;
 }
 
 /**
@@ -225,6 +283,43 @@ export interface StrategySummary {
   initialized: boolean;
 }
 
+/**
+ * Id prefixes mirroring the backend's own strategy id convention
+ * (`DIP_LADDER_ID_PREFIX`/`GRID_ID_PREFIX`) — every instance is `${prefix}${symbol}`,
+ * one per traded symbol.
+ */
+const DIP_LADDER_ID_PREFIX = 'dip-ladder:';
+const GRID_ID_PREFIX = 'grid:';
+
+/**
+ * Whether any registered dip-ladder instance is currently enabled.
+ *
+ * Drives which strategy's execution-tab panels the dashboard shows —
+ * `page.tsx` hides ladder-specific UI (the rung ladder, its own lots table)
+ * when the ladder is not the strategy in use, and the mirror image for grid.
+ * Enabled state, not merely "registered", because both strategies are always
+ * registered (`strategies.module.ts`) even when only one actually trades.
+ */
+export function isDipLadderEnabled(strategies: StrategySummary[]): boolean {
+  return strategies.some((s) => s.id.startsWith(DIP_LADDER_ID_PREFIX) && s.enabled);
+}
+
+/** The grid counterpart to `isDipLadderEnabled`. */
+export function isGridEnabled(strategies: StrategySummary[]): boolean {
+  return strategies.some((s) => s.id.startsWith(GRID_ID_PREFIX) && s.enabled);
+}
+
+/**
+ * True when a `ParameterSet` belongs to a grid instance, `false` for a
+ * ladder one — the discriminant `parameters/page.tsx` uses to choose between
+ * `ParameterEditor` and `GridParameterEditor`, since the two config shapes
+ * are otherwise structurally indistinguishable (both are plain numeric-field
+ * records).
+ */
+export function isGridParameterSet(set: ParameterSet): boolean {
+  return set.strategyId.startsWith(GRID_ID_PREFIX);
+}
+
 export interface LadderParameters {
   spacingMode: 'PERCENTAGE' | 'ATR' | 'FIXED_DOLLAR';
   spacingPercent: number;
@@ -248,18 +343,43 @@ export interface LadderParameters {
   hardFloorPercent: number;
 }
 
+/**
+ * The grid strategy's editable parameters (`GET /parameters` for a `grid:`
+ * id) — deliberately smaller than `LadderParameters`: no spacing mode, no
+ * ATR, no take-profit/exit-mode duality. `symbol` and `entryBuffer` are
+ * excluded from editing, mirroring the ladder's own exclusion of
+ * `symbol`/`symbolCapital`, so they are absent here too.
+ */
+export interface GridParameters {
+  /** Fixed-dollar distance between dip-buy levels, and a lot's sell target above its own fill. */
+  gap: number;
+  /** Whole-share quantity for every order — entries and exits alike. */
+  quantity: number;
+  /** How many stepped dip-buy levels to maintain below the lowest held lot. */
+  maxBuyLevels: number;
+  /** Cap on concurrent resting sells; the oldest/lowest-priced lots (FIFO) get them. */
+  maxSellOrders: number;
+}
+
 export interface ParameterSet {
   strategyId: string;
-  /** The symbol this ladder trades — joins to `riskLimits[symbol]`. */
+  /** The symbol this strategy trades — joins to `riskLimits[symbol]`. */
   symbol: string | null;
-  parameters: LadderParameters;
+  /** Ladder-shaped for a `dip-ladder:` id, grid-shaped for a `grid:` id. */
+  parameters: LadderParameters | GridParameters;
 }
 
 export interface ParameterChange {
   id: string;
   changeId: string;
   strategyId: string;
-  parameter: keyof LadderParameters;
+  /**
+   * A plain string rather than `keyof LadderParameters` — this table is
+   * shared by every strategy's editor (`ParameterChange.parameter` on the
+   * backend is the same widening, for the same reason: a grid edit's field
+   * names, e.g. `gap`, are not ladder parameter names).
+   */
+  parameter: string;
   oldValue: string | number;
   newValue: string | number;
   timestamp: string;
@@ -295,6 +415,7 @@ export interface Unavailable {
   fills: boolean;
   riskEvents: boolean;
   strategies: boolean;
+  gridLots: boolean;
 }
 
 /** What the Execution tab renders: current engine state, no configuration. */
@@ -307,6 +428,8 @@ export interface ExecutionData {
   fills: Fill[];
   riskEvents: RiskEvent[];
   strategies: StrategySummary[];
+  /** The grid strategy's own lots (`GET /grid/lots`) — see `Lot` vs. `GridLot`. */
+  gridLots: GridLot[];
   /** Set only when **every** read failed — a total backend outage. */
   error: string | null;
   /** Per-endpoint failure flags; absent on loaders that fetch as one unit. */
@@ -330,7 +453,10 @@ export interface RiskLimitChange {
   reason: string | null;
 }
 
-/** What the Parameters tab renders. `lots` is only for the held-lot count. */
+/**
+ * What the Parameters tab renders. `lots`/`gridLots` are only for each
+ * editor's held-lot count — see `heldLotCountFor`.
+ */
 export interface ParametersData {
   parameters: ParameterSet[];
   parameterChanges: ParameterChange[];
@@ -338,6 +464,8 @@ export interface ParametersData {
   riskLimits: Record<string, number>;
   riskLimitChanges: RiskLimitChange[];
   lots: Lot[];
+  /** The grid strategy's own lots — see `heldLotCountFor`. */
+  gridLots: GridLot[];
   /** Set when the backend could not be reached at all. */
   error: string | null;
 }
@@ -545,7 +673,7 @@ export async function loadStatus(): Promise<StatusData> {
  * whenever a single endpoint is unavailable.
  */
 export async function loadExecution(): Promise<ExecutionData> {
-  const [status, lots, rungs, positions, orders, fills, riskEvents, strategies] =
+  const [status, lots, rungs, positions, orders, fills, riskEvents, strategies, gridLots] =
     await Promise.allSettled([
       get<Status>('/status'),
       get<Lot[]>('/lots'),
@@ -555,9 +683,10 @@ export async function loadExecution(): Promise<ExecutionData> {
       get<Fill[]>('/fills'),
       get<RiskEvent[]>('/risk-events'),
       get<StrategySummary[]>('/strategies'),
+      get<GridLot[]>('/grid/lots'),
     ]);
 
-  const settled = [status, lots, rungs, positions, orders, fills, riskEvents, strategies];
+  const settled = [status, lots, rungs, positions, orders, fills, riskEvents, strategies, gridLots];
   const allFailed = settled.every((result) => result.status === 'rejected');
 
   return {
@@ -569,6 +698,7 @@ export async function loadExecution(): Promise<ExecutionData> {
     fills: valueOr(fills, []),
     riskEvents: valueOr(riskEvents, []),
     strategies: valueOr(strategies, []),
+    gridLots: valueOr(gridLots, []),
     // Only when nothing at all answered. A single failed endpoint is reported
     // by its own panel, not as "the backend is unreachable" — that banner
     // would be wrong, and a wrong banner on a control surface is worse than a
@@ -579,6 +709,7 @@ export async function loadExecution(): Promise<ExecutionData> {
     unavailable: {
       status: status.status === 'rejected',
       lots: lots.status === 'rejected',
+      gridLots: gridLots.status === 'rejected',
       rungs: rungs.status === 'rejected',
       positions: positions.status === 'rejected',
       orders: orders.status === 'rejected',
@@ -598,11 +729,14 @@ function reasonOf(result: PromiseSettledResult<unknown>): unknown {
 }
 
 /**
- * Ladder parameters and their audit trail, for the Parameters tab.
+ * Every registered strategy's parameters and their audit trail, for the
+ * Parameters tab.
  *
- * `/lots` is fetched only to count held lots for the editor's warning — the
- * count is part of how the "future rungs only" rule is communicated, so it has
- * to be accurate rather than approximated.
+ * `/lots` and `/grid/lots` are fetched only to count each strategy's own held
+ * lots for its editor's warning — the count is part of how the "future
+ * rungs/levels only" rule is communicated, so it has to describe the
+ * strategy actually being edited rather than always the ladder's count (see
+ * `heldLotCountFor`).
  */
 export async function loadParameters(): Promise<ParametersData> {
   const empty: ParametersData = {
@@ -611,22 +745,46 @@ export async function loadParameters(): Promise<ParametersData> {
     riskLimits: {},
     riskLimitChanges: [],
     lots: [],
+    gridLots: [],
     error: null,
   };
 
   try {
-    const [parameters, parameterChanges, riskLimits, riskLimitChanges, lots] = await Promise.all([
-      get<ParameterSet[]>('/parameters'),
-      get<ParameterChange[]>('/parameters/changes'),
-      get<Record<string, number>>('/risk-limits'),
-      get<RiskLimitChange[]>('/risk-limits/changes'),
-      get<Lot[]>('/lots'),
-    ]);
+    const [parameters, parameterChanges, riskLimits, riskLimitChanges, lots, gridLots] =
+      await Promise.all([
+        get<ParameterSet[]>('/parameters'),
+        get<ParameterChange[]>('/parameters/changes'),
+        get<Record<string, number>>('/risk-limits'),
+        get<RiskLimitChange[]>('/risk-limits/changes'),
+        get<Lot[]>('/lots'),
+        get<GridLot[]>('/grid/lots'),
+      ]);
 
-    return { parameters, parameterChanges, riskLimits, riskLimitChanges, lots, error: null };
+    return {
+      parameters,
+      parameterChanges,
+      riskLimits,
+      riskLimitChanges,
+      lots,
+      gridLots,
+      error: null,
+    };
   } catch (error) {
     return { ...empty, error: failure(error) };
   }
+}
+
+/**
+ * Held-lot count for one strategy's parameter editor warning.
+ *
+ * The ladder's own held lots for a `dip-ladder:` id, the grid strategy's for
+ * a `grid:` id — never one strategy's count on the other's editor, which
+ * would tell an operator editing the grid's `gap` how many *ladder* lots are
+ * unaffected, a fact with nothing to do with the edit they are making.
+ */
+export function heldLotCountFor(strategyId: string, lots: LotLike[], gridLots: LotLike[]): number {
+  const source = strategyId.startsWith(GRID_ID_PREFIX) ? gridLots : lots;
+  return source.filter((lot) => lot.status === 'HELD').length;
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +802,7 @@ export async function loadParameters(): Promise<ParametersData> {
  * must never break: no exit decision reads it. It is rendered with its label
  * attached precisely so nobody mistakes it for a target.
  */
-export function blendedAverageCost(lots: Lot[]): number | null {
+export function blendedAverageCost(lots: LotLike[]): number | null {
   const held = lots.filter((lot) => lot.status === 'HELD');
   const quantity = held.reduce((sum, lot) => sum + lot.quantity, 0);
 
@@ -656,7 +814,7 @@ export function blendedAverageCost(lots: Lot[]): number | null {
 }
 
 /** Distance from a mark price up to a lot's own target, as a fraction. */
-export function distanceToTarget(lot: Lot, mark: number | null): number | null {
+export function distanceToTarget(lot: LotLike, mark: number | null): number | null {
   if (mark === null || mark <= 0) {
     return null;
   }
@@ -665,15 +823,15 @@ export function distanceToTarget(lot: Lot, mark: number | null): number | null {
 }
 
 /** Realized P&L across completed lot cycles. */
-export function totalRealized(lots: Lot[]): number {
+export function totalRealized(lots: LotLike[]): number {
   return round(lots.reduce((sum, lot) => sum + (lot.realized ?? 0), 0));
 }
 
-export function totalHeldQuantity(lots: Lot[]): number {
+export function totalHeldQuantity(lots: LotLike[]): number {
   return lots.filter((lot) => lot.status === 'HELD').reduce((sum, lot) => sum + lot.quantity, 0);
 }
 
-export function totalDeployedCost(lots: Lot[]): number {
+export function totalDeployedCost(lots: LotLike[]): number {
   return round(
     lots
       .filter((lot) => lot.status === 'HELD')

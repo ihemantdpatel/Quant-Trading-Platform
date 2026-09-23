@@ -39,22 +39,35 @@ import {
 import { ExecutionMode } from '../config/execution-mode';
 import { Contract, equityContract } from '../domain/contract';
 import { ReplayService } from '../market-data/mock/replay.service';
-import { Bar } from '../market-data/types';
+import { Bar, BarSize } from '../market-data/types';
 import { AccountSnapshot, RiskManagerService } from '../risk/risk-manager.service';
 import { RiskIntent, RiskOutcome } from '../risk/types';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { DipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/config';
 import {
   DIP_LADDER_ID_PREFIX,
+  DIP_LADDER_STATE_VERSION,
   DipLadderStrategy,
 } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { isRestable, isRestableExit } from '../strategies/dip-ladder/ladder';
 import { Lot } from '../strategies/dip-ladder/lot';
 import { Rung } from '../strategies/dip-ladder/rung';
-import { OrderIntent, OrderType, StrategyState, TimeInForce } from '../strategies/types';
+import { GridConfig } from '../strategies/grid/config';
+import { GRID_ID_PREFIX, GRID_STATE_VERSION, GridStrategy } from '../strategies/grid/grid.strategy';
+import { GridLot } from '../strategies/grid/lot';
+import {
+  JsonValue,
+  OrderIntent,
+  OrderType,
+  StrategyContext,
+  StrategyState,
+  TimeInForce,
+} from '../strategies/types';
 import {
   FILL_REPOSITORY,
   FillRepository,
+  GRID_LOT_REPOSITORY,
+  GridLotRepository,
   LOT_REPOSITORY,
   LotRepository,
   ORDER_INTENT_REPOSITORY,
@@ -358,6 +371,13 @@ export class EngineService {
      * reconciliation suite supplies a real one.
      */
     private readonly snapshots: StrategyStateSnapshotRepository | null = null,
+    /**
+     * Optional for the same reason as `symbolHalts`/`snapshots` — the many
+     * tests that construct an engine directly need not supply one. Absent,
+     * `persistGridState` is a no-op, which is correct for a test that never
+     * enables the grid strategy.
+     */
+    @Inject(GRID_LOT_REPOSITORY) private readonly gridLots: GridLotRepository | null = null,
   ) {
     // A broker fault must reach the engine even when no order is in flight —
     // a socket dropping between bars is exactly as significant as one dropping
@@ -426,7 +446,7 @@ export class EngineService {
       result.fills += barResult.fills;
     }
 
-    await this.persistLadderState();
+    await this.persistAllStrategyState();
 
     result.halted = this.entryHalt !== null;
     result.haltReason = this.entryHalt?.reason ?? null;
@@ -497,6 +517,47 @@ export class EngineService {
       return outcome;
     }
 
+    const submission = await this.submitIntents(intents, bar.timestamp, 'intent');
+    outcome.approved = submission.approved;
+    outcome.resized = submission.resized;
+    outcome.rejected = submission.rejected;
+    outcome.submitted = submission.submitted;
+    outcome.fills = submission.fills;
+
+    outcome.halted = this.entryHalt !== null;
+    outcome.haltReason = this.entryHalt?.reason ?? null;
+
+    return outcome;
+  }
+
+  /**
+   * Runs a batch of intents through risk evaluation and submission.
+   *
+   * Extracted from `processBar` so `recomputeGrid` — the fill-triggered
+   * recompute that has no bar of its own — can reuse exactly the same path:
+   * persist-before-submit, the risk chokepoint, the resting-order duplicate
+   * guards, and the post-submission persist. Behaviour-preserving relative to
+   * the pre-extraction `processBar`; nothing here changed for the ladder.
+   *
+   * `recordIdPrefix` keeps the two callers' persisted-intent ids from
+   * colliding: `processBar` uses `intent`, matching every existing record
+   * (`intent-<timestamp>-<i>`), and `recomputeGrid` uses `grid-intent` — a
+   * fill can arrive, and therefore trigger a recompute, on the very bar
+   * whose own `intent-<timestamp>-<i>` ids share that same timestamp.
+   */
+  private async submitIntents(
+    intents: OrderIntent[],
+    timestamp: string,
+    recordIdPrefix: string,
+  ): Promise<{
+    approved: number;
+    resized: number;
+    rejected: number;
+    submitted: number;
+    fills: number;
+  }> {
+    const result = { approved: 0, resized: 0, rejected: 0, submitted: 0, fills: 0 };
+
     const account = await this.accountSnapshot();
 
     // Evaluated as a batch against a *running* capital total: five rungs firing
@@ -512,19 +573,19 @@ export class EngineService {
       const decision = decisions[i];
       const intent = intents[i];
 
-      if (decision.outcome === RiskOutcome.APPROVED) outcome.approved += 1;
-      if (decision.outcome === RiskOutcome.RESIZED) outcome.resized += 1;
-      if (decision.outcome === RiskOutcome.REJECTED) outcome.rejected += 1;
+      if (decision.outcome === RiskOutcome.APPROVED) result.approved += 1;
+      if (decision.outcome === RiskOutcome.RESIZED) result.resized += 1;
+      if (decision.outcome === RiskOutcome.REJECTED) result.rejected += 1;
 
       // Persisted *before* any submission attempt (`PRD.md:366`).
-      const recordId = `intent-${bar.timestamp}-${i}`;
+      const recordId = `${recordIdPrefix}-${timestamp}-${i}`;
       await this.intents.save({
         id: recordId,
         intent,
         decision,
         submitted: false,
         clientOrderId: null,
-        createdAt: bar.timestamp,
+        createdAt: timestamp,
       });
 
       if (decision.approvedQuantity <= 0) {
@@ -607,35 +668,33 @@ export class EngineService {
         }
       }
 
-      const submission = await this.submitOrder(intent, decision.approvedQuantity, recordId);
-      outcome.submitted += submission.submitted ? 1 : 0;
-      outcome.fills += submission.fills;
+      const submitted = await this.submitOrder(intent, decision.approvedQuantity, recordId);
+      result.submitted += submitted.submitted ? 1 : 0;
+      result.fills += submitted.fills;
 
       // The order just placed is now resting too. Recording it keeps a later
       // intent on this same bar from stacking a second order at that price
       // without re-querying IB.
-      if (submission.submitted && restingSnapshot?.status === 'OK') {
+      if (submitted.submitted && restingSnapshot?.status === 'OK') {
         restingSnapshot.limitPrices.add(roundPrice(intent.limitPrice));
       }
     }
 
     // **Persist after submission, because a working-order id is durable state.**
     //
-    // `Lot.workingOrderId` and `Rung.workingOrderId` are written by the submit
-    // path, and nothing else on this bar writes them: fills and order statuses
-    // persist, but a bar that merely *places* orders did not. A crash in that
-    // window left the database holding a lot with no working order while a live
+    // `Lot.workingOrderId` and `Rung.workingOrderId` (or, for the grid
+    // strategy, `GridLot.workingOrderId`) are written by the submit path, and
+    // nothing else on this bar writes them: fills and order statuses persist,
+    // but a bar that merely *places* orders did not. A crash in that window
+    // left the database holding a lot with no working order while a live
     // sell rested at IB — so on restart the lot looked unprotected, a second
     // sell was placed against it, and both could fill. That is the crash window
     // Story 13 closed for entries, and it was reopened on the exit side.
-    if (outcome.submitted > 0) {
-      await this.persistLadderState();
+    if (result.submitted > 0) {
+      await this.persistAllStrategyState();
     }
 
-    outcome.halted = this.entryHalt !== null;
-    outcome.haltReason = this.entryHalt?.reason ?? null;
-
-    return outcome;
+    return result;
   }
 
   /**
@@ -703,7 +762,26 @@ export class EngineService {
       const state = this.coordinator.getState(intent.strategyId);
 
       if (state) {
-        DipLadderStrategy.recordWorkingExit(state, exitLotId, clientOrderId);
+        if (intent.strategyId.startsWith(GRID_ID_PREFIX)) {
+          GridStrategy.recordWorkingExit(state, exitLotId, clientOrderId);
+        } else {
+          DipLadderStrategy.recordWorkingExit(state, exitLotId, clientOrderId);
+        }
+      } else {
+        // Disabled strategy: no live state for `persistAllStrategyState` to
+        // flush later, so the mark is written straight to the database now —
+        // `Lot.workingOrderId`/`GridLot.workingOrderId` is the durable record
+        // reconciliation's adoption and the order diagnosis both key on,
+        // live or not (see `OrderDiagnosisService`'s "diagnosed from the
+        // database" section). Without this, an operator-placed sell for a
+        // disabled strategy's lot would rest at the broker with nothing in
+        // the database ever recording that it does.
+        await this.recordDisabledExitWorkingOrder(
+          intent.strategyId,
+          intent.contract.symbol,
+          exitLotId,
+          clientOrderId,
+        );
       }
     } else if (resting && intent.side === 'BUY') {
       this.workingOrders.set(clientOrderId, {
@@ -724,10 +802,18 @@ export class EngineService {
       //
       // Rejection and submission failure both undo this below, so a rung is
       // never left blocked for an order that does not exist.
-      const state = this.coordinator.getState(intent.strategyId);
+      //
+      // **The grid strategy has no rung-equivalent to mark.** Every desired
+      // buy is re-derived from held lots on the next recompute trigger, and
+      // the engine's own duplicate-order guard above already stops that
+      // recompute from re-placing an order still resting at the broker — so
+      // there is nothing durable to write here for a grid entry.
+      if (!intent.strategyId.startsWith(GRID_ID_PREFIX)) {
+        const state = this.coordinator.getState(intent.strategyId);
 
-      if (state) {
-        DipLadderStrategy.recordWorkingOrder(state, intent.limitPrice, clientOrderId);
+        if (state) {
+          DipLadderStrategy.recordWorkingOrder(state, intent.limitPrice, clientOrderId);
+        }
       }
     }
 
@@ -751,7 +837,12 @@ export class EngineService {
 
       if (ack.status === OrderStatus.REJECTED) {
         // Nothing is resting, so release the rung the pre-submit mark blocked.
-        this.releaseRestingOrder(clientOrderId, intent.strategyId, resting);
+        await this.releaseRestingOrder(
+          clientOrderId,
+          intent.strategyId,
+          intent.contract.symbol,
+          resting,
+        );
 
         this.raiseAlert(
           'WARNING',
@@ -777,7 +868,12 @@ export class EngineService {
       // The order never reached the broker, so nothing is resting — drop the
       // registration and unblock the rung rather than leaving a level reserved
       // for an order that does not exist.
-      this.releaseRestingOrder(clientOrderId, intent.strategyId, resting);
+      await this.releaseRestingOrder(
+        clientOrderId,
+        intent.strategyId,
+        intent.contract.symbol,
+        resting,
+      );
 
       return { submitted: false, fills };
     } finally {
@@ -893,7 +989,7 @@ export class EngineService {
    */
   adoptWorkingOrders(strategyId: string, symbol: string, orders: OpenOrder[]): void {
     const state = this.coordinator.getState(strategyId);
-    const lots = state ? (DipLadderStrategy.lotsOf(state) ?? []) : [];
+    const isGrid = strategyId.startsWith(GRID_ID_PREFIX);
 
     for (const order of orders) {
       // The *outstanding* quantity, not the original: a partially-filled order
@@ -903,21 +999,47 @@ export class EngineService {
 
       if (order.side === 'SELL') {
         // A resting sell is keyed to the lot it disposes, not to a price level,
-        // and `Lot.workingOrderId` is the durable record of that pairing. An
-        // order no lot claims is left unadopted rather than guessed at: it is
-        // not something this ladder placed as an exit, and attaching it to a
-        // lot chosen by price would sell shares against the wrong basis.
-        const lot = lots.find((candidate) => candidate.workingOrderId === order.clientOrderId);
+        // and `workingOrderId` is the durable record of that pairing — `Lot`'s
+        // for the ladder, `GridLot`'s for the grid strategy. An order no lot
+        // claims is left unadopted rather than guessed at: it is not something
+        // this strategy placed as an exit, and attaching it to a lot chosen by
+        // price would sell shares against the wrong basis.
+        if (isGrid) {
+          const lot = state
+            ? (GridStrategy.lotsOf(state) ?? []).find(
+                (candidate) => candidate.workingOrderId === order.clientOrderId,
+              )
+            : undefined;
 
-        if (lot) {
-          this.workingOrders.set(order.clientOrderId, {
-            kind: 'EXIT',
-            lotId: lot.id,
-            strategyId,
-            rungPrice: lot.rungPrice,
-            quantity,
-            symbol,
-          });
+          if (lot) {
+            this.workingOrders.set(order.clientOrderId, {
+              kind: 'EXIT',
+              lotId: lot.id,
+              strategyId,
+              // No rung-equivalent to key on — the lot's own fill price is
+              // the closest analog, and it is only ever used for logging.
+              rungPrice: lot.fillPrice,
+              quantity,
+              symbol,
+            });
+          }
+        } else {
+          const lot = state
+            ? (DipLadderStrategy.lotsOf(state) ?? []).find(
+                (candidate) => candidate.workingOrderId === order.clientOrderId,
+              )
+            : undefined;
+
+          if (lot) {
+            this.workingOrders.set(order.clientOrderId, {
+              kind: 'EXIT',
+              lotId: lot.id,
+              strategyId,
+              rungPrice: lot.rungPrice,
+              quantity,
+              symbol,
+            });
+          }
         }
 
         continue;
@@ -953,15 +1075,43 @@ export class EngineService {
    * knows it — the order's limit price is the placement price, which is the
    * same value but arrived at from the side that owns the fact.
    *
-   * Deliberately narrow: BUY entries only, and only for an order the ladder
-   * still has a `WORKING` rung for. A SELL, or an order no rung claims, is not
-   * something this engine placed as an entry, and inventing a rung for it would
-   * attach a lot to a level the ladder never chose.
+   * A BUY is deliberately narrow: only for an order the ladder still has a
+   * `WORKING` rung for, and read from **live** state. A rung is bar-driven
+   * bookkeeping with no meaning for a strategy nothing is running, so a
+   * disabled strategy correctly recovers no entry here — there is no
+   * legitimate way for one to have placed a BUY to begin with.
+   *
+   * A SELL is the exit-side counterpart, and is read from the **persisted**
+   * `Lot`/`GridLot` row rather than live state, which is what makes it work
+   * for a disabled strategy too: `Lot.workingOrderId` is the durable record
+   * regardless of whether anything is running, unlike a rung's `WORKING`
+   * status, which describes an in-progress *decision* a disabled strategy is
+   * not making. This is the same database that `routeExitFillForDisabledStrategy`
+   * writes back to, and the same field `OrderDiagnosisService`'s database
+   * fallback reads — one authority, three consumers.
    */
   private async recoverWorkingOrder(clientOrderId: string): Promise<WorkingOrder | null> {
     const order = await this.orders.findByClientOrderId(clientOrderId);
 
-    if (!order || order.side !== 'BUY') {
+    if (!order) {
+      return null;
+    }
+
+    if (order.side === 'SELL') {
+      return this.recoverExitWorkingOrder(
+        order.strategyId,
+        order.symbol,
+        order.quantity,
+        clientOrderId,
+      );
+    }
+
+    // Deliberately narrow to the ladder — see this method's own header. The
+    // grid strategy keeps no rung-like persisted "pending" ledger a dropped
+    // BUY fill could be recovered from (an accepted v1 limitation), and
+    // `DipLadderStrategy.rungsOf` below would crash reading `.rungs` off a
+    // `GridStateData`, which does not have that field.
+    if (order.strategyId.startsWith(GRID_ID_PREFIX)) {
       return null;
     }
 
@@ -1001,6 +1151,58 @@ export class EngineService {
   }
 
   /**
+   * The SELL-side half of `recoverWorkingOrder` — reads the persisted lot
+   * table directly rather than live state, so it recovers an exit whether or
+   * not the strategy that opened the lot is currently enabled. See
+   * `recoverWorkingOrder`'s own header for why the two sides differ.
+   */
+  private async recoverExitWorkingOrder(
+    strategyId: string,
+    symbol: string,
+    quantity: number,
+    clientOrderId: string,
+  ): Promise<WorkingOrder | null> {
+    const isGrid = strategyId.startsWith(GRID_ID_PREFIX);
+
+    const lot = isGrid
+      ? this.gridLots
+        ? (await this.gridLots.findByStrategy(strategyId)).find(
+            (candidate) => candidate.workingOrderId === clientOrderId,
+          )
+        : undefined
+      : (await this.lots.findBySymbol(symbol)).find(
+          (candidate) => candidate.workingOrderId === clientOrderId,
+        );
+
+    if (!lot) {
+      return null;
+    }
+
+    const recovered: WorkingOrder = {
+      kind: 'EXIT',
+      lotId: lot.id,
+      strategyId,
+      // No rung-equivalent for a grid lot — the lot's own fill price is the
+      // closest analog, and it is only ever used for logging, mirroring
+      // `adoptWorkingOrders`'s identical SELL-side substitution.
+      rungPrice: isGrid ? lot.fillPrice : (lot as Lot).rungPrice,
+      quantity,
+      symbol,
+    };
+
+    this.workingOrders.set(clientOrderId, recovered);
+
+    this.logger.warn(
+      `recovered working order ${clientOrderId} for lot ${lot.id} from persisted state — the fill ` +
+        'arrived with no in-memory record, which happens when an order fills while the daemon is ' +
+        'down (or was never adopted, e.g. a disabled strategy) and IB replays the execution on ' +
+        'reconnect',
+    );
+
+    return recovered;
+  }
+
+  /**
    * Undoes a pre-submit resting-order reservation.
    *
    * Used when the order turns out not to exist — rejected, or never reached the
@@ -1008,7 +1210,12 @@ export class EngineService {
    * order that filled during `submit()` is no longer working, and clearing it
    * would reopen a level that now holds shares.
    */
-  private releaseRestingOrder(clientOrderId: string, strategyId: string, resting: boolean): void {
+  private async releaseRestingOrder(
+    clientOrderId: string,
+    strategyId: string,
+    symbol: string,
+    resting: boolean,
+  ): Promise<void> {
     this.workingOrders.delete(clientOrderId);
 
     if (!resting) {
@@ -1018,8 +1225,91 @@ export class EngineService {
     const state = this.coordinator.getState(strategyId);
 
     if (state) {
-      DipLadderStrategy.clearWorkingOrder(state, clientOrderId);
+      if (strategyId.startsWith(GRID_ID_PREFIX)) {
+        GridStrategy.clearWorkingOrder(state, clientOrderId);
+      } else {
+        DipLadderStrategy.clearWorkingOrder(state, clientOrderId);
+      }
+
+      return;
     }
+
+    // Disabled strategy: a rejected/failed submission must undo the mark
+    // `recordDisabledExitWorkingOrder` wrote straight to the database before
+    // this order was submitted — otherwise a lot's persisted
+    // `workingOrderId` would point at an order that never actually rested. A
+    // harmless no-op for a BUY, which never gets a disabled-path mark to
+    // begin with (see `submitOrder`'s exit-only special case).
+    await this.clearDisabledWorkingOrder(strategyId, symbol, clientOrderId);
+  }
+
+  /**
+   * Writes an exit's `workingOrderId` mark straight to a disabled strategy's
+   * database row — the counterpart to `DipLadderStrategy.recordWorkingExit`/
+   * `GridStrategy.recordWorkingExit`, which mutate live state that does not
+   * exist for a disabled strategy. See `submitOrder`'s pre-submit marking
+   * block.
+   */
+  private async recordDisabledExitWorkingOrder(
+    strategyId: string,
+    symbol: string,
+    lotId: string,
+    clientOrderId: string,
+  ): Promise<void> {
+    if (strategyId.startsWith(GRID_ID_PREFIX)) {
+      if (!this.gridLots) {
+        return;
+      }
+
+      const lots = await this.gridLots.findByStrategy(strategyId);
+      const updated = lots.map((lot) =>
+        lot.id === lotId ? { ...lot, workingOrderId: clientOrderId } : lot,
+      );
+      await this.gridLots.saveAll(updated, strategyId, symbol);
+      return;
+    }
+
+    const lots = await this.lots.findBySymbol(symbol);
+    const updated = lots.map((lot) =>
+      lot.id === lotId ? { ...lot, workingOrderId: clientOrderId } : lot,
+    );
+    await this.lots.saveAll(updated, symbol);
+  }
+
+  /** Undoes `recordDisabledExitWorkingOrder` — see `releaseRestingOrder`. */
+  private async clearDisabledWorkingOrder(
+    strategyId: string,
+    symbol: string,
+    clientOrderId: string,
+  ): Promise<void> {
+    if (strategyId.startsWith(GRID_ID_PREFIX)) {
+      if (!this.gridLots) {
+        return;
+      }
+
+      const lots = await this.gridLots.findByStrategy(strategyId);
+
+      if (!lots.some((lot) => lot.workingOrderId === clientOrderId)) {
+        return;
+      }
+
+      const updated = lots.map((lot) =>
+        lot.workingOrderId === clientOrderId ? { ...lot, workingOrderId: null } : lot,
+      );
+      await this.gridLots.saveAll(updated, strategyId, symbol);
+      return;
+    }
+
+    const lots = await this.lots.findBySymbol(symbol);
+
+    if (!lots.some((lot) => lot.workingOrderId === clientOrderId)) {
+      return;
+    }
+
+    const updated = lots.map((lot) =>
+      lot.workingOrderId === clientOrderId ? { ...lot, workingOrderId: null } : lot,
+    );
+    await this.lots.saveAll(updated, symbol);
   }
 
   /**
@@ -1030,8 +1320,16 @@ export class EngineService {
    * resting orders in Story 13 and exits were left behind — so a sell was
    * submitted with no working-order registration, no persistent fill routing,
    * and a lot closed optimistically before the broker confirmed anything.
+   *
+   * **Every grid intent rests, unconditionally.** There is no `IMMEDIATE`
+   * mode for the grid strategy — it has no bar-close-triggered entry rule to
+   * fall back to, so resting is the only placement mode it has.
    */
   private isRestingOrder(intent: OrderIntent): boolean {
+    if (intent.strategyId.startsWith(GRID_ID_PREFIX)) {
+      return true;
+    }
+
     return this.ladderConfigFor(intent.strategyId)?.orderPlacement === OrderPlacement.RESTING;
   }
 
@@ -1144,7 +1442,19 @@ export class EngineService {
 
     const state = this.coordinator.getState(working.strategyId);
 
-    if (!state) {
+    // **A disabled strategy has no live state, but its resting exits are
+    // still real orders that can still fill.** An ENTRY fill has nowhere to
+    // go without it — opening a lot writes into the strategy's own state,
+    // and nothing currently places a BUY for a disabled strategy (the
+    // operator diagnosis this fill router shares an id space with is
+    // SELL-side only for exactly that reason) — so that case is left as it
+    // was: dropped, because it cannot legitimately arise. An EXIT fill is
+    // different: the shares it disposes of are real regardless of whether
+    // anything is running, and dropping it here would leave the database
+    // showing a lot HELD forever while the broker has already sold it —
+    // silently, until the next reconciliation finds the mismatch and halts
+    // the symbol for a "fault" that was actually a successful trade.
+    if (!state && working.kind !== 'EXIT') {
       return;
     }
 
@@ -1165,7 +1475,63 @@ export class EngineService {
     }
 
     if (working.kind === 'EXIT') {
-      await this.routeExitFill(fill, working, partial);
+      if (state) {
+        await this.routeExitFill(fill, working, partial);
+      } else {
+        await this.routeExitFillForDisabledStrategy(fill, working, partial);
+      }
+
+      return;
+    }
+
+    // Unreachable in practice — the guard above already returned for a null
+    // state unless `working.kind === 'EXIT'`, which itself just returned —
+    // but TypeScript cannot prove that across the two independent checks.
+    // Kept as an explicit narrowing rather than a non-null assertion.
+    if (!state) {
+      return;
+    }
+
+    const isGrid = working.strategyId.startsWith(GRID_ID_PREFIX);
+
+    if (isGrid) {
+      const gridConfig = this.gridConfigFor(working.strategyId);
+
+      if (!gridConfig) {
+        return;
+      }
+
+      const lot = GridStrategy.openLotFromFill(state, gridConfig, {
+        price: fill.price,
+        quantity: fill.quantity,
+        at: fill.timestamp,
+      });
+
+      // Same reasoning as the ladder branch below: a fill smaller than what
+      // remains outstanding may not be the whole order.
+      if (partial) {
+        working.quantity = outstandingBeforeThisFill - fill.quantity;
+      } else {
+        this.workingOrders.delete(fill.clientOrderId);
+      }
+
+      await this.orders.updateStatus(
+        fill.clientOrderId,
+        partial ? OrderStatus.PARTIALLY_FILLED : OrderStatus.FILLED,
+      );
+
+      this.logger.log(
+        `grid buy filled ${fill.quantity}${
+          partial ? ` of ${outstandingBeforeThisFill} (remainder cancelled)` : ''
+        } @ ${fill.price.toFixed(2)} — lot ${lot.id} sells at ${lot.sellTarget.toFixed(2)}`,
+      );
+
+      await this.persistAllStrategyState();
+
+      // The fill-triggered recompute: a newly opened lot needs its own
+      // resting sell placed right away, and the buy levels below it have
+      // moved if this is now the lowest held lot.
+      await this.recomputeGrid(working.strategyId);
       return;
     }
 
@@ -1207,7 +1573,7 @@ export class EngineService {
       } @ ${fill.price.toFixed(2)} — lot ${lot.id} exits at ${lot.exitTarget.toFixed(2)}`,
     );
 
-    await this.persistLadderState();
+    await this.persistAllStrategyState();
   }
 
   /**
@@ -1255,14 +1621,22 @@ export class EngineService {
       return;
     }
 
+    const isGrid = working.strategyId.startsWith(GRID_ID_PREFIX);
     const outstandingBeforeThisFill = working.quantity;
 
-    const result = DipLadderStrategy.closeLotFromFill(state, {
-      lotId: working.lotId,
-      price: fill.price,
-      quantity: fill.quantity,
-      at: fill.timestamp,
-    });
+    const result = isGrid
+      ? GridStrategy.closeLotFromFill(state, {
+          lotId: working.lotId,
+          price: fill.price,
+          quantity: fill.quantity,
+          at: fill.timestamp,
+        })
+      : DipLadderStrategy.closeLotFromFill(state, {
+          lotId: working.lotId,
+          price: fill.price,
+          quantity: fill.quantity,
+          at: fill.timestamp,
+        });
 
     // A split leaves real, still-held shares behind, and IB can (and does)
     // deliver one order's fill as more than one execution report — so this
@@ -1296,12 +1670,12 @@ export class EngineService {
         fill.timestamp,
       );
 
-      await this.persistLadderState();
+      await this.persistAllStrategyState();
       return;
     }
 
     this.logger.log(
-      `lot ${result.closed.id} at rung ${working.rungPrice.toFixed(2)} sold ` +
+      `lot ${result.closed.id}${isGrid ? '' : ` at rung ${working.rungPrice.toFixed(2)}`} sold ` +
         `${fill.quantity}${partial ? ` of ${outstandingBeforeThisFill} (remainder cancelled)` : ''} ` +
         `@ ${fill.price.toFixed(2)}` +
         (result.remainder
@@ -1309,7 +1683,171 @@ export class EngineService {
           : ''),
     );
 
-    await this.persistLadderState();
+    await this.persistAllStrategyState();
+
+    if (isGrid) {
+      // A closed lot changes which lot is now the lowest held — the level
+      // the next dip-buy is computed from. Recompute immediately rather than
+      // waiting for the next session's first bar.
+      await this.recomputeGrid(working.strategyId);
+    }
+  }
+
+  /**
+   * The disabled-strategy counterpart to `routeExitFill`.
+   *
+   * A disabled strategy has no live coordinator state (`initializeAll` never
+   * created it), so there is nothing for `closeLotFromFill` to mutate the way
+   * `routeExitFill` does. This closes the lot's **database row directly**
+   * instead, reusing the exact same pure close/split logic
+   * (`DipLadderStrategy.closeLotFromFill`/`GridStrategy.closeLotFromFill`)
+   * against a throwaway `StrategyState` built from the persisted lots —
+   * never against the live coordinator, which does not have an entry for
+   * this strategy to begin with.
+   *
+   * **Every persisted lot for the symbol is loaded, not just the held ones.**
+   * `LotRepository.saveAll`/`GridLotRepository.saveAll` replace the whole
+   * persisted set for a symbol; writing back only the lots this fill touched
+   * would silently delete every other lot's history, closed or held.
+   *
+   * `lotSequence` is a throwaway value (`Date.now()`), not a restored one: it
+   * is only consulted to name a split remainder's fresh id, and this state is
+   * discarded the moment this method returns — there is no continuity for it
+   * to preserve across calls the way the live ladder's own sequence has.
+   */
+  private async routeExitFillForDisabledStrategy(
+    fill: Fill,
+    working: WorkingOrder & { kind: 'EXIT' },
+    partial: boolean,
+  ): Promise<void> {
+    const isGrid = working.strategyId.startsWith(GRID_ID_PREFIX);
+    const outstandingBeforeThisFill = working.quantity;
+
+    if (isGrid) {
+      if (!this.gridLots) {
+        return;
+      }
+
+      const persisted = await this.gridLots.findByStrategy(working.strategyId);
+      const state: StrategyState = {
+        strategyId: working.strategyId,
+        version: GRID_STATE_VERSION,
+        symbols: [working.symbol],
+        data: {
+          lots: persisted,
+          lotSequence: Date.now(),
+          sessionDate: null,
+        } as unknown as Record<string, JsonValue>,
+      };
+
+      const result = GridStrategy.closeLotFromFill(state, {
+        lotId: working.lotId,
+        price: fill.price,
+        quantity: fill.quantity,
+        at: fill.timestamp,
+      });
+
+      if (result?.remainder) {
+        working.lotId = result.remainder.id;
+        working.quantity = result.remainder.quantity;
+      } else {
+        this.workingOrders.delete(fill.clientOrderId);
+      }
+
+      await this.orders.updateStatus(
+        fill.clientOrderId,
+        partial ? OrderStatus.PARTIALLY_FILLED : OrderStatus.FILLED,
+      );
+
+      if (!result) {
+        this.raiseAlert(
+          'WARNING',
+          'EXIT_FILL_UNATTRIBUTED',
+          `fill ${fill.fillId} closed no lot — ${working.lotId} is missing or already closed`,
+          fill.timestamp,
+        );
+        await this.gridLots.saveAll(
+          GridStrategy.lotsOf(state) ?? [],
+          working.strategyId,
+          working.symbol,
+        );
+        return;
+      }
+
+      this.logger.log(
+        `lot ${result.closed.id} sold ` +
+          `${fill.quantity}${partial ? ` of ${outstandingBeforeThisFill} (remainder cancelled)` : ''} ` +
+          `@ ${fill.price.toFixed(2)}` +
+          (result.remainder
+            ? ` — ${result.remainder.quantity} still held as ${result.remainder.id}`
+            : '') +
+          ' [strategy disabled — closed directly in the database]',
+      );
+
+      await this.gridLots.saveAll(
+        GridStrategy.lotsOf(state) ?? [],
+        working.strategyId,
+        working.symbol,
+      );
+      return;
+    }
+
+    const persistedLots = await this.lots.findBySymbol(working.symbol);
+    const persistedRungs = await this.rungs.findBySymbol(working.symbol);
+    const state: StrategyState = {
+      strategyId: working.strategyId,
+      version: DIP_LADDER_STATE_VERSION,
+      symbols: [working.symbol],
+      data: {
+        lots: persistedLots,
+        rungs: persistedRungs,
+        lotSequence: Date.now(),
+      } as unknown as Record<string, JsonValue>,
+    };
+
+    const result = DipLadderStrategy.closeLotFromFill(state, {
+      lotId: working.lotId,
+      price: fill.price,
+      quantity: fill.quantity,
+      at: fill.timestamp,
+    });
+
+    if (result?.remainder) {
+      working.lotId = result.remainder.id;
+      working.quantity = result.remainder.quantity;
+    } else {
+      this.workingOrders.delete(fill.clientOrderId);
+    }
+
+    await this.orders.updateStatus(
+      fill.clientOrderId,
+      partial ? OrderStatus.PARTIALLY_FILLED : OrderStatus.FILLED,
+    );
+
+    if (!result) {
+      this.raiseAlert(
+        'WARNING',
+        'EXIT_FILL_UNATTRIBUTED',
+        `fill ${fill.fillId} closed no lot — ${working.lotId} is missing or already closed`,
+        fill.timestamp,
+      );
+      await this.lots.saveAll(DipLadderStrategy.lotsOf(state) ?? [], working.symbol);
+      await this.rungs.saveAll(DipLadderStrategy.rungsOf(state) ?? [], working.symbol);
+      return;
+    }
+
+    this.logger.log(
+      `lot ${result.closed.id} sold ` +
+        `${fill.quantity}${partial ? ` of ${outstandingBeforeThisFill} (remainder cancelled)` : ''} ` +
+        `@ ${fill.price.toFixed(2)}` +
+        (result.remainder
+          ? ` — ${result.remainder.quantity} still held as ${result.remainder.id}`
+          : '') +
+        ' [strategy disabled — closed directly in the database]',
+    );
+
+    await this.lots.saveAll(DipLadderStrategy.lotsOf(state) ?? [], working.symbol);
+    await this.rungs.saveAll(DipLadderStrategy.rungsOf(state) ?? [], working.symbol);
   }
 
   /**
@@ -1359,7 +1897,11 @@ export class EngineService {
     const state = this.coordinator.getState(working.strategyId);
 
     if (state) {
-      DipLadderStrategy.clearWorkingOrder(state, ack.clientOrderId);
+      if (working.strategyId.startsWith(GRID_ID_PREFIX)) {
+        GridStrategy.clearWorkingOrder(state, ack.clientOrderId);
+      } else {
+        DipLadderStrategy.clearWorkingOrder(state, ack.clientOrderId);
+      }
     }
 
     this.workingOrders.delete(ack.clientOrderId);
@@ -1376,7 +1918,7 @@ export class EngineService {
       );
     }
 
-    await this.persistLadderState();
+    await this.persistAllStrategyState();
   }
 
   /**
@@ -1395,6 +1937,17 @@ export class EngineService {
     const strategy = this.coordinator.getStrategy(strategyId);
 
     return strategy instanceof DipLadderStrategy ? strategy.parameters : null;
+  }
+
+  /** The grid config for a strategy id, or null when the id is not a grid instance. */
+  private gridConfigFor(strategyId: string): GridConfig | null {
+    if (!strategyId.startsWith(GRID_ID_PREFIX)) {
+      return null;
+    }
+
+    const strategy = this.coordinator.getStrategy(strategyId);
+
+    return strategy instanceof GridStrategy ? strategy.parameters : null;
   }
 
   /**
@@ -1454,6 +2007,108 @@ export class EngineService {
         capturedAt: this.lastBarTimestamp ?? new Date().toISOString(),
       });
     }
+  }
+
+  /**
+   * Persists the grid strategy's lots to `GridLot`. Parallel to
+   * `persistLadderState`, and deliberately smaller: no `Rung` table, and no
+   * `StrategyStateSnapshot` — `sessionDate`, the grid strategy's only other
+   * cross-bar scalar, is cheap to lose on restart (see `GridReconciliationService`'s
+   * own `restore` for why).
+   *
+   * A no-op when no repository was supplied — the many tests that construct
+   * an `EngineService` directly without one, and any process where the grid
+   * strategy is never enabled.
+   */
+  private async persistGridState(): Promise<void> {
+    if (!this.gridLots) {
+      return;
+    }
+
+    for (const snapshot of this.coordinator.snapshots()) {
+      if (!snapshot.state || !snapshot.id.startsWith(GRID_ID_PREFIX)) {
+        continue;
+      }
+
+      const symbol = snapshot.symbols[0];
+
+      if (!symbol) {
+        continue;
+      }
+
+      // Same reasoning as the ladder: a halted symbol's live state was never
+      // restored, and writing its empty ladder over the persisted lots would
+      // destroy the records an operator needs to resolve the mismatch.
+      if (this.symbolHalts.isHalted(symbol)) {
+        continue;
+      }
+
+      await this.gridLots.saveAll(GridStrategy.lotsOf(snapshot.state) ?? [], snapshot.id, symbol);
+    }
+  }
+
+  /** Persists both strategies' durable state. The single call site every submit/fill path uses. */
+  private async persistAllStrategyState(): Promise<void> {
+    await this.persistLadderState();
+    await this.persistGridState();
+  }
+
+  /**
+   * The grid strategy's fill-triggered recompute — its counterpart to a bar
+   * reaching `onBar`, for the one strategy that has no bar of its own at the
+   * moment a fill demands a fresh decision.
+   *
+   * Builds a minimal, single-bar `StrategyContext` from the last known price
+   * rather than reading a clock — `evaluate`'s contract forbids that, and the
+   * bar this is triggered from is genuinely the most recent price this engine
+   * has seen, whether or not it happens to be the bar the fill settled on.
+   *
+   * A halted symbol is not evaluated at all, mirroring `processBar`'s own
+   * guard: recomputing against a position reconciliation has not verified
+   * would advance the strategy's view of a mismatch nobody has resolved.
+   */
+  private async recomputeGrid(strategyId: string): Promise<void> {
+    const strategy = this.coordinator.getStrategy(strategyId);
+    const state = this.coordinator.getState(strategyId);
+
+    if (!(strategy instanceof GridStrategy) || !state) {
+      return;
+    }
+
+    if (this.symbolHalts.isHalted(strategy.symbol)) {
+      return;
+    }
+
+    if (this.lastBarClose === null || this.lastBarTimestamp === null) {
+      return;
+    }
+
+    const bar: Bar = {
+      symbol: strategy.symbol,
+      barSize: BarSize.ONE_MIN,
+      timestamp: this.lastBarTimestamp,
+      open: this.lastBarClose,
+      high: this.lastBarClose,
+      low: this.lastBarClose,
+      close: this.lastBarClose,
+      volume: 0,
+    };
+
+    const ctx: StrategyContext = Object.freeze({
+      strategyId,
+      symbols: Object.freeze([strategy.symbol]),
+      now: this.lastBarTimestamp,
+      parameters: Object.freeze({}),
+      history: Object.freeze([bar]),
+    });
+
+    const intents = strategy.evaluate(ctx, state);
+
+    if (intents.length === 0) {
+      return;
+    }
+
+    await this.submitIntents(intents, this.lastBarTimestamp, 'grid-intent');
   }
 
   /**
@@ -1684,8 +2339,17 @@ export class EngineService {
    * hand-built contract that differed in exchange or currency would be a
    * different instrument wearing the same symbol.
    */
+  /**
+   * The contract for an operator-placement candidate, ladder or grid.
+   *
+   * Checked against **either** config rather than the ladder's alone — a
+   * grid candidate's `strategyId` (`grid:TQQQ`) never matches
+   * `ladderConfigFor`, so before this considered both, every grid placement
+   * candidate from `OrderDiagnosisService` was silently declined here as "no
+   * contract is registered", regardless of what the risk manager decided.
+   */
   private contractFor(strategyId: string, symbol: string): Contract | null {
-    const config = this.ladderConfigFor(strategyId);
+    const config = this.ladderConfigFor(strategyId) ?? this.gridConfigFor(strategyId);
 
     // `equityContract` is the same helper the strategy itself uses to build an
     // intent's contract, so an operator placement and a bar placement describe
@@ -1904,6 +2568,40 @@ export class EngineService {
     return this.coordinator
       .snapshots()
       .filter((snapshot) => snapshot.id.startsWith(DIP_LADDER_ID_PREFIX) && snapshot.state)
+      .map((snapshot) => ({ symbols: [...snapshot.symbols], state: snapshot.state! }));
+  }
+
+  /**
+   * Grid state as the API serves it, read from strategy state — the grid
+   * counterpart to `ladderLots`/`ladderRungsBySymbol` above.
+   *
+   * There is no grid equivalent of `ladderRungs`: this strategy keeps no
+   * persisted level ledger (`GridStrategy`'s own doc comment), so there is
+   * nothing to project beyond the lots themselves.
+   */
+  gridStrategyLots(): GridLot[] {
+    return this.gridStates().flatMap(({ state }) => GridStrategy.lotsOf(state) ?? []);
+  }
+
+  /**
+   * Grid lots paired with the symbol whose grid instance they belong to.
+   *
+   * Mirrors `ladderRungsBySymbol`'s reasoning: a `GridLot` carries no symbol
+   * of its own (unlike the ladder's `${symbol}-lot-N` id convention), so a
+   * caller that must treat one symbol differently — the API, serving a halted
+   * symbol from the database instead — cannot derive it from the lot alone.
+   */
+  gridLotsBySymbol(): { symbol: string; lots: GridLot[] }[] {
+    return this.gridStates().map(({ symbols, state }) => ({
+      symbol: symbols[0] ?? '',
+      lots: GridStrategy.lotsOf(state) ?? [],
+    }));
+  }
+
+  private gridStates(): { symbols: string[]; state: StrategyState }[] {
+    return this.coordinator
+      .snapshots()
+      .filter((snapshot) => snapshot.id.startsWith(GRID_ID_PREFIX) && snapshot.state)
       .map((snapshot) => ({ symbols: [...snapshot.symbols], state: snapshot.state! }));
   }
 

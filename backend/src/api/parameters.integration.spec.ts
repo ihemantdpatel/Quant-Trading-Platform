@@ -26,6 +26,8 @@ import { ParameterService } from '../strategies/dip-ladder/parameter.service';
 import { DIP_LADDER_CONFIG, DIP_LADDER_SYMBOL } from '../strategies/strategies.module';
 import { buildDipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/config';
 import { PAPER_SYMBOL_CAPITAL } from '../config/capital.config';
+import { buildGridConfig } from '../strategies/grid/config';
+import { GridStrategy } from '../strategies/grid/grid.strategy';
 
 jest.setTimeout(120_000);
 
@@ -87,6 +89,14 @@ describe('Story 7: live parameter editing', () => {
 
     coordinator = app.get(CoordinatorService);
     parameters = app.get(ParameterService);
+
+    // This suite is about the dip ladder's own frozen-target behaviour, but
+    // the current operator default boots the grid strategy enabled on TQQQ
+    // and the ladder disabled. `coordinator.enable` initializes on demand,
+    // so this is deterministic regardless of the app's own (unawaited)
+    // startup chain.
+    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    coordinator.disable('grid:TQQQ');
   });
 
   afterEach(async () => {
@@ -395,20 +405,28 @@ describe('Story 7: live parameter editing', () => {
   });
 
   describe('GET /parameters', () => {
-    it('lists the editable parameters for the ladder', async () => {
+    it('lists the editable parameters for the ladder, alongside the grid strategy’s own entry', async () => {
       const { body } = await http().get('/parameters').expect(200);
 
-      expect(body).toHaveLength(1);
-      expect(body[0].strategyId).toBe(LADDER_ID);
-      expect(body[0].parameters).toMatchObject({
+      // The grid strategy is registered (disabled) alongside the ladder, so
+      // its own editable-parameter entry appears too — `ParametersController`
+      // dispatches across both services rather than assuming only one exists.
+      expect(body).toHaveLength(2);
+
+      const ladder = body.find((entry: { strategyId: string }) => entry.strategyId === LADDER_ID);
+      expect(ladder.parameters).toMatchObject({
         spacingPercent: 0.05,
         takeProfitPercent: 0.05,
         maxConcurrentRungs: 5,
         escalationFactor: 1,
       });
       // The two values that must never appear on an editable surface.
-      expect(body[0].parameters.symbolCapital).toBeUndefined();
-      expect(body[0].parameters.symbol).toBeUndefined();
+      expect(ladder.parameters.symbolCapital).toBeUndefined();
+      expect(ladder.parameters.symbol).toBeUndefined();
+
+      const grid = body.find((entry: { strategyId: string }) => entry.strategyId === 'grid:TQQQ');
+      expect(grid.parameters).toMatchObject({ gap: 0.5, quantity: 50 });
+      expect(grid.parameters.symbol).toBeUndefined();
     });
 
     it('404s for a strategy that carries no ladder parameters', async () => {
@@ -467,5 +485,97 @@ describe('Story 13: clearing absolute parameters', () => {
       .post('/parameters/dip-ladder:TQQQ')
       .send({ parameters: { fixedQuantity: 12.5 }, reason: 'test' })
       .expect(422);
+  });
+});
+
+/**
+ * `ParametersController`'s dispatch to `GridParameterService` — a smoke test
+ * over HTTP for the same rules `grid/parameter.service.spec.ts` already
+ * covers at the unit level. The grid strategy is registered but disabled
+ * (`EngineModule`'s `gridEnabled` flag), which does not affect the parameter
+ * editor: `register()`/`restore()` run for a disabled strategy exactly as
+ * for an enabled one.
+ */
+describe('Grid strategy parameter editing', () => {
+  let app: INestApplication;
+  let coordinator: CoordinatorService;
+
+  const GRID_ID = 'grid:TQQQ';
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+    coordinator = app.get(CoordinatorService);
+  });
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  const http = () => request(app.getHttpServer());
+
+  it('GET /parameters/:strategyId reports the current grid parameters', async () => {
+    const { body } = await http().get(`/parameters/${GRID_ID}`).expect(200);
+
+    expect(body.strategyId).toBe(GRID_ID);
+    expect(body.symbol).toBe('TQQQ');
+    expect(body.parameters).toMatchObject({
+      gap: 0.5,
+      quantity: 50,
+      maxBuyLevels: 2,
+      maxSellOrders: 2,
+    });
+  });
+
+  it('edits a grid parameter and reports the applies-to scope for lots, not rungs', async () => {
+    const response = await http()
+      .post(`/parameters/${GRID_ID}`)
+      .send({ parameters: { gap: 0.75 }, reason: 'test' })
+      .expect(200);
+
+    expect(response.body.parameters.gap).toBe(0.75);
+    expect(response.body.appliesTo).toContain('held lots keep the sell targets');
+  });
+
+  it('refuses to retarget the traded symbol', async () => {
+    await http()
+      .post(`/parameters/${GRID_ID}`)
+      .send({ parameters: { symbol: 'SOXL' } })
+      .expect(422);
+  });
+
+  it('leaves a held lot’s frozen sell target untouched across an edit', async () => {
+    const config = buildGridConfig('TQQQ', { gap: 0.5 });
+
+    // The grid strategy is registered but disabled, and `initializeAll` only
+    // initializes enabled strategies — so there is no live state to fetch
+    // yet. Seeding it directly mirrors what reconciliation would otherwise
+    // do on a real restart.
+    const strategy = coordinator.getStrategy(GRID_ID) as GridStrategy;
+    coordinator.setState(GRID_ID, await strategy.initialize());
+    const state = coordinator.getState(GRID_ID)!;
+
+    const lot = GridStrategy.openLotFromFill(state, config, {
+      price: 100,
+      quantity: 10,
+      at: '2026-08-14T09:30:00.000-04:00',
+    });
+
+    const response = await http()
+      .post(`/parameters/${GRID_ID}`)
+      .send({ parameters: { gap: 5 }, reason: 'test' })
+      .expect(200);
+
+    expect(response.body.frozenLotTargets).toEqual([{ lotId: lot.id, sellTarget: 100.5 }]);
+    expect(GridStrategy.lotsOf(coordinator.getState(GRID_ID)!)[0].sellTarget).toBe(100.5);
+  });
+
+  it('404s for a strategy id neither service recognizes', async () => {
+    await http().get('/parameters/nope').expect(404);
+    await http()
+      .post('/parameters/nope')
+      .send({ parameters: { gap: 1 } })
+      .expect(404);
   });
 });

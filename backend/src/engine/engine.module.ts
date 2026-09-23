@@ -6,9 +6,11 @@
  * registrations, so enabling the Wheel at Story 16 is a change here rather
  * than anywhere in the strategy layer.
  *
- * The dip ladder is registered **enabled**; Grid, Wheel, and Leaps are
- * registered **disabled** with no live wiring (`PRD.md:229`). Four registered,
- * three disabled — the Story 2 exit criterion, asserted in the module spec.
+ * **Current operator choice: the grid strategy trades TQQQ; the dip ladder,
+ * Wheel, and Leaps are all disabled.** This inverts the Story 2 default (the
+ * ladder enabled, everything else off) — see `ladderEnabled`/`gridEnabled`
+ * below for the reasoning and the same-symbol guard that keeps the two from
+ * ever running together.
  */
 
 import { Inject, Logger, Module, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
@@ -34,7 +36,9 @@ import { LiveFeedService } from '../market-data/live/live-feed.service';
 import { BarSize } from '../market-data/types';
 import { OrderPollService } from '../reconciliation/order-poll.service';
 import { PostCloseReconcileService } from '../reconciliation/post-close-reconcile.service';
+import { DisabledStrategyProtectionService } from '../reconciliation/disabled-strategy-protection.service';
 import { ReplayService } from '../market-data/mock/replay.service';
+import { GridReconciliationService } from '../reconciliation/grid-reconciliation.service';
 import { ReconciliationModule } from '../reconciliation/reconciliation.module';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
 // Declared alongside `ReconciliationService` for the same reason: both depend
@@ -52,6 +56,8 @@ import {
   BarRepository,
   FILL_REPOSITORY,
   FillRepository,
+  GRID_LOT_REPOSITORY,
+  GridLotRepository,
   LOT_REBUILD_EVENT_REPOSITORY,
   LOT_REPOSITORY,
   LotRebuildEventRepository,
@@ -83,11 +89,13 @@ import { RISK_EVENT_SINK, RiskModule } from '../risk/risk.module';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { DipLadderConfig } from '../strategies/dip-ladder/config';
+import { GridConfig } from '../strategies/grid/config';
 import { GridStrategy } from '../strategies/grid/grid.strategy';
+import { GridParameterService } from '../strategies/grid/parameter.service';
 import { LeapsStrategy } from '../strategies/leaps/leaps.strategy';
 import { WheelStrategy } from '../strategies/wheel/wheel.strategy';
 import { ParameterService } from '../strategies/dip-ladder/parameter.service';
-import { DIP_LADDER_CONFIG, StrategiesModule } from '../strategies/strategies.module';
+import { DIP_LADDER_CONFIG, GRID_CONFIG, StrategiesModule } from '../strategies/strategies.module';
 import { EngineService } from './engine.service';
 import { RiskParametersController } from '../api/risk-parameters.controller';
 import { StartupSequence } from './startup.sequence';
@@ -112,8 +120,31 @@ import { StartupSequence } from './startup.sequence';
   ],
   providers: [
     ParameterService,
+    GridParameterService,
     RiskParameterService,
-    StartupSequence,
+    // A factory rather than a bare class: `gridReconciliation` is typed
+    // `GridReconciliationService | null` on the constructor (nullable so the
+    // two spec files that construct a `StartupSequence` directly need not
+    // supply one), and a union type defeats Nest's reflection-based
+    // constructor injection — `design:paramtypes` emits a bare `Object` for a
+    // union, which Nest cannot resolve to a token. A factory sidesteps that
+    // by supplying the argument explicitly rather than asking Nest to infer
+    // it from the parameter's static type.
+    {
+      provide: StartupSequence,
+      useFactory: (
+        coordinator: CoordinatorService,
+        reconciliation: ReconciliationService,
+        broker: BrokerAdapter,
+        gridReconciliation: GridReconciliationService,
+      ) => new StartupSequence(coordinator, reconciliation, broker, gridReconciliation),
+      inject: [
+        CoordinatorService,
+        ReconciliationService,
+        BROKER_ADAPTER,
+        GridReconciliationService,
+      ],
+    },
     // Story 11. Depends only on the bar cache and the backtest repository — it
     // holds no broker, so no request to `/backtest` can reach IB, and it reads
     // history only from the cache so a sweep cannot breach IB's pacing limits.
@@ -144,6 +175,7 @@ import { StartupSequence } from './startup.sequence';
         rebuildEvents: LotRebuildEventRepository,
         ladderConfig: DipLadderConfig,
         appConfig: AppConfigService,
+        gridLots: GridLotRepository,
       ) =>
         new ReconciliationService(
           coordinator,
@@ -158,6 +190,7 @@ import { StartupSequence } from './startup.sequence';
           rebuildEvents,
           ladderConfig,
           appConfig.executionMode,
+          gridLots,
         ),
       inject: [
         CoordinatorService,
@@ -172,6 +205,7 @@ import { StartupSequence } from './startup.sequence';
         LOT_REBUILD_EVENT_REPOSITORY,
         DIP_LADDER_CONFIG,
         AppConfigService,
+        GRID_LOT_REPOSITORY,
       ],
     },
     // Pure computation plus one repository read (`ORDER_REPOSITORY`) — see its
@@ -181,6 +215,11 @@ import { StartupSequence } from './startup.sequence';
     LotRebuildService,
     OrderDiagnosisService,
     DuplicateOrderService,
+    // The grid strategy's own, parallel restart-safety service — see its file
+    // header for why this is strictly additive rather than sharing
+    // `ReconciliationService`. No factory needed: every dependency is a plain
+    // injectable class or a token already bound by an imported module.
+    GridReconciliationService,
     // A single broker instance shared by the engine and the API, so a
     // simulated disconnect in a test is visible to both.
     //
@@ -264,6 +303,7 @@ import { StartupSequence } from './startup.sequence';
         appConfig: AppConfigService,
         symbolHalts: SymbolHaltService,
         snapshots: StrategyStateSnapshotRepository,
+        gridLots: GridLotRepository,
       ) =>
         new EngineService(
           replay,
@@ -280,6 +320,7 @@ import { StartupSequence } from './startup.sequence';
           // symbol is halted everywhere.
           symbolHalts,
           snapshots,
+          gridLots,
         ),
       inject: [
         ReplayService,
@@ -294,6 +335,7 @@ import { StartupSequence } from './startup.sequence';
         AppConfigService,
         SymbolHaltService,
         STRATEGY_STATE_SNAPSHOT_REPOSITORY,
+        GRID_LOT_REPOSITORY,
       ],
     },
   ],
@@ -302,9 +344,11 @@ import { StartupSequence } from './startup.sequence';
     EngineService,
     BROKER_ADAPTER,
     ParameterService,
+    GridParameterService,
     RiskParameterService,
     StartupSequence,
     ReconciliationService,
+    GridReconciliationService,
     OrderDiagnosisService,
     DuplicateOrderService,
     HistoryCacheService,
@@ -316,18 +360,64 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
   private liveFeed: LiveFeedService | null = null;
   private postClose: PostCloseReconcileService | null = null;
   private orderPoll: OrderPollService | null = null;
+  // The grid strategy's own instances — see `startLiveFeed` for why these
+  // are separate from the ladder's rather than one job serving both.
+  private gridPostClose: PostCloseReconcileService | null = null;
+  private gridOrderPoll: OrderPollService | null = null;
+  // Places protective sells for a disabled strategy's real leftover lots,
+  // which nothing else re-rests once its DAY orders expire at each close —
+  // see the class's own header for the full rationale.
+  private disabledStrategyProtection: DisabledStrategyProtectionService | null = null;
+
+  /**
+   * Whether the dip ladder is wired to trade.
+   *
+   * **Operator decision: disabled**, so the grid strategy can trade TQQQ
+   * instead — the two must never both be enabled on one symbol (see the
+   * same-symbol guard below). Kept as a named flag rather than a bare
+   * `enabled: false` at the registration call, so a future re-enable is a
+   * one-line, legible change and the guard stays meaningful in both
+   * directions.
+   *
+   * **Consequence worth knowing before flipping this back on while Grid
+   * stays enabled too**: reconciliation still protects a disabled ladder's
+   * real broker position (the lot-sum assertion runs for every registered
+   * ladder-prefixed snapshot regardless of `enabled`), and `GET /lots`, the
+   * order diagnosis, and `DisabledStrategyProtectionService` all fall back to
+   * the database for a disabled strategy's real lots (`CoordinatorService.
+   * initializeAll` only initializes enabled ones, so live strategy state is
+   * never populated for it) — so a disabled ladder holding real shares is
+   * both visible on the dashboard and kept protected by a fresh sell every
+   * session, without being re-enabled. What it does *not* get is anything
+   * bar-driven: no new entries, no rung re-arming, no dip-buys — a disabled
+   * strategy still makes no trading decisions of its own.
+   */
+  private readonly ladderEnabled = false;
+
+  /**
+   * Whether the grid strategy is wired to trade.
+   *
+   * **Operator decision: enabled**, trading the same TQQQ symbol the ladder
+   * used to. Safe only because `ladderEnabled` is `false` above — the
+   * same-symbol guard below refuses to boot otherwise.
+   */
+  private readonly gridEnabled = true;
 
   constructor(
     private readonly coordinator: CoordinatorService,
     @Inject(DIP_LADDER_CONFIG) private readonly ladderConfig: DipLadderConfig,
+    @Inject(GRID_CONFIG) private readonly gridConfig: GridConfig,
     @Inject(BROKER_ADAPTER) private readonly broker: BrokerAdapter,
     @Inject(RISK_EVENT_SINK) private readonly riskEventSink: RiskEventSink,
     @Inject(RISK_EVENT_REPOSITORY) private readonly riskEvents: RiskEventRepository,
     private readonly parameters: ParameterService,
+    private readonly gridParameters: GridParameterService,
     private readonly riskParameters: RiskParameterService,
     private readonly startup: StartupSequence,
     private readonly engine: EngineService,
     private readonly reconciliation: ReconciliationService,
+    private readonly gridReconciliation: GridReconciliationService,
+    private readonly orderDiagnosis: OrderDiagnosisService,
     private readonly appConfig: AppConfigService,
   ) {}
 
@@ -343,13 +433,36 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       this.riskEventSink.subscribe((event) => void this.riskEvents.save(event));
     }
 
+    // **Same-symbol guard.** The grid strategy and the dip ladder cannot
+    // safely hold live positions in the same symbol at once — each one's
+    // reconciliation is blind to the other's shares, so both enabled here
+    // would make each halt on the other's exposure as a spurious mismatch
+    // the moment either holds a position. Refusing to boot turns an operator
+    // mistake into a legible startup error instead of two confusing halts,
+    // mirroring `assertSingleCurrency`'s "refuse rather than silently
+    // misbehave" precedent. Checked against **both** enabled flags — a
+    // disabled ladder holding a stale position is not the unsafe case this
+    // guards against; two strategies actively trading it at once is.
+    if (
+      this.gridEnabled &&
+      this.ladderEnabled &&
+      this.gridConfig.symbol === this.ladderConfig.symbol
+    ) {
+      throw new Error(
+        `refusing to start: GridStrategy and DipLadderStrategy are both enabled on ` +
+          `${this.gridConfig.symbol} — each strategy's reconciliation is blind to the other's ` +
+          'shares and would halt on a spurious mismatch. Enable at most one of them per symbol.',
+      );
+    }
+
     // Registration order is display order on the dashboard; the ladder first
-    // because it is the only strategy that trades in Phase 1.
+    // for historical continuity even though it is disabled by the current
+    // operator choice above.
     const ladder = new DipLadderStrategy(this.ladderConfig);
 
     this.coordinator.register({
       strategy: ladder,
-      enabled: true,
+      enabled: this.ladderEnabled,
       symbols: [this.ladderConfig.symbol],
     });
 
@@ -366,7 +479,31 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       this.engine.adoptWorkingOrders(strategyId, symbol, orders);
     };
 
-    for (const strategy of [new GridStrategy(), new WheelStrategy(), new LeapsStrategy()]) {
+    // Rebuilds the engine's in-memory working-order registry from the grid
+    // strategy's resting orders found still at the broker — the grid
+    // counterpart to the ladder's wiring just above. Safe now that
+    // `EngineService.adoptWorkingOrders` branches on the `grid:` id prefix
+    // (the Phase C dispatch surgery); without this, a sell that filled while
+    // the daemon was down would arrive with no working-order entry to
+    // resolve against and be silently dropped, surfacing only later as a
+    // lot-sum mismatch.
+    this.gridReconciliation.onOpenOrdersReconciled = (strategyId, symbol, orders) => {
+      this.engine.adoptWorkingOrders(strategyId, symbol, orders);
+    };
+
+    const grid = new GridStrategy(this.gridConfig);
+
+    this.coordinator.register({
+      strategy: grid,
+      enabled: this.gridEnabled,
+      symbols: [this.gridConfig.symbol],
+    });
+
+    // The same object instance the strategy holds — see the identical note
+    // on `this.parameters.register` above.
+    this.gridParameters.register(grid.id, this.gridConfig);
+
+    for (const strategy of [new WheelStrategy(), new LeapsStrategy()]) {
       this.coordinator.register({
         strategy,
         // Disabled with no live wiring until Story 16.
@@ -424,6 +561,11 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       .then(() =>
         this.parameters
           .restore(ladder.id)
+          // The grid strategy's own parameter restore, alongside the ladder's —
+          // both must be back in force before a single bar or fill can reach
+          // either strategy. Non-fatal internally, matching `ParameterService.restore`,
+          // so no separate `.catch` is needed here either.
+          .then(() => this.gridParameters.restore(grid.id))
           .then(() => this.engine.restoreClientOrderSequence())
           .catch((error: unknown) => {
             // Non-fatal. A failed read leaves the counter at zero, which is the
@@ -486,8 +628,18 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
 
     // 1-minute bars: faster re-evaluation than the 5-minute default, since
     // resting orders already capture intra-bar fills — this changes how often
-    // the ladder re-evaluates and places new orders, not fill mechanics.
-    this.liveFeed.start(equityContract(this.ladderConfig.symbol), BarSize.ONE_MIN);
+    // the active strategy re-evaluates and places new orders, not fill
+    // mechanics.
+    //
+    // **Whichever strategy is actually enabled**, not unconditionally the
+    // ladder's symbol. Both happen to be TQQQ today, so this was silently
+    // correct before — but hard-coding `ladderConfig.symbol` here would have
+    // subscribed to the wrong instrument entirely the moment an operator
+    // pointed the grid strategy at a different symbol while leaving the
+    // ladder's compiled default alone, leaving the enabled strategy fed no
+    // bars at all with nothing in the logs to explain why.
+    const liveSymbol = this.gridEnabled ? this.gridConfig.symbol : this.ladderConfig.symbol;
+    this.liveFeed.start(equityContract(liveSymbol), BarSize.ONE_MIN);
     this.liveFeed.startWatchdog();
 
     // **Started alongside the live feed, and gated on the same condition.**
@@ -508,11 +660,42 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // that leaves open.
     this.orderPoll = new OrderPollService(this.reconciliation);
     this.orderPoll.start();
+
+    // **The grid strategy's own pair, not a shared instance.** Each job holds
+    // exactly one reconciler and calls its `reconcileOrders` on its own
+    // schedule — `GridReconciliationService` and `ReconciliationService` are
+    // deliberately separate services (see the former's file header), so
+    // giving the grid strategy the same DAY-expiry and mid-session order
+    // coverage the ladder has means a second pair of jobs, not a shared one.
+    // Started unconditionally alongside the ladder's — both are cheap,
+    // read-only, and harmless against a symbol nothing is resting for.
+    this.gridPostClose = new PostCloseReconcileService(this.gridReconciliation);
+    this.gridPostClose.start();
+
+    this.gridOrderPoll = new OrderPollService(this.gridReconciliation);
+    this.gridOrderPoll.start();
+
+    // **Writes real orders, unlike every job above it.** Gated on the same
+    // IB-bound condition for the same reason: under the mock broker there is
+    // no session and no DAY order that outlives one. See the class's own
+    // header for why this needs to be a separate service from
+    // `PostCloseReconcileService` rather than an extension of it.
+    this.disabledStrategyProtection = new DisabledStrategyProtectionService(
+      this.reconciliation,
+      this.gridReconciliation,
+      this.orderDiagnosis,
+      this.coordinator,
+      this.engine,
+    );
+    this.disabledStrategyProtection.start();
   }
 
   onModuleDestroy(): void {
     this.liveFeed?.stop();
     this.postClose?.stop();
     this.orderPoll?.stop();
+    this.gridPostClose?.stop();
+    this.gridOrderPoll?.stop();
+    this.disabledStrategyProtection?.stop();
   }
 }

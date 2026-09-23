@@ -126,6 +126,49 @@ describe('ReconcileButton', () => {
     expect(screen.queryByText(/post-close job last ran/i)).not.toBeInTheDocument();
   });
 
+  it('shows the grid strategy’s own post-close job separately from the ladder’s', async () => {
+    render(
+      <ReconcileButton
+        lastRun={{
+          ranAt: '2025-01-20T16:15:00.000-05:00',
+          symbols: ['TQQQ'],
+          brokerReachable: true,
+          ordersUpdated: 3,
+        }}
+        gridLastRun={{
+          ranAt: '2025-01-20T16:16:00.000-05:00',
+          symbols: ['TQQQ'],
+          brokerReachable: true,
+        }}
+      />,
+    );
+
+    // Both report separately — neither line should be mistaken for the other.
+    expect(screen.getByText(/ladder post-close job last ran/i)).toHaveTextContent(
+      /3 order row\(s\) corrected/,
+    );
+    expect(screen.getByText(/grid post-close job last ran/i)).toHaveTextContent(
+      /checked 1 symbol\(s\)/,
+    );
+  });
+
+  it('reports the grid job as unreachable independently of the ladder’s job', async () => {
+    render(
+      <ReconcileButton
+        gridLastRun={{
+          ranAt: '2025-01-20T16:16:00.000-05:00',
+          symbols: [],
+          brokerReachable: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/grid post-close job last ran/i)).toHaveTextContent(
+      /could not be reached/,
+    );
+    expect(screen.queryByText(/ladder post-close job/i)).not.toBeInTheDocument();
+  });
+
   it('states that nothing is traded by the run', async () => {
     render(<ReconcileButton />);
 
