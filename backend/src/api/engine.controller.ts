@@ -664,7 +664,7 @@ export class EngineController {
       haltedSymbols: [...ladder.haltedSymbols, ...grid.haltedSymbols],
       symbols: [...ladder.symbols, ...grid.symbols],
       ordersUpdated: ladder.ordersUpdated,
-      recoveredExits: ladder.recoveredExits,
+      recoveredExits: ladder.recoveredExits + grid.recoveredExits,
       rebuildsApplied: ladder.rebuildsApplied,
       ladder,
       grid,

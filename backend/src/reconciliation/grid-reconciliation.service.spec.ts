@@ -10,6 +10,7 @@
 import { FillMode, MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
 import { equityContract } from '../domain/contract';
 import {
+  InMemoryFillRepository,
   InMemoryGridLotRepository,
   InMemoryLotRepository,
 } from '../repositories/in-memory/in-memory.repositories';
@@ -71,6 +72,8 @@ function buildHarness(
     lots?: InMemoryGridLotRepository;
     /** The ladder's own lots for the same symbol — see `siblingHeldQuantity`. */
     ladderLots?: InMemoryLotRepository;
+    /** Read by `recoverGridExitFills`. */
+    fills?: InMemoryFillRepository;
     broker?: MockBrokerAdapter;
     symbol?: string;
     /** Also register a dip-ladder instance, to prove it is skipped entirely. */
@@ -82,6 +85,7 @@ function buildHarness(
   const symbol = options.symbol ?? 'TQQQ';
   const lots = options.lots ?? new InMemoryGridLotRepository();
   const ladderLots = options.ladderLots ?? new InMemoryLotRepository();
+  const fills = options.fills ?? new InMemoryFillRepository();
   const broker = options.broker ?? new MockBrokerAdapter();
   const halts = new SymbolHaltService();
   const coordinator = new CoordinatorService();
@@ -104,9 +108,10 @@ function buildHarness(
     broker,
     lots,
     ladderLots,
+    fills,
   );
 
-  return { coordinator, grid, lots, ladderLots, broker, halts, reconciliation, symbol };
+  return { coordinator, grid, lots, ladderLots, fills, broker, halts, reconciliation, symbol };
 }
 
 describe('GridReconciliationService', () => {
@@ -207,6 +212,124 @@ describe('GridReconciliationService', () => {
       // The persisted ledger is untouched — no rebuild was written back.
       expect(await lots.findByStrategy(grid.id)).toHaveLength(1);
       expect((await lots.findByStrategy(grid.id))[0].quantity).toBe(50);
+    });
+  });
+
+  describe('reconcileAll — recoverGridExitFills', () => {
+    it('closes a held lot whose resting exit already filled but was never routed', async () => {
+      // The gap `recoverGridExitFills` exists for: the exit's `Fill` was
+      // recorded (a real IB execDetails event) but the live router never
+      // applied it — e.g. the fill arrived while nothing was subscribed.
+      // Mirrors `reconciliation.service.spec.ts`'s equivalent ladder test,
+      // minus the rung reconstruction grid has no ledger for.
+      const broker = new MockBrokerAdapter();
+      await broker.connect();
+      const { coordinator, lots, fills, reconciliation, halts, grid, symbol } = buildHarness({
+        broker,
+      });
+      await coordinator.initializeAll(NOW);
+      await lots.saveAll(
+        [gridLot('TQQQ-grid-lot-1', { fillPrice: 95, workingOrderId: 'co-filled-sell' })],
+        grid.id,
+        symbol,
+      );
+      await fills.save({
+        clientOrderId: 'co-filled-sell',
+        brokerOrderId: '1',
+        fillId: 'exec-1',
+        symbol,
+        side: 'SELL',
+        quantity: 100,
+        price: 99.75,
+        commission: 0,
+        timestamp: '2025-01-05T15:50:00.000-05:00',
+      });
+      // The lot's 100 shares were genuinely sold — the broker is flat.
+      broker.seedPosition({ symbol, quantity: 0, averageCost: 0 });
+
+      const report = await reconciliation.reconcileAll(NOW);
+
+      expect(halts.isHalted(symbol)).toBe(false);
+      expect(report.recoveredExits).toBe(1);
+      expect(report.symbols[0].recoveredExits).toBe(1);
+
+      const persisted = await lots.findByStrategy(grid.id);
+      expect(persisted[0].status).toBe(GridLotStatus.CLOSED);
+      expect(persisted[0].exitPrice).toBe(99.75);
+      expect(persisted[0].closedAt).toBe('2025-01-05T15:50:00.000-05:00');
+      expect(persisted[0].workingOrderId).toBeNull();
+    });
+
+    it('does not recover a lot whose exit fill only partially covers it', async () => {
+      // A partial exit needs the live path's lot-splitting to describe
+      // correctly; closing the whole lot on a partial fill would misstate
+      // both the realized proceeds and the shares still actually held.
+      const broker = new MockBrokerAdapter();
+      await broker.connect();
+      const { coordinator, lots, fills, reconciliation, halts, grid, symbol } = buildHarness({
+        broker,
+      });
+      await coordinator.initializeAll(NOW);
+      await lots.saveAll(
+        [gridLot('TQQQ-grid-lot-1', { fillPrice: 95, workingOrderId: 'co-partial-sell' })],
+        grid.id,
+        symbol,
+      );
+      await fills.save({
+        clientOrderId: 'co-partial-sell',
+        brokerOrderId: '1',
+        fillId: 'exec-partial',
+        symbol,
+        side: 'SELL',
+        quantity: 40,
+        price: 99.75,
+        commission: 0,
+        timestamp: '2025-01-05T15:50:00.000-05:00',
+      });
+      broker.seedPosition({ symbol, quantity: 60, averageCost: 95 });
+
+      const report = await reconciliation.reconcileAll(NOW);
+
+      // 100 held vs. 60 at the broker: the assertion correctly still halts,
+      // since a partial fill is not evidence this repair is scoped to act on.
+      expect(halts.isHalted(symbol)).toBe(true);
+      expect(report.recoveredExits).toBe(0);
+      expect((await lots.findByStrategy(grid.id))[0].status).toBe(GridLotStatus.HELD);
+    });
+
+    it('leaves the ledger untouched when open orders cannot be read', async () => {
+      const { coordinator, lots, fills, broker, reconciliation, halts, grid, symbol } =
+        buildHarness();
+      await coordinator.initializeAll(NOW);
+      await lots.saveAll(
+        [gridLot('TQQQ-grid-lot-1', { fillPrice: 95, workingOrderId: 'co-filled-sell' })],
+        grid.id,
+        symbol,
+      );
+      await fills.save({
+        clientOrderId: 'co-filled-sell',
+        brokerOrderId: '1',
+        fillId: 'exec-1',
+        symbol,
+        side: 'SELL',
+        quantity: 100,
+        price: 99.75,
+        commission: 0,
+        timestamp: '2025-01-05T15:50:00.000-05:00',
+      });
+      broker.seedPosition({ symbol, quantity: 0, averageCost: 0 });
+      jest.spyOn(broker, 'getOpenOrders').mockRejectedValue(new Error('socket closed'));
+
+      const report = await reconciliation.reconcileAll(NOW);
+
+      // "Could not ask" is not "nothing resting" — collapsing the two could
+      // close a lot whose exit is genuinely still working at the broker.
+      expect(report.recoveredExits).toBe(0);
+      expect((await lots.findByStrategy(grid.id))[0].status).toBe(GridLotStatus.HELD);
+      // The broker position could not be corroborated against open orders,
+      // but the lot-sum assertion itself is unaffected by that failure — the
+      // symbol still halts on its own terms (100 held vs. 0 at the broker).
+      expect(halts.isHalted(symbol)).toBe(true);
     });
   });
 

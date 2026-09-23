@@ -18,12 +18,9 @@
 
 import { ActivityLog } from './components/ActivityLog';
 import { EngineControls } from './components/EngineControls';
+import { HoldingsPanel } from './components/HoldingsPanel';
 import { LadderView } from './components/LadderView';
-import { LotTable } from './components/LotTable';
-import { ModeSwitch } from './components/ModeSwitch';
-import { StatusBar } from './components/StatusBar';
-import { StrategyPanel } from './components/StrategyPanel';
-import { TradeHistoryTable } from './components/TradeHistoryTable';
+import { OverviewPanel } from './components/OverviewPanel';
 import {
   isDipLadderEnabled,
   isGridEnabled,
@@ -111,18 +108,17 @@ export default async function ExecutionPage() {
 
   return (
     <main className="flex flex-col gap-4">
-      <StatusBar
-        status={data.status}
-        positions={data.positions}
-        deployed={totalDeployedCost(allLots)}
-        realized={totalRealized(allLots)}
-        positionsUnavailable={data.unavailable?.positions ?? false}
-      />
-
-      <div className={`grid gap-4 ${replayable ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
-        <ModeSwitch mode={data.status?.mode ?? 'SHADOW'} />
+      <div className={`grid gap-4 ${replayable ? 'lg:grid-cols-[minmax(0,1fr)_20rem]' : ''}`}>
+        <OverviewPanel
+          status={data.status}
+          positions={data.positions}
+          deployed={totalDeployedCost(allLots)}
+          realized={totalRealized(allLots)}
+          positionsUnavailable={data.unavailable?.positions ?? false}
+          mode={data.status?.mode ?? 'SHADOW'}
+          strategies={data.strategies}
+        />
         {replayable && <EngineControls />}
-        <StrategyPanel strategies={data.strategies} />
       </div>
 
       {/*
@@ -144,17 +140,15 @@ export default async function ExecutionPage() {
             <LadderView rungs={data.rungs} mark={mark} unavailable={rungsUnavailable} />
           )}
           {holdingsRelevant && (
-            <LotTable
-              title="Holdings"
-              lots={holdings}
+            <HoldingsPanel
+              holdings={holdings}
+              allLots={allLots}
               mark={mark}
               unavailable={lotsUnavailable || gridLotsUnavailable}
             />
           )}
         </div>
       )}
-
-      <TradeHistoryTable lots={allLots} unavailable={lotsUnavailable || gridLotsUnavailable} />
 
       <ActivityLog
         orders={data.orders}

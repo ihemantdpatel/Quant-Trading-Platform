@@ -10,8 +10,15 @@
  * orders. Tabs make that split a switch rather than a scroll.
  *
  * Each tab keeps the original panel's cap (12 rows, most recent first) — this
- * is a history log, not the live view; `PendingOrders` inside `ActivityLog`
+ * is a history log, not the live view; the Pending tab in `ActivityLog`
  * remains the uncapped answer to "what is resting right now."
+ *
+ * **Unbordered and headingless on purpose.** `ActivityLog` now embeds this
+ * directly inside its own "Orders & fills" tab, which already supplies the box
+ * and the label — a second border and a repeated "Orders & fills" heading here
+ * would just be chrome around chrome. The Submitted/Filled switch below is a
+ * second, nested level of tabs, which is fine: the two tablists have disjoint
+ * names, and an operator reads them as "which view" then "which list."
  *
  * A Client Component only for the tab state — the rest of `ActivityLog` stays
  * a Server Component.
@@ -34,11 +41,8 @@ export function OrdersFillsHistory({
   const [tab, setTab] = useState<Tab>('submitted');
 
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900">
-      <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
-          Orders & fills
-        </h2>
+    <div>
+      <div className="flex justify-end border-b border-slate-800 px-4 py-2">
         <div role="tablist" aria-label="Orders & fills view" className="flex gap-1">
           <TabButton active={tab === 'submitted'} onClick={() => setTab('submitted')}>
             Submitted ({orders.length})
@@ -47,9 +51,9 @@ export function OrdersFillsHistory({
             Filled ({fills.length})
           </TabButton>
         </div>
-      </header>
+      </div>
 
-      <div role="tabpanel" className="max-h-72 overflow-y-auto">
+      <div role="tabpanel">
         {tab === 'submitted' ? (
           orders.length === 0 ? (
             <Empty>

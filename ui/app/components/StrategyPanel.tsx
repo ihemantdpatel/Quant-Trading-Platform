@@ -8,6 +8,11 @@
  * is visible: the dashboard shows what the coordinator holds, and a scaffold
  * that silently vanished from the UI would be a strategy nobody remembers is
  * registered.
+ *
+ * **Unbordered on purpose.** `OverviewPanel` renders this as the content of
+ * its "Strategies" tab — see that component's and `ModeSwitch`'s docblocks
+ * for why this and the rest of the engine state are one tabbed panel rather
+ * than separate always-visible ones.
  */
 
 import { useState, useTransition } from 'react';
@@ -25,7 +30,7 @@ export function StrategyPanel({ strategies }: { strategies: StrategySummary[] })
   }
 
   return (
-    <section aria-label="Strategies" className="rounded-lg border border-slate-800 bg-slate-900">
+    <section aria-label="Strategies">
       <header className="border-b border-slate-800 px-4 py-3">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">Strategies</h2>
       </header>

@@ -17,10 +17,18 @@
  * **Deliberately no repair path and no rebuild tiers.** A lot-sum mismatch
  * halts for an operator, exactly like the ladder's reconciliation did before
  * `LotRebuildService` existed — this is a design decision for the grid
- * strategy's first version, not an oversight. There is also no equivalent of
- * `recoverExitFills`: that closes a narrow crash-window gap the ladder's
- * heavier machinery can leave, and grid's much smaller surface has not yet
- * demonstrated it needs the same repair.
+ * strategy's first version, not an oversight.
+ *
+ * **`recoverGridExitFills` is the one exception**, the grid counterpart to
+ * `ReconciliationService.recoverExitFills` — a real incident (2026-09-22,
+ * TQQQ) showed the gap is not hypothetical: a grid lot's resting sell filled
+ * at the broker, nothing routed the fill live, and the stale `HELD` lot then
+ * produced both a `GRID_LOT_SUM_MISMATCH` here and a misleading negative
+ * `siblingHeldQuantity` reading on the ladder's own reconciliation for the
+ * same symbol. Unlike the rebuild tiers, this is not a guess: it only closes
+ * a lot when the `Fill` table holds this system's own record of the exact
+ * exit, so it stays in keeping with "no repair path" for anything that isn't
+ * evidence already on hand.
  *
  * **`reconcileOrderHistory` (stale `Order` row correction) is deliberately
  * not duplicated here.** That method operates on the `Order` table generically
@@ -40,6 +48,8 @@ import {
   OpenOrder,
 } from '../broker/broker-adapter.interface';
 import {
+  FILL_REPOSITORY,
+  FillRepository,
   GRID_LOT_REPOSITORY,
   GridLotRepository,
   LOT_REPOSITORY,
@@ -47,7 +57,7 @@ import {
 } from '../repositories/repository.interfaces';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { GRID_ID_PREFIX, GridStateData, GridStrategy } from '../strategies/grid/grid.strategy';
-import { GridLot, GridLotStatus } from '../strategies/grid/lot';
+import { closeGridLot, GridLot, GridLotStatus } from '../strategies/grid/lot';
 import {
   assertGridLotSum,
   GridLotSumVerdict,
@@ -64,6 +74,14 @@ export interface GridSymbolReconciliation {
   verdict: GridLotSumVerdict;
   resumed: boolean;
   restoredLots: number;
+  /**
+   * HELD lots closed by `recoverGridExitFills` before the assertion ran,
+   * using a `Fill` this system already recorded for that lot's own exit
+   * order. Reported even on a halt — the verdict above is computed from the
+   * post-recovery lots, so a symbol that still does not reconcile after
+   * recovery genuinely has a second, different problem.
+   */
+  recoveredExits: number;
 }
 
 export interface GridReconciliationReport {
@@ -71,6 +89,8 @@ export interface GridReconciliationReport {
   clean: boolean;
   symbols: GridSymbolReconciliation[];
   haltedSymbols: string[];
+  /** Sum of `GridSymbolReconciliation.recoveredExits` across every symbol. */
+  recoveredExits: number;
 }
 
 /**
@@ -99,6 +119,10 @@ export class GridReconciliationService {
     // `ReconciliationService`'s own `GRID_LOT_REPOSITORY` read. See
     // `siblingHeldQuantity`.
     @Inject(LOT_REPOSITORY) private readonly ladderLots: LotRepository,
+    // Read by `recoverGridExitFills` — the same `Fill` table the ladder's
+    // `recoverExitFills` reads, populated only from a real IB `execDetails`
+    // event, never synthesized.
+    @Inject(FILL_REPOSITORY) private readonly fills: FillRepository,
   ) {}
 
   /**
@@ -131,6 +155,7 @@ export class GridReconciliationService {
       clean: results.every((result) => result.verdict.reconciled),
       symbols: results,
       haltedSymbols: this.halts.haltedSymbols(),
+      recoveredExits: results.reduce((sum, result) => sum + result.recoveredExits, 0),
     };
 
     this.lastReport = report;
@@ -224,6 +249,7 @@ export class GridReconciliationService {
           reason: `${symbol}: broker unreachable at startup — cannot verify the grid position, halted`,
         },
         now,
+        0,
       );
     }
 
@@ -231,20 +257,36 @@ export class GridReconciliationService {
     // `siblingHeldQuantity` and the file header comment.
     const rawBrokerQuantity = positions.find((p) => p.symbol === symbol)?.quantity ?? 0;
     const brokerQuantity = rawBrokerQuantity - (await this.siblingHeldQuantity(symbol));
-    const verdict = assertGridLotSum(symbol, persistedLots, brokerQuantity);
+
+    // Recover any HELD lot whose resting exit already filled at the broker
+    // before asserting the sum — see `recoverGridExitFills`. A lot closed
+    // here is exactly the shape of gap the assertion below would otherwise
+    // halt on, and the fix is evidence this system already recorded, not a
+    // guess.
+    const recovery = await this.recoverGridExitFills(strategyId, symbol, persistedLots, openOrders);
+
+    const verdict = assertGridLotSum(symbol, recovery.lots, brokerQuantity);
 
     if (!verdict.reconciled) {
-      return this.haltWith(strategyId, symbol, GRID_HALT_LOT_SUM_MISMATCH, verdict, now);
+      return this.haltWith(
+        strategyId,
+        symbol,
+        GRID_HALT_LOT_SUM_MISMATCH,
+        verdict,
+        now,
+        recovery.recovered,
+      );
     }
 
-    const restoredLots = this.restore(strategyId, persistedLots);
+    const restoredLots = this.restore(strategyId, recovery.lots);
 
     // Resting orders are reconciled *after* the lot-sum assertion passes, not
     // instead of it — same split as the ladder's version.
     await this.reconcileOpenOrders(strategyId, symbol, openOrders);
 
     this.logger.log(
-      `${symbol}: grid reconciled — ${verdict.reason}. Restored ${restoredLots} lot(s).`,
+      `${symbol}: grid reconciled — ${verdict.reason}. Restored ${restoredLots} lot(s)` +
+        (recovery.recovered > 0 ? ` (recovered ${recovery.recovered} exit fill(s)).` : '.'),
     );
 
     return {
@@ -253,7 +295,92 @@ export class GridReconciliationService {
       verdict,
       resumed: true,
       restoredLots,
+      recoveredExits: recovery.recovered,
     };
+  }
+
+  /**
+   * Closes a HELD grid lot whose resting exit already filled at the broker
+   * but was never routed live — the grid counterpart to
+   * `ReconciliationService.recoverExitFills`, minus the rung reconstruction:
+   * grid keeps no persisted rung ledger (see the file header comment), so
+   * there is nothing to re-arm.
+   *
+   * A lot closes only when both hold:
+   *
+   * 1. its `workingOrderId` names an order that is **not** currently resting
+   *    at the broker (`openOrders` says so), and
+   * 2. this system's `Fill` table — populated only from a real IB
+   *    `execDetails` event, never synthesized — holds fill(s) for that exact
+   *    `clientOrderId` summing to **exactly** the lot's quantity.
+   *
+   * Nothing here infers a price or invents a quantity; both come from the
+   * fill itself. Anything short of an exact match — no fill at all, or one
+   * that does not cover the whole lot (a genuine partial exit needs the live
+   * path's lot-splitting, not a guess made here) — is left untouched, exactly
+   * as before this method existed: `reconcileOpenOrders` below still releases
+   * a `workingOrderId` the broker confirms gone *without* a matching fill
+   * (cancelled, rejected, expired), which is a different, safe kind of gone.
+   */
+  private async recoverGridExitFills(
+    strategyId: string,
+    symbol: string,
+    lots: GridLot[],
+    openOrders: OpenOrder[] | null,
+  ): Promise<{ lots: GridLot[]; recovered: number }> {
+    // `null` is "could not ask", not "nothing resting" — the same distinction
+    // `reconcileOpenOrders` makes below, for the same reason: treating it as
+    // "definitely not resting" could close a lot whose exit is still working.
+    if (openOrders === null) {
+      return { lots, recovered: 0 };
+    }
+
+    const restingSellIds = new Set(
+      openOrders
+        .filter((order) => order.symbol === symbol && order.side === 'SELL')
+        .map((order) => order.clientOrderId),
+    );
+
+    let nextLots = lots;
+    let recovered = 0;
+
+    for (const lot of lots) {
+      if (lot.status !== GridLotStatus.HELD || !lot.workingOrderId) {
+        continue;
+      }
+
+      if (restingSellIds.has(lot.workingOrderId)) {
+        continue;
+      }
+
+      const exitFills = await this.fills.findByClientOrderId(lot.workingOrderId);
+      const filledQuantity = exitFills.reduce((sum, fill) => sum + fill.quantity, 0);
+
+      if (exitFills.length === 0 || filledQuantity !== lot.quantity) {
+        continue;
+      }
+
+      // Several rows would mean the broker filled this one order in more than
+      // one print; the exact-quantity match above already rules out a true
+      // partial sitting here, so the last print is the one that completed it.
+      const fill = exitFills[exitFills.length - 1];
+
+      const closed = closeGridLot(lot, fill.price, fill.timestamp);
+      nextLots = nextLots.map((candidate) => (candidate.id === lot.id ? closed : candidate));
+      recovered += 1;
+
+      this.logger.warn(
+        `${symbol}: recovered grid exit fill for ${lot.id} — order ${lot.workingOrderId} ` +
+          `filled ${fill.quantity} @ ${fill.price.toFixed(2)} but was never routed live; closed ` +
+          `with realized ${((fill.price - lot.fillPrice) * lot.quantity).toFixed(2)}`,
+      );
+    }
+
+    if (recovered > 0) {
+      await this.gridLots.saveAll(nextLots, strategyId, symbol);
+    }
+
+    return { lots: nextLots, recovered };
   }
 
   /**
@@ -391,6 +518,7 @@ export class GridReconciliationService {
     code: string,
     verdict: GridLotSumVerdict,
     now: string,
+    recoveredExits: number,
   ): GridSymbolReconciliation {
     this.halts.halt(symbol, code, verdict.reason, now);
 
@@ -400,6 +528,7 @@ export class GridReconciliationService {
       verdict,
       resumed: false,
       restoredLots: 0,
+      recoveredExits,
     };
   }
 

@@ -18,9 +18,18 @@ export interface GridConfig {
    * own fill price to compute its sell target.
    */
   gap: number;
-  /** How many stepped dip-buy levels to maintain below the lowest held lot. */
+  /**
+   * How many stepped dip-buy levels to maintain below the lowest held lot.
+   *
+   * Used by the `GRID_STEPS` buy rule in `computeGridIntents` — every
+   * fill-triggered recompute, and `onBar`'s recompute on any session-open
+   * bar that isn't genuinely the day's first entry. The day's actual first
+   * entry uses the separate `DAILY_AVERAGE` rule instead (one buy off the
+   * average hold price), which does not consult this field — see the doc
+   * comment on `GridBuyPricing` in `levels.ts`.
+   */
   maxBuyLevels: number;
-  /** Cap on concurrent resting sells; the oldest/lowest-priced lots (FIFO) get them. */
+  /** Cap on concurrent resting sells; the lowest-fill-price lots get them first. */
   maxSellOrders: number;
   /**
    * Dollars added past the last close for the flat (0-lot) entry, so the

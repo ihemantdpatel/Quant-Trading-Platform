@@ -75,6 +75,46 @@ describe('GridStrategy', () => {
       expect(intents[0]).toMatchObject({ side: 'BUY', strategyId: 'grid:TQQQ' });
       expect(intents[0].limitPrice).toBeGreaterThan(100);
     });
+
+    it("falls back to the GRID_STEPS rule (never pegs) when a lot already opened earlier the same day — guards a restart from re-triggering the day's-first-entry peg", async () => {
+      // `sessionDate` is not restored across a restart, so a fresh `state`
+      // here stands in for "process just restarted mid-session": `onBar`
+      // sees `date !== data.sessionDate` exactly as it would on a genuine
+      // session open. What must stop it pegging is the lot below, which
+      // proves today already had its entry — a real incident on 2026-09-14
+      // (a restart pegged an unrelated marketable buy at 69.97).
+      const strategy = buildStrategy();
+      const state = await strategy.initialize();
+
+      GridStrategy.openLotFromFill(state, buildGridConfig('TQQQ', { gap: 0.5 }), {
+        price: 100,
+        quantity: 50,
+        at: '2025-01-02T09:31:00.000-05:00',
+      });
+
+      // Gapped through every GRID_STEPS level (99.5, 99) as well as the
+      // DAILY_AVERAGE target (99.5) — so DAILY_AVERAGE would peg to 98 while
+      // GRID_STEPS correctly emits nothing.
+      const intents = strategy.onBar(flatBar('TQQQ', '2025-01-02T09:35:00.000-05:00', 98), state);
+
+      expect(intents.filter((i) => i.side === 'BUY')).toEqual([]);
+    });
+
+    it('uses DAILY_AVERAGE (may peg to market) on a genuine first bar of the day with nothing opened yet today', async () => {
+      const strategy = buildStrategy();
+      const state = await strategy.initialize();
+
+      GridStrategy.openLotFromFill(state, buildGridConfig('TQQQ', { gap: 0.5 }), {
+        price: 100,
+        quantity: 50,
+        at: '2025-01-01T09:31:00.000-05:00', // yesterday
+      });
+
+      const intents = strategy.onBar(flatBar('TQQQ', '2025-01-02T09:30:00.000-05:00', 98), state);
+
+      const buys = intents.filter((i) => i.side === 'BUY');
+      expect(buys).toEqual([expect.objectContaining({ limitPrice: 98 })]);
+    });
   });
 
   describe('evaluate', () => {

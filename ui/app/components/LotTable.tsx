@@ -40,6 +40,7 @@ export function LotTable({
   title = 'Lots',
   emptyMessage = 'No lots held. Replay a fixture to drive the strategy.',
   showRungColumn = true,
+  showHeader = true,
 }: {
   lots: LotLike[];
   /** Last traded price, or null when the engine has seen no fills. */
@@ -68,6 +69,12 @@ export function LotTable({
    * rendering a column of dashes for every grid row, the caller omits it.
    */
   showRungColumn?: boolean;
+  /**
+   * Suppresses the built-in title/count header. Set by a caller that already
+   * renders its own header above this table — e.g. `HoldingsPanel`'s tab bar
+   * — so the title is not shown twice.
+   */
+  showHeader?: boolean;
 }) {
   const held = lots.filter((lot) => lot.status === 'HELD');
   const blended = blendedAverageCost(held);
@@ -82,11 +89,16 @@ export function LotTable({
   const showStrategyColumn = held.some((lot) => lot.strategy);
 
   return (
-    <section aria-label={title} className="rounded-lg border border-slate-800 bg-slate-900">
-      <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-800 px-4 py-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">{title}</h2>
-        <p className="text-xs text-slate-400">{held.length} held</p>
-      </header>
+    <section
+      aria-label={showHeader ? title : undefined}
+      className={showHeader ? 'rounded-lg border border-slate-800 bg-slate-900' : undefined}
+    >
+      {showHeader && (
+        <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-800 px-4 py-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">{title}</h2>
+          <p className="text-xs text-slate-400">{held.length} held</p>
+        </header>
+      )}
 
       {unverified && (
         <p className="border-b border-amber-800/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">

@@ -6,6 +6,7 @@ import {
   heldGridLots,
   isHeld,
   openGridLot,
+  sellPriorityQueue,
   sellTargetFor,
   splitGridLot,
 } from './lot';
@@ -122,5 +123,40 @@ describe('fifoQueue', () => {
     const a = lot({ id: 'a', openedAt: '2025-01-02T10:00:00.000-05:00' });
 
     expect(fifoQueue([b, a]).map((l) => l.id)).toEqual(['a', 'b']);
+  });
+});
+
+describe('sellPriorityQueue', () => {
+  it('orders lots lowest fill price first, regardless of age', () => {
+    // Bought first but at the worst price — must sort last, unlike fifoQueue.
+    const boughtFirstExpensive = lot({
+      id: 'expensive',
+      fillPrice: 100,
+      openedAt: '2025-01-02T10:00:00.000-05:00',
+    });
+    const boughtLaterCheap = lot({
+      id: 'cheap',
+      fillPrice: 98,
+      openedAt: '2025-01-02T12:00:00.000-05:00',
+    });
+
+    expect(sellPriorityQueue([boughtFirstExpensive, boughtLaterCheap]).map((l) => l.id)).toEqual([
+      'cheap',
+      'expensive',
+    ]);
+  });
+
+  it('breaks a tied fill price by age, oldest first', () => {
+    const newer = lot({ id: 'newer', fillPrice: 98, openedAt: '2025-01-02T12:00:00.000-05:00' });
+    const older = lot({ id: 'older', fillPrice: 98, openedAt: '2025-01-02T10:00:00.000-05:00' });
+
+    expect(sellPriorityQueue([newer, older]).map((l) => l.id)).toEqual(['older', 'newer']);
+  });
+
+  it('breaks a tied fill price and timestamp by id, for a stable total order', () => {
+    const b = lot({ id: 'b', fillPrice: 98, openedAt: '2025-01-02T10:00:00.000-05:00' });
+    const a = lot({ id: 'a', fillPrice: 98, openedAt: '2025-01-02T10:00:00.000-05:00' });
+
+    expect(sellPriorityQueue([b, a]).map((l) => l.id)).toEqual(['a', 'b']);
   });
 });

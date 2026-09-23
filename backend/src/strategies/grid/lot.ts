@@ -136,6 +136,30 @@ function compare(a: string, b: string): number {
   return 0;
 }
 
+/**
+ * Held lots ordered lowest-fill-price first — the priority order for
+ * `computeGridIntents`'s `maxSellOrders` cap. Ties on `fillPrice` break the
+ * same way `fifoQueue` does (`openedAt`, then `id`), so the order stays
+ * total and stable.
+ *
+ * Deliberately distinct from `fifoQueue`: age and fill price usually agree
+ * in a grid that steps down on every drop, since the oldest held lot is
+ * normally also the highest-priced one — but they are not the same
+ * question, and a lot bought later can still be the cheapest, e.g. via
+ * `DAILY_AVERAGE`'s peg-to-market rule or simple price whipsaw. Selecting by
+ * age left a lot bought at the best price sitting with no resting sell while
+ * older, worse-priced lots were protected first — the actual bug this
+ * function replaces `fifoQueue` for in the sell cap.
+ */
+export function sellPriorityQueue(lots: GridLot[]): GridLot[] {
+  return [...lots].sort((a, b) => {
+    if (a.fillPrice !== b.fillPrice) {
+      return a.fillPrice - b.fillPrice;
+    }
+    return a.openedAt === b.openedAt ? compare(a.id, b.id) : compare(a.openedAt, b.openedAt);
+  });
+}
+
 export function heldGridLots(lots: GridLot[]): GridLot[] {
   return lots.filter(isHeld);
 }

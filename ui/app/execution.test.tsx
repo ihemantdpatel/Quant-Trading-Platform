@@ -11,6 +11,7 @@
  */
 
 import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import ExecutionPage from './page';
 import { loadExecution, type ExecutionData } from './lib/api';
 
@@ -72,8 +73,12 @@ function withBroker(name: string): ExecutionData {
 describe('Execution page', () => {
   it('shows the current execution mode', async () => {
     mockLoad.mockResolvedValue(executionData());
+    const user = userEvent.setup();
 
     render(await ExecutionPage());
+    // Execution mode is a tab within the Overview panel now, not an
+    // always-visible block — see `OverviewPanel`.
+    await user.click(screen.getByRole('tab', { name: 'Execution mode' }));
 
     expect(screen.getByTestId('current-mode')).toHaveTextContent('SHADOW');
     expect(screen.getByText(/nothing is submitted/i)).toBeInTheDocument();

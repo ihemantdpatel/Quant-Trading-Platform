@@ -139,6 +139,10 @@ describe('grid strategy — engine integration', () => {
       .sort((a, b) => a - b);
     const sells = resting.filter((o) => o.side === 'SELL');
 
+    // The flat entry itself uses `DAILY_AVERAGE` (marketable-at-close, filed
+    // under the "0 held lots" branch); the fill it produces immediately
+    // triggers the fill-recompute, which always uses `GRID_STEPS` — two
+    // levels below the one held lot's fill price, gap=1 apart.
     expect(buys).toEqual([98, 99]);
     expect(sells).toHaveLength(1);
     expect(sells[0]).toMatchObject({ limitPrice: 101, quantity: 10 });
@@ -338,6 +342,7 @@ describe('grid strategy — engine integration', () => {
       broker,
       gridLots,
       new InMemoryLotRepository(),
+      new InMemoryFillRepository(),
     );
     // The same wiring `engine.module.ts` does between the grid strategy's
     // reconciliation and the engine's working-order registry.

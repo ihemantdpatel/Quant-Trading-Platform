@@ -5,11 +5,15 @@
  * "grid" as a fixed lattice of levels independent of exposure, contrasted
  * with the ladder's anchor chaining off the lowest held lot. This
  * implementation does chain off held lots — the requirement it was built
- * against explicitly asks for buy levels stepped below the lowest held lot
- * and a sell per lot at that lot's own fill price — so that framing is
- * superseded, not honoured. What *is* preserved from the scaffold's spirit is
- * the "will not share rung code" line: this strategy has no `Rung` or
- * `RungStatus` at all.
+ * against explicitly asks for a buy below the held position and a sell per
+ * lot at that lot's own fill price — so that framing is superseded, not
+ * honoured. What *is* preserved from the scaffold's spirit is the "will not
+ * share rung code" line: this strategy has no `Rung` or `RungStatus` at all.
+ * (The buy side still steps several levels below the *lowest* held lot for
+ * every recompute except one: the day's first entry instead prices a single
+ * buy off the average hold price, pegged to market if already gapped through
+ * — see `GridBuyPricing` in `levels.ts` for both rules and why they're kept
+ * separate.)
  *
  * **No pre-computed level ledger, deliberately.** Every order this strategy
  * places is DAY time-in-force and expires naturally at the close, so there is
@@ -144,12 +148,24 @@ export class GridStrategy implements Strategy {
 
     data.sessionDate = date;
 
+    // `sessionDate` above is in-memory-only state, not restored across a
+    // restart — a mid-session restart makes `date === data.sessionDate`
+    // false even though the session already had its first entry, which would
+    // otherwise let `DAILY_AVERAGE` peg a second, unrelated marketable buy at
+    // whatever price happens to be current when the process comes back (a
+    // real incident: a restart on 2026-09-14 filled one at 69.97). Lots
+    // *are* durably restored, so checking them is what actually answers "did
+    // today already have its first entry" — `data.lots` includes closed lots
+    // too, since one opened and closed earlier today still proves it.
+    const alreadyEnteredToday = data.lots.some((lot) => sessionDateOf(lot.openedAt) === date);
+
     const intents = computeGridIntents({
       symbol: this.config.symbol,
       close: bar.close,
       timestamp: bar.timestamp,
       heldLots: heldGridLots(data.lots),
       config: this.config,
+      buyPricing: alreadyEnteredToday ? 'GRID_STEPS' : 'DAILY_AVERAGE',
     });
 
     return intents.map((intent) => this.toOrderIntent(intent));
@@ -180,6 +196,12 @@ export class GridStrategy implements Strategy {
       timestamp: bar.timestamp,
       heldLots: heldGridLots(data.lots),
       config: this.config,
+      // **Always the stepped grid rule, never `DAILY_AVERAGE`.** A pegged
+      // buy is marketable, so it fills almost immediately, which is exactly
+      // what re-triggers this hook — allowing a peg here turned into a
+      // self-sustaining buying loop live. See the doc comment on
+      // `GridBuyPricing` in `levels.ts`.
+      buyPricing: 'GRID_STEPS',
     });
 
     return intents.map((intent) => this.toOrderIntent(intent));
