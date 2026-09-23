@@ -1,7 +1,7 @@
 import { flatBar } from '../contract-test-suite';
-import { StrategyContext, StrategyState } from '../types';
+import { StrategyContext } from '../types';
 import { buildGridConfig } from './config';
-import { GridStrategy, GridStateData } from './grid.strategy';
+import { GridStrategy } from './grid.strategy';
 import { GridLotStatus } from './lot';
 
 const NOW = '2025-01-02T10:00:00.000-05:00';
@@ -12,10 +12,6 @@ function context(
   symbols: string[] = ['TQQQ'],
 ): StrategyContext {
   return { strategyId, symbols, now: NOW, parameters: {}, history };
-}
-
-function dataOf(state: StrategyState): GridStateData {
-  return state.data as unknown as GridStateData;
 }
 
 describe('GridStrategy', () => {
@@ -257,9 +253,17 @@ describe('GridStrategy', () => {
     it('clearWorkingOrder is a harmless no-op for an id that matches no lot', async () => {
       const strategy = buildStrategy();
       const state = await strategy.initialize();
+      const config = buildGridConfig('TQQQ', { gap: 0.5 });
+
+      const lot = GridStrategy.openLotFromFill(state, config, {
+        price: 100,
+        quantity: 50,
+        at: NOW,
+      });
+      GridStrategy.recordWorkingExit(state, lot.id, 'co-1');
 
       expect(() => GridStrategy.clearWorkingOrder(state, 'co-unknown')).not.toThrow();
-      expect(dataOf(state).lots).toEqual([]);
+      expect(GridStrategy.lotsOf(state)[0].workingOrderId).toBe('co-1');
     });
   });
 });

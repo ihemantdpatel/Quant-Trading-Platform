@@ -13,6 +13,7 @@
 import { InMemoryParameterChangeRepository } from '../../repositories/in-memory/in-memory.repositories';
 import { CoordinatorService } from '../coordinator.service';
 import { StrategyState } from '../types';
+import * as configModule from './config';
 import { buildGridConfig, GridConfig } from './config';
 import { GridParameterEditError, GridParameterService } from './parameter.service';
 
@@ -286,6 +287,43 @@ describe('GridParameterService', () => {
       const { restarted, restartedConfig } = reboot();
       await expect(restarted.restore(STRATEGY_ID)).resolves.toBeUndefined();
       expect(restartedConfig.maxBuyLevels).toBe(2);
+    });
+
+    it('keeps the latest value by timestamp, not by the order records were read back', async () => {
+      const record = (changeId: string, newValue: number, timestamp: string) => ({
+        id: `${changeId}:gap`,
+        changeId,
+        strategyId: STRATEGY_ID,
+        parameter: 'gap',
+        oldValue: 0.5,
+        newValue,
+        timestamp,
+        stateAtChange: null,
+        reason: null,
+      });
+      await changes.append(record('grid-param-change-newer', 0.75, '2024-03-04T11:00:00.000Z'));
+      await changes.append(record('grid-param-change-older', 0.6, AT));
+
+      const { restarted, restartedConfig } = reboot();
+      await restarted.restore(STRATEGY_ID);
+
+      expect(restartedConfig.gap).toBe(0.75);
+    });
+
+    it('leaves compiled defaults in force when validation throws a non-Error value', async () => {
+      await edit({ maxBuyLevels: 1 });
+
+      const { restarted, restartedConfig } = reboot();
+      const build = jest.spyOn(configModule, 'buildGridConfig').mockImplementationOnce(() => {
+        throw 'boom';
+      });
+
+      try {
+        await expect(restarted.restore(STRATEGY_ID)).resolves.toBeUndefined();
+        expect(restartedConfig.maxBuyLevels).toBe(2);
+      } finally {
+        build.mockRestore();
+      }
     });
   });
 });
