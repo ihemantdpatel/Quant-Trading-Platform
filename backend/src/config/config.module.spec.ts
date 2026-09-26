@@ -18,6 +18,8 @@ describe('AppConfigModule', () => {
     delete process.env.EXECUTION_MODE;
     delete process.env.PORT;
     delete process.env.IB_HOST;
+    delete process.env.IB_ACCOUNT_ID;
+    delete process.env.ACCOUNT_ALIAS;
   });
 
   afterAll(() => {
@@ -111,6 +113,7 @@ describe('AppConfigModule', () => {
 
     it('selects the IB broker when a host is configured', async () => {
       process.env.IB_HOST = 'host.docker.internal';
+      process.env.IB_ACCOUNT_ID = 'DU1234567';
 
       const config = await bootConfigModule();
 

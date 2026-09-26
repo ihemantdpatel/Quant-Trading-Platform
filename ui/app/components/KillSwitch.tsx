@@ -21,6 +21,7 @@
 
 import { useState, useTransition } from 'react';
 import { setKillSwitch, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import { LivePrice } from './LivePrice';
 import type { LastPrice } from '../lib/api';
 
@@ -39,20 +40,21 @@ export function KillSwitch({
   /** The feed's last bar, or null when nothing has arrived. */
   lastPrice?: LastPrice | null;
 }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [note, setNote] = useState('');
 
   function toggle() {
     startTransition(async () => {
-      setResult(await setKillSwitch(!engaged, note));
+      setResult(await setKillSwitch(account, !engaged, note));
       setNote('');
     });
   }
 
   return (
     <section
-      aria-label="Global kill switch"
+      aria-label="Account kill switch"
       className={`rounded-lg border p-4 ${
         engaged ? 'border-red-500 bg-red-950/40' : 'border-slate-700 bg-slate-900'
       }`}

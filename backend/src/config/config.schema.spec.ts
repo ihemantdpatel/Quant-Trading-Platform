@@ -64,9 +64,52 @@ describe('validateConfig', () => {
     });
 
     it('keeps a real host value', () => {
-      expect(validateConfig({ IB_HOST: 'host.docker.internal' }).IB_HOST).toBe(
-        'host.docker.internal',
+      expect(
+        validateConfig({ IB_HOST: 'host.docker.internal', IB_ACCOUNT_ID: 'DU1234567' }).IB_HOST,
+      ).toBe('host.docker.internal');
+    });
+  });
+
+  describe('ACCOUNT_ALIAS', () => {
+    it('defaults to the one account that predates accounts, so an old deployment keeps trading it', () => {
+      expect(validateConfig({}).ACCOUNT_ALIAS).toBe('nuuixl118');
+      expect(validateConfig({ ACCOUNT_ALIAS: '' }).ACCOUNT_ALIAS).toBe('nuuixl118');
+    });
+
+    it('accepts an alias the registry knows', () => {
+      expect(validateConfig({ ACCOUNT_ALIAS: ' nuuixl118 ' }).ACCOUNT_ALIAS).toBe('nuuixl118');
+    });
+
+    it('refuses an alias the registry does not know rather than borrowing another account', () => {
+      expect(() => validateConfig({ ACCOUNT_ALIAS: 'nobody' })).toThrow(
+        /ACCOUNT_ALIAS: must be one of nuuixl118/,
       );
+    });
+  });
+
+  describe('IB_ACCOUNT_ID', () => {
+    it('is optional under the mock broker, where there is no account to name', () => {
+      expect(validateConfig({}).IB_ACCOUNT_ID).toBeUndefined();
+    });
+
+    it('refuses a value that is not an IB account id, such as the alias or login username', () => {
+      expect(() =>
+        validateConfig({ IB_HOST: 'host.docker.internal', IB_ACCOUNT_ID: 'nuuixl118' }),
+      ).toThrow(/IB_ACCOUNT_ID: must be an IB account id/);
+    });
+
+    it('accepts live and paper account ids', () => {
+      expect(validateConfig({ IB_ACCOUNT_ID: 'U1234567' }).IB_ACCOUNT_ID).toBe('U1234567');
+      expect(validateConfig({ IB_ACCOUNT_ID: ' DU1234567 ' }).IB_ACCOUNT_ID).toBe('DU1234567');
+    });
+
+    it('is required whenever IB is bound, so no IB read can go unfiltered', () => {
+      expect(() => validateConfig({ IB_HOST: 'host.docker.internal' })).toThrow(
+        /IB_ACCOUNT_ID: is required when IB_HOST is set/,
+      );
+      expect(() =>
+        validateConfig({ IB_HOST: 'host.docker.internal', IB_ACCOUNT_ID: '  ' }),
+      ).toThrow(/IB_ACCOUNT_ID/);
     });
   });
 });

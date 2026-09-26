@@ -24,8 +24,9 @@
  * identical. Recovery that throws on retry is not recovery.
  */
 
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { DEFAULT_ACCOUNT_ALIAS } from '../../config/accounts.config';
 import { Fill, OrderStatus } from '../../broker/broker-adapter.interface';
 import { Bar, BarSize } from '../../market-data/types';
 import { RiskEvent, RiskEventType } from '../../risk/risk-event';
@@ -57,6 +58,7 @@ import {
   StrategyStateSnapshotRecord,
   StrategyStateSnapshotRepository,
 } from '../repository.interfaces';
+import { ACCOUNT_ID } from '../account-scope';
 import { toDecimal, toDecimalOrNull, toNumber, toNumberOrNull } from './decimal';
 import { PrismaService } from './prisma.service';
 
@@ -75,7 +77,12 @@ function fromJson<T>(value: Prisma.JsonValue): T {
 
 @Injectable()
 export class PrismaOrderIntentRepository implements OrderIntentRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(record: OrderIntentRecord): Promise<void> {
     const intent = record.intent;
@@ -102,8 +109,8 @@ export class PrismaOrderIntentRepository implements OrderIntentRepository {
     };
 
     await this.prisma.orderIntent.upsert({
-      where: { id: record.id },
-      create: { id: record.id, ...data },
+      where: { accountId_id: { accountId: this.accountId, id: record.id } },
+      create: { accountId: this.accountId, id: record.id, ...data },
       update: data,
     });
   }
@@ -112,6 +119,7 @@ export class PrismaOrderIntentRepository implements OrderIntentRepository {
     // Ordered by the insertion-ordered `createdAt` then id: the in-memory
     // implementation returns insertion order, and the shared suite asserts it.
     const rows = await this.prisma.orderIntent.findMany({
+      where: { accountId: this.accountId },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
 
@@ -120,7 +128,7 @@ export class PrismaOrderIntentRepository implements OrderIntentRepository {
 
   async findBySymbol(symbol: string): Promise<OrderIntentRecord[]> {
     const rows = await this.prisma.orderIntent.findMany({
-      where: { symbol },
+      where: { accountId: this.accountId, symbol },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
 
@@ -132,13 +140,13 @@ export class PrismaOrderIntentRepository implements OrderIntentRepository {
     // an unknown id is a no-op, not a throw (the in-memory version simply finds
     // nothing). `update` would raise P2025 on a missing row.
     await this.prisma.orderIntent.updateMany({
-      where: { id },
+      where: { accountId: this.accountId, id },
       data: { submitted: true, clientOrderId },
     });
   }
 
   async clear(): Promise<void> {
-    await this.prisma.orderIntent.deleteMany();
+    await this.prisma.orderIntent.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -162,7 +170,12 @@ function toIntentRecord(row: {
 
 @Injectable()
 export class PrismaOrderRepository implements OrderRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(order: OrderRecord): Promise<void> {
     const data = {
@@ -178,8 +191,10 @@ export class PrismaOrderRepository implements OrderRepository {
     };
 
     await this.prisma.order.upsert({
-      where: { clientOrderId: order.clientOrderId },
-      create: { clientOrderId: order.clientOrderId, ...data },
+      where: {
+        accountId_clientOrderId: { accountId: this.accountId, clientOrderId: order.clientOrderId },
+      },
+      create: { accountId: this.accountId, clientOrderId: order.clientOrderId, ...data },
       update: data,
     });
   }
@@ -193,13 +208,14 @@ export class PrismaOrderRepository implements OrderRepository {
     // the existing one rather than nulling it, so a later CANCELLED does not
     // erase the reason the order was REJECTED for.
     await this.prisma.order.updateMany({
-      where: { clientOrderId },
+      where: { accountId: this.accountId, clientOrderId },
       data: rejectReason === undefined ? { status } : { status, rejectReason },
     });
   }
 
   async findAll(): Promise<OrderRecord[]> {
     const rows = await this.prisma.order.findMany({
+      where: { accountId: this.accountId },
       orderBy: [{ createdAt: 'asc' }, { clientOrderId: 'asc' }],
     });
 
@@ -207,13 +223,15 @@ export class PrismaOrderRepository implements OrderRepository {
   }
 
   async findByClientOrderId(clientOrderId: string): Promise<OrderRecord | null> {
-    const row = await this.prisma.order.findUnique({ where: { clientOrderId } });
+    const row = await this.prisma.order.findUnique({
+      where: { accountId_clientOrderId: { accountId: this.accountId, clientOrderId } },
+    });
 
     return row === null ? null : toOrderRecord(row);
   }
 
   async clear(): Promise<void> {
-    await this.prisma.order.deleteMany();
+    await this.prisma.order.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -245,7 +263,12 @@ function toOrderRecord(row: {
 
 @Injectable()
 export class PrismaFillRepository implements FillRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(fill: Fill): Promise<void> {
     const data = {
@@ -260,14 +283,15 @@ export class PrismaFillRepository implements FillRepository {
     };
 
     await this.prisma.fill.upsert({
-      where: { fillId: fill.fillId },
-      create: { fillId: fill.fillId, ...data },
+      where: { accountId_fillId: { accountId: this.accountId, fillId: fill.fillId } },
+      create: { accountId: this.accountId, fillId: fill.fillId, ...data },
       update: data,
     });
   }
 
   async findAll(): Promise<Fill[]> {
     const rows = await this.prisma.fill.findMany({
+      where: { accountId: this.accountId },
       orderBy: [{ timestamp: 'asc' }, { fillId: 'asc' }],
     });
 
@@ -276,7 +300,7 @@ export class PrismaFillRepository implements FillRepository {
 
   async findByClientOrderId(clientOrderId: string): Promise<Fill[]> {
     const rows = await this.prisma.fill.findMany({
-      where: { clientOrderId },
+      where: { accountId: this.accountId, clientOrderId },
       orderBy: [{ timestamp: 'asc' }, { fillId: 'asc' }],
     });
 
@@ -284,15 +308,17 @@ export class PrismaFillRepository implements FillRepository {
   }
 
   async findByFillId(fillId: string): Promise<Fill | null> {
-    // `fillId` is the primary key (`schema.prisma:127`), so this is a point
-    // lookup — it sits on the fill path and runs once per execution IB reports.
-    const row = await this.prisma.fill.findUnique({ where: { fillId } });
+    // `(accountId, fillId)` is the primary key, so this is a point lookup — it
+    // sits on the fill path and runs once per execution IB reports.
+    const row = await this.prisma.fill.findUnique({
+      where: { accountId_fillId: { accountId: this.accountId, fillId } },
+    });
 
     return row ? toFill(row) : null;
   }
 
   async clear(): Promise<void> {
-    await this.prisma.fill.deleteMany();
+    await this.prisma.fill.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -324,14 +350,19 @@ function toFill(row: {
 
 @Injectable()
 export class PrismaLotRepository implements LotRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(lot: Lot, symbol: string): Promise<void> {
     const data = lotData(lot, symbol);
 
     await this.prisma.lot.upsert({
-      where: { id: lot.id },
-      create: { id: lot.id, ...data },
+      where: { accountId_id: { accountId: this.accountId, id: lot.id } },
+      create: { accountId: this.accountId, id: lot.id, ...data },
       update: data,
     });
   }
@@ -352,13 +383,16 @@ export class PrismaLotRepository implements LotRepository {
       // A lot absent from the strategy's state no longer exists: the strategy
       // is authoritative on lot composition (`in-memory.repositories.ts:140`).
       this.prisma.lot.deleteMany({
-        where: ids.length === 0 ? { symbol } : { symbol, id: { notIn: ids } },
+        where:
+          ids.length === 0
+            ? { accountId: this.accountId, symbol }
+            : { accountId: this.accountId, symbol, id: { notIn: ids } },
       }),
       ...lots.map((lot) => {
         const data = lotData(lot, symbol);
         return this.prisma.lot.upsert({
-          where: { id: lot.id },
-          create: { id: lot.id, ...data },
+          where: { accountId_id: { accountId: this.accountId, id: lot.id } },
+          create: { accountId: this.accountId, id: lot.id, ...data },
           update: data,
         });
       }),
@@ -366,20 +400,26 @@ export class PrismaLotRepository implements LotRepository {
   }
 
   async findAll(): Promise<Lot[]> {
-    const rows = await this.prisma.lot.findMany({ orderBy: FIFO_ORDER });
+    const rows = await this.prisma.lot.findMany({
+      where: { accountId: this.accountId },
+      orderBy: FIFO_ORDER,
+    });
 
     return rows.map(toLot);
   }
 
   async findBySymbol(symbol: string): Promise<Lot[]> {
-    const rows = await this.prisma.lot.findMany({ where: { symbol }, orderBy: FIFO_ORDER });
+    const rows = await this.prisma.lot.findMany({
+      where: { accountId: this.accountId, symbol },
+      orderBy: FIFO_ORDER,
+    });
 
     return rows.map(toLot);
   }
 
   async findHeld(symbol: string): Promise<Lot[]> {
     const rows = await this.prisma.lot.findMany({
-      where: { symbol, status: LotStatus.HELD },
+      where: { accountId: this.accountId, symbol, status: LotStatus.HELD },
       orderBy: FIFO_ORDER,
     });
 
@@ -387,7 +427,7 @@ export class PrismaLotRepository implements LotRepository {
   }
 
   async clear(): Promise<void> {
-    await this.prisma.lot.deleteMany();
+    await this.prisma.lot.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -448,14 +488,19 @@ function toLot(row: {
  */
 @Injectable()
 export class PrismaGridLotRepository implements GridLotRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(lot: GridLot, strategyId: string, symbol: string): Promise<void> {
     const data = gridLotData(lot, strategyId, symbol);
 
     await this.prisma.gridLot.upsert({
-      where: { id: lot.id },
-      create: { id: lot.id, ...data },
+      where: { accountId_id: { accountId: this.accountId, id: lot.id } },
+      create: { accountId: this.accountId, id: lot.id, ...data },
       update: data,
     });
   }
@@ -470,13 +515,16 @@ export class PrismaGridLotRepository implements GridLotRepository {
 
     await this.prisma.$transaction([
       this.prisma.gridLot.deleteMany({
-        where: ids.length === 0 ? { strategyId } : { strategyId, id: { notIn: ids } },
+        where:
+          ids.length === 0
+            ? { accountId: this.accountId, strategyId }
+            : { accountId: this.accountId, strategyId, id: { notIn: ids } },
       }),
       ...lots.map((lot) => {
         const data = gridLotData(lot, strategyId, symbol);
         return this.prisma.gridLot.upsert({
-          where: { id: lot.id },
-          create: { id: lot.id, ...data },
+          where: { accountId_id: { accountId: this.accountId, id: lot.id } },
+          create: { accountId: this.accountId, id: lot.id, ...data },
           update: data,
         });
       }),
@@ -484,14 +532,17 @@ export class PrismaGridLotRepository implements GridLotRepository {
   }
 
   async findAll(): Promise<GridLot[]> {
-    const rows = await this.prisma.gridLot.findMany({ orderBy: GRID_LOT_FIFO_ORDER });
+    const rows = await this.prisma.gridLot.findMany({
+      where: { accountId: this.accountId },
+      orderBy: GRID_LOT_FIFO_ORDER,
+    });
 
     return rows.map(toGridLot);
   }
 
   async findByStrategy(strategyId: string): Promise<GridLot[]> {
     const rows = await this.prisma.gridLot.findMany({
-      where: { strategyId },
+      where: { accountId: this.accountId, strategyId },
       orderBy: GRID_LOT_FIFO_ORDER,
     });
 
@@ -500,7 +551,7 @@ export class PrismaGridLotRepository implements GridLotRepository {
 
   async findHeld(strategyId: string): Promise<GridLot[]> {
     const rows = await this.prisma.gridLot.findMany({
-      where: { strategyId, status: GridLotStatus.HELD },
+      where: { accountId: this.accountId, strategyId, status: GridLotStatus.HELD },
       orderBy: GRID_LOT_FIFO_ORDER,
     });
 
@@ -508,7 +559,7 @@ export class PrismaGridLotRepository implements GridLotRepository {
   }
 
   async clear(): Promise<void> {
-    await this.prisma.gridLot.deleteMany();
+    await this.prisma.gridLot.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -558,7 +609,12 @@ function toGridLot(row: {
 
 @Injectable()
 export class PrismaRungRepository implements RungRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   /** Transactional for the same reason as `PrismaLotRepository.saveAll`: a
    * half-written rung set would lose the levels that re-arming depends on. */
@@ -567,7 +623,10 @@ export class PrismaRungRepository implements RungRepository {
 
     await this.prisma.$transaction([
       this.prisma.rung.deleteMany({
-        where: prices.length === 0 ? { symbol } : { symbol, price: { notIn: prices } },
+        where:
+          prices.length === 0
+            ? { accountId: this.accountId, symbol }
+            : { accountId: this.accountId, symbol, price: { notIn: prices } },
       }),
       ...rungs.map((rung) => {
         const data = {
@@ -579,10 +638,16 @@ export class PrismaRungRepository implements RungRepository {
         };
 
         return this.prisma.rung.upsert({
-          // A rung is identified by its level within a symbol — the composite
-          // key that makes "this level already holds a lot" answerable.
-          where: { symbol_price: { symbol, price: toDecimal(rung.price) } },
-          create: { symbol, price: toDecimal(rung.price), ...data },
+          // A rung is identified by its level within a symbol and account — the
+          // composite key that makes "this level already holds a lot" answerable.
+          where: {
+            accountId_symbol_price: {
+              accountId: this.accountId,
+              symbol,
+              price: toDecimal(rung.price),
+            },
+          },
+          create: { accountId: this.accountId, symbol, price: toDecimal(rung.price), ...data },
           update: data,
         });
       }),
@@ -591,7 +656,7 @@ export class PrismaRungRepository implements RungRepository {
 
   async findBySymbol(symbol: string): Promise<Rung[]> {
     const rows = await this.prisma.rung.findMany({
-      where: { symbol },
+      where: { accountId: this.accountId, symbol },
       orderBy: { price: 'desc' },
     });
 
@@ -600,6 +665,7 @@ export class PrismaRungRepository implements RungRepository {
 
   async findAll(): Promise<Rung[]> {
     const rows = await this.prisma.rung.findMany({
+      where: { accountId: this.accountId },
       orderBy: [{ symbol: 'asc' }, { price: 'desc' }],
     });
 
@@ -607,7 +673,7 @@ export class PrismaRungRepository implements RungRepository {
   }
 
   async clear(): Promise<void> {
-    await this.prisma.rung.deleteMany();
+    await this.prisma.rung.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -787,11 +853,17 @@ function toBar(row: {
 
 @Injectable()
 export class PrismaRiskEventRepository implements RiskEventRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(event: RiskEvent): Promise<void> {
     await this.prisma.riskEvent.create({
       data: {
+        accountId: this.accountId,
         type: event.type,
         reason: event.reason,
         detail: event.detail,
@@ -806,7 +878,10 @@ export class PrismaRiskEventRepository implements RiskEventRepository {
     // Insertion order, via the autoincrement id. Sorting by `timestamp` would
     // reorder events that share a bar timestamp — several rejections on one bar
     // is the normal case, not an edge case.
-    const rows = await this.prisma.riskEvent.findMany({ orderBy: { id: 'asc' } });
+    const rows = await this.prisma.riskEvent.findMany({
+      where: { accountId: this.accountId },
+      orderBy: { id: 'asc' },
+    });
 
     return rows.map((row) => ({
       type: row.type as RiskEventType,
@@ -819,17 +894,23 @@ export class PrismaRiskEventRepository implements RiskEventRepository {
   }
 
   async clear(): Promise<void> {
-    await this.prisma.riskEvent.deleteMany();
+    await this.prisma.riskEvent.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
 @Injectable()
 export class PrismaLotRebuildEventRepository implements LotRebuildEventRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(event: LotRebuildEventRecord): Promise<void> {
     await this.prisma.lotRebuildEvent.create({
       data: {
+        accountId: this.accountId,
         symbol: event.symbol,
         strategyId: event.strategyId,
         triggerCode: event.triggerCode,
@@ -845,14 +926,17 @@ export class PrismaLotRebuildEventRepository implements LotRebuildEventRepositor
   }
 
   async findAll(): Promise<LotRebuildEventRecord[]> {
-    const rows = await this.prisma.lotRebuildEvent.findMany({ orderBy: { id: 'asc' } });
+    const rows = await this.prisma.lotRebuildEvent.findMany({
+      where: { accountId: this.accountId },
+      orderBy: { id: 'asc' },
+    });
 
     return rows.map(toLotRebuildEventRecord);
   }
 
   async findBySymbol(symbol: string): Promise<LotRebuildEventRecord[]> {
     const rows = await this.prisma.lotRebuildEvent.findMany({
-      where: { symbol },
+      where: { accountId: this.accountId, symbol },
       orderBy: { id: 'asc' },
     });
 
@@ -860,7 +944,7 @@ export class PrismaLotRebuildEventRepository implements LotRebuildEventRepositor
   }
 
   async clear(): Promise<void> {
-    await this.prisma.lotRebuildEvent.deleteMany();
+    await this.prisma.lotRebuildEvent.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 
@@ -902,11 +986,17 @@ function toLotRebuildEventRecord(row: {
  */
 @Injectable()
 export class PrismaParameterChangeRepository implements ParameterChangeRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async append(change: ParameterChange): Promise<void> {
     await this.prisma.parameterChange.create({
       data: {
+        accountId: this.accountId,
         id: change.id,
         changeId: change.changeId,
         strategyId: change.strategyId,
@@ -922,6 +1012,7 @@ export class PrismaParameterChangeRepository implements ParameterChangeRepositor
 
   async findAll(): Promise<ParameterChange[]> {
     const rows = await this.prisma.parameterChange.findMany({
+      where: { accountId: this.accountId },
       orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
     });
 
@@ -930,7 +1021,7 @@ export class PrismaParameterChangeRepository implements ParameterChangeRepositor
 
   async findByStrategy(strategyId: string): Promise<ParameterChange[]> {
     const rows = await this.prisma.parameterChange.findMany({
-      where: { strategyId },
+      where: { accountId: this.accountId, strategyId },
       orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
     });
 
@@ -964,11 +1055,17 @@ export class PrismaParameterChangeRepository implements ParameterChangeRepositor
  */
 @Injectable()
 export class PrismaPerSymbolLimitChangeRepository implements PerSymbolLimitChangeRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async append(change: PerSymbolLimitChange): Promise<void> {
     await this.prisma.perSymbolLimitChange.create({
       data: {
+        accountId: this.accountId,
         id: change.id,
         symbol: change.symbol,
         oldValue: toDecimalOrNull(change.oldValue),
@@ -981,6 +1078,7 @@ export class PrismaPerSymbolLimitChangeRepository implements PerSymbolLimitChang
 
   async findAll(): Promise<PerSymbolLimitChange[]> {
     const rows = await this.prisma.perSymbolLimitChange.findMany({
+      where: { accountId: this.accountId },
       orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
     });
 
@@ -989,7 +1087,7 @@ export class PrismaPerSymbolLimitChangeRepository implements PerSymbolLimitChang
 
   async findBySymbol(symbol: string): Promise<PerSymbolLimitChange[]> {
     const rows = await this.prisma.perSymbolLimitChange.findMany({
-      where: { symbol },
+      where: { accountId: this.accountId, symbol },
       orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
     });
 
@@ -1035,7 +1133,12 @@ function toPerSymbolLimitChange(row: {
  */
 @Injectable()
 export class PrismaStrategyStateSnapshotRepository implements StrategyStateSnapshotRepository {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
 
   async save(snapshot: StrategyStateSnapshotRecord): Promise<void> {
     const instance = {
@@ -1046,16 +1149,17 @@ export class PrismaStrategyStateSnapshotRepository implements StrategyStateSnaps
 
     await this.prisma.$transaction([
       this.prisma.strategyInstance.upsert({
-        where: { id: snapshot.strategyId },
+        where: { accountId_id: { accountId: this.accountId, id: snapshot.strategyId } },
         // `enabled` is set only on create. A snapshot records what the strategy
         // *held*, not whether an operator has it switched on — overwriting the
         // flag here would let a state write silently re-enable a disabled
         // strategy.
-        create: { id: snapshot.strategyId, enabled: true, ...instance },
+        create: { accountId: this.accountId, id: snapshot.strategyId, enabled: true, ...instance },
         update: instance,
       }),
       this.prisma.strategyStateSnapshot.create({
         data: {
+          accountId: this.accountId,
           strategyId: snapshot.strategyId,
           version: snapshot.version,
           symbols: snapshot.symbols as unknown as Prisma.InputJsonValue,
@@ -1072,7 +1176,7 @@ export class PrismaStrategyStateSnapshotRepository implements StrategyStateSnaps
     // autoincrement id is the tiebreak that makes "newest" total rather than
     // arbitrary. Without it recovery could load an older anchor at random.
     const row = await this.prisma.strategyStateSnapshot.findFirst({
-      where: { strategyId },
+      where: { accountId: this.accountId, strategyId },
       orderBy: [{ capturedAt: 'desc' }, { id: 'desc' }],
     });
 
@@ -1081,7 +1185,7 @@ export class PrismaStrategyStateSnapshotRepository implements StrategyStateSnaps
 
   async findAll(strategyId: string): Promise<StrategyStateSnapshotRecord[]> {
     const rows = await this.prisma.strategyStateSnapshot.findMany({
-      where: { strategyId },
+      where: { accountId: this.accountId, strategyId },
       orderBy: [{ capturedAt: 'asc' }, { id: 'asc' }],
     });
 
@@ -1089,7 +1193,7 @@ export class PrismaStrategyStateSnapshotRepository implements StrategyStateSnaps
   }
 
   async clear(): Promise<void> {
-    await this.prisma.strategyStateSnapshot.deleteMany();
+    await this.prisma.strategyStateSnapshot.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 

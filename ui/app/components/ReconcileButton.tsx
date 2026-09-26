@@ -24,6 +24,7 @@
 
 import { useState, useTransition } from 'react';
 import { reconcileNow, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import type { GridOrderReconciliationReport, OrderReconciliationReport } from '../lib/api';
 
 export function ReconcileButton({
@@ -41,13 +42,14 @@ export function ReconcileButton({
    */
   gridLastRun?: GridOrderReconciliationReport | null;
 }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [confirming, setConfirming] = useState(false);
 
   function run() {
     setConfirming(false);
-    startTransition(async () => setResult(await reconcileNow()));
+    startTransition(async () => setResult(await reconcileNow(account)));
   }
 
   return (

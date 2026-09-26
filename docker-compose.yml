@@ -19,6 +19,24 @@
 #
 # Leave `IB_HOST` unset entirely and the stack runs on mock data with no IB at
 # all, which is what every test and the whole mock-data path depend on.
+#
+# ## One backend per account
+#
+# Each IB account is traded by its own backend daemon (`ACCOUNT_ALIAS` names
+# its entry in `backend/src/config/accounts.config.ts`), all sharing the one
+# MySQL. Separate processes are the isolation: a crash, stuck timer, or halt in
+# one account cannot reach another. `backend` below is the `nuuixl118` daemon;
+# the commented `backend-<alias>` block after it is the template for adding
+# another account by hand. The UI finds every daemon through `ACCOUNT_BACKENDS`.
+#
+# **Accounts can also be created from the dashboard** (`/accounts/new`), and
+# that is the simpler path. The `backend` container runs a supervisor
+# (`src/supervisor/`) which starts the `nuuixl118` daemon on 3000 plus one
+# daemon per dashboard-created account on 3101, 3102, … — each its own process,
+# trading in parallel, all through this container's IB_HOST/IB_PORT login. The
+# UI reaches those ports over the compose network via `API_URL`'s host, so they
+# are not published. They take IB client ids 11, 13, 15, …; a hand-configured
+# daemon below should stay under 11.
 
 services:
   # IB Gateway, headless, with IBC driving the login (`stories.md:583`).
@@ -128,14 +146,23 @@ services:
       - mysql-data:/var/lib/mysql
     restart: unless-stopped
 
-  backend:
+  # The daemon for account `nuuixl118`. Its service and container names predate
+  # accounts and are kept so an existing deployment upgrades in place.
+  backend: &backend
     build:
       context: ./backend
     container_name: ib-backend
-    environment:
-      # SHADOW is the default and stays so until Story 13. Overriding this in a
-      # compose file is not how PAPER/LIVE get enabled — see the Story 5 guards.
-      EXECUTION_MODE: ${EXECUTION_MODE:-SHADOW}
+    environment: &backend-env
+      # Which `accounts.config.ts` entry this daemon trades. Every row it
+      # writes is owned by this alias.
+      ACCOUNT_ALIAS: ${ACCOUNT_ALIAS:-nuuixl118}
+      # The IB account id (DU…/U…) behind that alias. Required whenever IB_HOST
+      # is set; every IB read is filtered to it and every order is sent with
+      # it. Lives only in the gitignored `.env` so the id never enters git.
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      # PAPER is the default since Story 13; SHADOW is retired and refused at
+      # boot. LIVE stays refused by the startup assertions until Story 15.
+      EXECUTION_MODE: ${EXECUTION_MODE:-PAPER}
       PORT: 3000
       # Presence of this variable is what selects the Prisma repositories over
       # the in-memory ones (`engine.module.ts`). Unset it and the engine still
@@ -179,6 +206,28 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ── Template: a second account ─────────────────────────────────────────────
+  # Uncomment, rename `second` to the alias you added to accounts.config.ts,
+  # and add its URL to ACCOUNT_BACKENDS on the ui service. Everything not
+  # overridden here is inherited from `backend` above. Each daemon needs:
+  #   - its own container name and published port,
+  #   - its own IB_CLIENT_ID (IB drops two connections sharing one; each daemon
+  #     also uses client id + 1 for its execution stream, so leave a gap of 2),
+  #   - its own IB_ACCOUNT_ID, and IB_HOST/IB_PORT for the login that manages it.
+  #
+  # backend-second:
+  #   <<: *backend
+  #   container_name: ib-backend-second
+  #   environment:
+  #     <<: *backend-env
+  #     ACCOUNT_ALIAS: second
+  #     IB_ACCOUNT_ID: ${SECOND_IB_ACCOUNT_ID:-}
+  #     IB_HOST: ${SECOND_IB_HOST:-}
+  #     IB_PORT: ${SECOND_IB_PORT:-4002}
+  #     IB_CLIENT_ID: ${SECOND_IB_CLIENT_ID:-3}
+  #   ports:
+  #     - '3002:3000'
+
   ui:
     build:
       context: ./ui
@@ -189,6 +238,10 @@ services:
       # inside this container. `localhost:3000` here would be the ui container
       # itself; the backend is reachable only by its compose service name.
       API_URL: ${API_URL:-http://backend:3000}
+      # Every account daemon the dashboard's switcher offers, comma-separated.
+      # Each one is asked who it is (`GET /account`), so this list carries URLs
+      # only — never an account label that could disagree with the daemon.
+      ACCOUNT_BACKENDS: ${ACCOUNT_BACKENDS:-http://backend:3000}
     ports:
       - '3001:3001'
     depends_on:

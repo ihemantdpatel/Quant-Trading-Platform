@@ -1,74 +1,64 @@
 /**
- * Operator shell tests (`stories.md:465`).
+ * Root shell tests.
  *
- * The property under test: **the kill switch is present on every dashboard
- * route** (`PRD.md:383`) — including when the backend cannot be reached. It
- * lives in the layout precisely so that holds on all three tabs, and these
- * assertions are what keep it there.
+ * The root layout holds what spans accounts. The properties pinned here:
  *
- * The unreachable-backend case is the one worth having a test for. A shell that
- * renders its controls only after a successful fetch hides the kill switch
- * during exactly the kind of incident where an operator wants it.
+ * - **Kill-all is on screen on every route, even with every backend down** —
+ *   it is the only kill control on `/backtest`, which belongs to no account.
+ * - **Every configured account is listed**, an unreachable one included and
+ *   disabled, so "unreachable" never looks like "not configured".
  *
  * The layout renders `<html>`/`<body>`, so these tests assert against
  * `document.body` content rather than a container subtree.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import RootLayout from './layout';
-import { loadStatus, type Status, type StatusData } from './lib/api';
+import { loadAccounts, type AccountEntry } from './lib/api';
 
 jest.mock('./lib/api', () => {
   const actual = jest.requireActual('./lib/api');
-  return { ...actual, loadStatus: jest.fn() };
+  return { ...actual, loadAccounts: jest.fn() };
 });
 
 jest.mock('./actions', () => ({
-  setKillSwitch: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
-  setMode: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
-  setStrategyEnabled: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
-  editParameters: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
-  runReplay: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
-  resetEngine: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
+  killAllAccounts: jest.fn().mockResolvedValue({ ok: true, message: 'ok', outcomes: [] }),
 }));
 
-// Both use App Router hooks that have no provider in a bare render. Their own
-// suites cover them; the shell's job is only to place them.
+jest.mock('next/navigation', () => ({
+  usePathname: () => '/accounts/nuuixl118',
+  useRouter: () => ({ push: jest.fn(), refresh: jest.fn() }),
+}));
+
+// Its own suite covers it; the shell's job is only to place it.
 jest.mock('./components/AutoRefresh', () => ({ AutoRefresh: () => null }));
-jest.mock('./components/Tabs', () => ({ Tabs: () => null }));
 
-const mockLoad = loadStatus as jest.MockedFunction<typeof loadStatus>;
+const mockAccounts = loadAccounts as jest.MockedFunction<typeof loadAccounts>;
 
-function status(overrides: Partial<Status> = {}): Status {
+function entry(alias: string | null, overrides: Partial<AccountEntry> = {}): AccountEntry {
   return {
-    mode: 'SHADOW',
-    broker: {
-      name: 'mock',
-      connected: true,
-      state: 'CONNECTED',
-      reconnectAttempts: 0,
-      lastError: null,
-    },
-    halts: {
-      killSwitch: { engaged: false, reason: null, changedAt: null },
-      dailyLossBreaker: { halted: false },
-      entryHalt: { halted: false, reason: null },
-    },
-    alerts: [],
-    strategies: [{ id: 'dip-ladder:TQQQ', enabled: true }],
+    url: `http://${alias ?? 'down'}:3000`,
+    account:
+      alias === null
+        ? null
+        : {
+            alias,
+            label: alias,
+            ibAccountId: 'DU•••567',
+            mode: 'PAPER',
+            allowedModes: ['PAPER'],
+            broker: { name: 'ib', connected: true },
+            halted: false,
+          },
+    error: alias === null ? 'connect ECONNREFUSED' : null,
     ...overrides,
   };
-}
-
-function statusData(overrides: Partial<StatusData> = {}): StatusData {
-  return { status: status(), error: null, ...overrides };
 }
 
 /**
  * React warns that `<html>` cannot nest in the `<div>` RTL mounts into. That is
  * inherent to rendering a root layout in isolation and says nothing about the
  * component, so it is silenced here rather than left to look like a defect.
- * Any *other* console error still surfaces.
  */
 beforeAll(() => {
   const original = console.error;
@@ -89,84 +79,68 @@ async function renderLayout(children: React.ReactNode = <div />) {
 }
 
 describe('RootLayout', () => {
-  it('renders the kill switch', async () => {
-    mockLoad.mockResolvedValue(statusData());
+  it('lists every account, keeping an unreachable one visible but unselectable', async () => {
+    mockAccounts.mockResolvedValue([entry('nuuixl118'), entry(null)]);
 
     await renderLayout();
 
-    expect(screen.getByRole('region', { name: /global kill switch/i })).toBeInTheDocument();
-    expect(screen.getByTestId('kill-switch-state')).toHaveTextContent('ARMED');
+    const switcher = screen.getByRole('combobox', { name: /switch account/i });
+    const options = within(switcher).getAllByRole('option');
+
+    expect(options.map((option) => option.textContent)).toEqual([
+      'nuuixl118 (DU•••567) · PAPER',
+      'http://down:3000 — unreachable',
+    ]);
+    expect(options[1]).toBeDisabled();
+    expect(switcher).toHaveValue('nuuixl118');
   });
 
-  it('renders the kill switch even when the backend is unreachable', async () => {
-    mockLoad.mockResolvedValue({ status: null, error: 'fetch failed' });
+  it('badges the mode of the account on screen', async () => {
+    mockAccounts.mockResolvedValue([entry('nuuixl118')]);
 
     await renderLayout();
 
-    // The control an operator needs during an outage is still there.
-    expect(screen.getByRole('region', { name: /global kill switch/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /engage kill switch/i })).toBeInTheDocument();
-    // And the outage itself is reported rather than rendered as calm state.
-    expect(screen.getByRole('alert')).toHaveTextContent(/fetch failed/i);
+    expect(screen.getByTestId('account-mode')).toHaveTextContent('PAPER');
+    expect(screen.getByTestId('account-health')).toHaveAttribute('title', 'healthy');
   });
 
-  it('reflects an engaged kill switch from server state', async () => {
-    mockLoad.mockResolvedValue(
-      statusData({
-        status: status({
-          halts: {
-            killSwitch: {
-              engaged: true,
-              reason: 'operator',
-              changedAt: '2024-03-04T10:00:00-05:00',
-            },
-            dailyLossBreaker: { halted: false },
-            entryHalt: { halted: false, reason: null },
-          },
-        }),
+  it('marks a halted account in the switcher', async () => {
+    mockAccounts.mockResolvedValue([
+      entry('nuuixl118', {
+        account: { ...entry('nuuixl118').account!, halted: true },
       }),
+    ]);
+
+    await renderLayout();
+
+    expect(screen.getByTestId('account-health')).toHaveAttribute('title', 'halted');
+    expect(screen.getByRole('option', { name: /halted/ })).toBeInTheDocument();
+  });
+
+  it('keeps kill-all on screen even when no backend answers', async () => {
+    mockAccounts.mockResolvedValue([entry(null)]);
+
+    await renderLayout();
+
+    expect(screen.getByRole('button', { name: /kill all accounts/i })).toBeInTheDocument();
+  });
+
+  it('offers account creation from every route, even with every backend down', async () => {
+    mockAccounts.mockResolvedValue([entry(null)]);
+
+    await renderLayout();
+
+    expect(screen.getByRole('link', { name: 'Add account' })).toHaveAttribute(
+      'href',
+      '/accounts/new',
     );
-
-    await renderLayout();
-
-    expect(screen.getByTestId('kill-switch-state')).toHaveTextContent('ENGAGED');
   });
 
-  it('surfaces an entry halt and states positions are not liquidated', async () => {
-    mockLoad.mockResolvedValue(
-      statusData({
-        status: status({
-          halts: {
-            killSwitch: { engaged: false, reason: null, changedAt: null },
-            dailyLossBreaker: { halted: false },
-            entryHalt: { halted: true, reason: 'broker connection failed' },
-          },
-        }),
-      }),
-    );
-
-    await renderLayout();
-
-    const alert = screen.getByRole('alert');
-    expect(alert).toHaveTextContent(/new entries are halted/i);
-    expect(alert).toHaveTextContent(/held, not liquidated/i);
-  });
-
-  it('renders no alert when the engine is healthy', async () => {
-    mockLoad.mockResolvedValue(statusData());
-
-    await renderLayout();
-
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-  });
-
-  it('renders the active tab content beneath the shell', async () => {
-    mockLoad.mockResolvedValue(statusData());
+  it('renders the page beneath the shell', async () => {
+    mockAccounts.mockResolvedValue([entry('nuuixl118')]);
 
     await renderLayout(<p>execution tab</p>);
 
     expect(screen.getByText('execution tab')).toBeInTheDocument();
-    // Still alongside the shell, not instead of it.
-    expect(screen.getByRole('region', { name: /global kill switch/i })).toBeInTheDocument();
   });
 });

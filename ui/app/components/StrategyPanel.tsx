@@ -17,15 +17,17 @@
 
 import { useState, useTransition } from 'react';
 import { setStrategyEnabled, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import type { StrategySummary } from '../lib/api';
 
 export function StrategyPanel({ strategies }: { strategies: StrategySummary[] }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
 
   function toggle(id: string, enabled: boolean) {
     startTransition(async () => {
-      setResult(await setStrategyEnabled(id, enabled));
+      setResult(await setStrategyEnabled(account, id, enabled));
     });
   }
 

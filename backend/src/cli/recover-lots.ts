@@ -54,6 +54,12 @@
 
 import { PrismaClient } from '@prisma/client';
 import {
+  ACCOUNTS,
+  activeAccountAlias,
+  environmentAccount,
+  findAccount,
+} from '../config/accounts.config';
+import {
   buildRecoveryPlan,
   refuseReason,
   ProposedLot,
@@ -76,11 +82,16 @@ Options:
                           given, the weighted reconstruction is validated
                           against it and refuses to write if it lands below.
   --take-profit <PCT>     Take-profit fraction (default 0.05).
+  --account <ALIAS>       Account whose ledger to repair (default: ACCOUNT_ALIAS,
+                          else the default account). Must name an entry in
+                          accounts.config.ts.
   --apply                 Write the lots. Without this the script only reports.
   --help, -h              Show this message.
 `;
 
 export interface RecoverLotsArgs {
+  /** The account alias whose rows are read and written — never any other's. */
+  account: string;
   symbol: string;
   brokerQuantity: number;
   averageCost: number | null;
@@ -88,7 +99,10 @@ export interface RecoverLotsArgs {
   apply: boolean;
 }
 
-export function parseRecoverLotsArgs(argv: string[]): RecoverLotsArgs {
+export function parseRecoverLotsArgs(
+  argv: string[],
+  env: Record<string, string | undefined> = process.env,
+): RecoverLotsArgs {
   const value = (flag: string): string | null => {
     const index = argv.indexOf(flag);
     return index >= 0 && index + 1 < argv.length ? argv[index + 1] : null;
@@ -126,7 +140,23 @@ export function parseRecoverLotsArgs(argv: string[]): RecoverLotsArgs {
     throw new Error(`--take-profit must be a positive number, got ${rawTakeProfit}`);
   }
 
+  // Defaults to the daemon's own account, so running the script inside that
+  // daemon's container repairs the ledger that daemon trades. An unknown alias
+  // is refused rather than defaulted: repairing the wrong account's ledger
+  // would attach lots to shares held somewhere else entirely.
+  const account = value('--account') ?? activeAccountAlias(env);
+
+  // A dashboard-created account is known to this process only through the
+  // ACCOUNT_DEFINITION its supervisor passed, so it is accepted only as the
+  // daemon's own account — run the script with that daemon's environment.
+  if (findAccount(account) === null && environmentAccount(env)?.alias !== account) {
+    throw new Error(
+      `--account "${account}" is not in accounts.config.ts (known: ${Object.keys(ACCOUNTS).join(', ')})`,
+    );
+  }
+
   return {
+    account,
     symbol,
     brokerQuantity,
     averageCost,
@@ -162,7 +192,8 @@ export async function runRecoverLots(
   const prisma = new PrismaClient();
 
   try {
-    const existing = await prisma.lot.findMany({ where: { symbol: args.symbol } });
+    const accountId = args.account;
+    const existing = await prisma.lot.findMany({ where: { accountId, symbol: args.symbol } });
 
     if (existing.length > 0) {
       out.write(
@@ -172,14 +203,14 @@ export async function runRecoverLots(
       return 1;
     }
 
-    const rungs = await prisma.rung.findMany({ where: { symbol: args.symbol } });
+    const rungs = await prisma.rung.findMany({ where: { accountId, symbol: args.symbol } });
     const workingRungs = rungs.filter((rung) => rung.workingOrderId !== null);
     const rungByOrder = new Map(
       workingRungs.map((rung) => [rung.workingOrderId!, Number(rung.price)]),
     );
 
     const orders = await prisma.order.findMany({
-      where: { symbol: args.symbol, side: 'BUY' },
+      where: { accountId, symbol: args.symbol, side: 'BUY' },
     });
 
     const strandedOrders = orders.filter((order) => rungByOrder.has(order.clientOrderId));
@@ -202,7 +233,7 @@ export async function runRecoverLots(
       args.takeProfitPercent,
     );
 
-    out.write(`\n${args.symbol} — proposed reconstruction\n\n`);
+    out.write(`\n${args.symbol} (account ${accountId}) — proposed reconstruction\n\n`);
 
     for (const lot of plan.lots) {
       out.write(
@@ -237,6 +268,7 @@ export async function runRecoverLots(
       for (const lot of plan.lots) {
         await tx.lot.create({
           data: {
+            accountId,
             id: lot.id,
             symbol: lot.symbol,
             rungPrice: lot.rungPrice,
@@ -255,12 +287,14 @@ export async function runRecoverLots(
         // release the level, and the ladder would re-enter on top of shares it
         // already holds.
         await tx.rung.update({
-          where: { symbol_price: { symbol: lot.symbol, price: lot.rungPrice } },
+          where: {
+            accountId_symbol_price: { accountId, symbol: lot.symbol, price: lot.rungPrice },
+          },
           data: { status: 'HELD', lotId: lot.id, workingOrderId: null },
         });
 
         await tx.order.update({
-          where: { clientOrderId: lot.clientOrderId },
+          where: { accountId_clientOrderId: { accountId, clientOrderId: lot.clientOrderId } },
           data: { status: 'FILLED' },
         });
       }
@@ -275,7 +309,7 @@ export async function runRecoverLots(
       // bind" (`invalidation.ts:46`) on a ladder that is anything but.
       const snapshot = strategyId
         ? await tx.strategyStateSnapshot.findFirst({
-            where: { strategyId },
+            where: { accountId, strategyId },
             orderBy: [{ capturedAt: 'desc' }, { id: 'desc' }],
           })
         : null;
@@ -293,6 +327,7 @@ export async function runRecoverLots(
         // history would destroy the record of what the ladder actually held.
         await tx.strategyStateSnapshot.create({
           data: {
+            accountId,
             strategyId: snapshot.strategyId,
             version: snapshot.version,
             symbols: snapshot.symbols ?? [args.symbol],

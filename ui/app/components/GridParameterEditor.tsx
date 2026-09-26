@@ -23,6 +23,7 @@
 
 import { useState, useTransition } from 'react';
 import { editParameters, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import type { GridParameters, ParameterChange, RiskLimitChange } from '../lib/api';
 import { Field, ParameterChangeLog } from './ParameterFields';
 import { RiskLimitEditor } from './RiskLimitEditor';
@@ -68,6 +69,7 @@ export function GridParameterEditor({
   riskLimit?: number | null;
   riskLimitChanges?: RiskLimitChange[];
 }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [reason, setReason] = useState('');
@@ -88,7 +90,7 @@ export function GridParameterEditor({
     }
 
     startTransition(async () => {
-      setResult(await editParameters(strategyId, payload, reason));
+      setResult(await editParameters(account, strategyId, payload, reason));
       setReason('');
     });
   }

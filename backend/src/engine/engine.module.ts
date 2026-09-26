@@ -13,7 +13,8 @@
  * ever running together.
  */
 
-import { Inject, Logger, Module, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { AccountsController } from '../api/accounts.controller';
+import { Inject, Logger, Module, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { BacktestController } from '../api/backtest.controller';
 import { BacktestService } from '../backtest/backtest.service';
 import { EngineController } from '../api/engine.controller';
@@ -50,6 +51,7 @@ import {
 } from '../reconciliation/order-diagnosis.service';
 import { LotRebuildService } from '../reconciliation/lot-rebuild.service';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
+import { AccountRegistrationService } from '../repositories/prisma/account-registration.service';
 import { RepositoriesModule } from '../repositories/repositories.module';
 import {
   BAR_REPOSITORY,
@@ -113,6 +115,7 @@ import { StartupSequence } from './startup.sequence';
     StrategiesModule,
   ],
   controllers: [
+    AccountsController,
     BacktestController,
     EngineController,
     ParametersController,
@@ -247,6 +250,8 @@ import { StartupSequence } from './startup.sequence';
             host: config.ibHost!,
             port: config.ibPort,
             clientId: config.ibClientId,
+            // Validated as present whenever IB_HOST is set (`config.schema.ts`).
+            accountId: config.ibAccountId!,
           }),
         );
       },
@@ -321,6 +326,7 @@ import { StartupSequence } from './startup.sequence';
           symbolHalts,
           snapshots,
           gridLots,
+          appConfig.accountAlias,
         ),
       inject: [
         ReplayService,
@@ -419,9 +425,36 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     private readonly gridReconciliation: GridReconciliationService,
     private readonly orderDiagnosis: OrderDiagnosisService,
     private readonly appConfig: AppConfigService,
+    // Present only with durable storage (`repositories.module.ts`).
+    @Optional() private readonly accountRegistration?: AccountRegistrationService,
   ) {}
 
   async onModuleInit(): Promise<void> {
+    // **The IB account id is pinned only once IB has confirmed it.** A
+    // `CONNECTED` from the IB adapter means `connect()` resolved, which the
+    // socket allows only after `checkManagedAccount` passed — so this is the
+    // first moment the configured id is known to be real. Every CONNECTED
+    // re-runs it; after the first it is a no-op. A failure is logged, never
+    // thrown: the process is already running, and boot has already refused
+    // every contradiction with an existing pin.
+    if (this.accountRegistration && this.appConfig.usesIbBroker) {
+      const registration = this.accountRegistration;
+
+      this.broker.onConnectionChange((health) => {
+        if (health.state === ConnectionState.CONNECTED) {
+          registration
+            .confirmBrokerAccount()
+            .catch((error: unknown) =>
+              this.logger.error(
+                `could not record the IB-confirmed account: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              ),
+            );
+        }
+      });
+    }
+
     // Forward every risk event into the repository the API serves.
     //
     // Wired here rather than by rebinding `RISK_EVENT_SINK` to the repository:

@@ -26,6 +26,7 @@ import { Global, Module, Provider } from '@nestjs/common';
 import { AppConfigModule } from '../config/config.module';
 import { AppConfigService } from '../config/app-config.service';
 import {
+  InMemoryAccountDefinitionRepository,
   InMemoryBacktestRepository,
   InMemoryBarRepository,
   InMemoryFillRepository,
@@ -55,8 +56,12 @@ import {
   PrismaRungRepository,
   PrismaStrategyStateSnapshotRepository,
 } from './prisma/prisma.repositories';
+import { PrismaAccountDefinitionRepository } from './prisma/prisma-account-definition.repository';
+import { AccountRegistrationService } from './prisma/account-registration.service';
 import { PrismaService } from './prisma/prisma.service';
+import { ACCOUNT_ID } from './account-scope';
 import {
+  ACCOUNT_DEFINITION_REPOSITORY,
   BACKTEST_REPOSITORY,
   BAR_REPOSITORY,
   FILL_REPOSITORY,
@@ -89,7 +94,7 @@ const useDatabase = Boolean(process.env.DATABASE_URL);
  * fail at `onModuleInit` in exactly the zero-dependency setup that is supposed
  * to work.
  */
-const prismaProviders: Provider[] = useDatabase ? [PrismaService] : [];
+const prismaProviders: Provider[] = useDatabase ? [PrismaService, AccountRegistrationService] : [];
 
 const repositoryProviders: Provider[] = useDatabase
   ? [
@@ -112,6 +117,7 @@ const repositoryProviders: Provider[] = useDatabase
         useClass: PrismaStrategyStateSnapshotRepository,
       },
       { provide: BACKTEST_REPOSITORY, useClass: PrismaBacktestRepository },
+      { provide: ACCOUNT_DEFINITION_REPOSITORY, useClass: PrismaAccountDefinitionRepository },
     ]
   : [
       { provide: BAR_REPOSITORY, useClass: InMemoryBarRepository },
@@ -133,6 +139,7 @@ const repositoryProviders: Provider[] = useDatabase
         useClass: InMemoryStrategyStateSnapshotRepository,
       },
       { provide: BACKTEST_REPOSITORY, useClass: InMemoryBacktestRepository },
+      { provide: ACCOUNT_DEFINITION_REPOSITORY, useClass: InMemoryAccountDefinitionRepository },
     ];
 
 /** Whether the process is running against durable storage. Reported on `GET /status`. */
@@ -147,6 +154,13 @@ export type StorageMode = 'DURABLE' | 'IN_MEMORY';
     ...prismaProviders,
     ...repositoryProviders,
     {
+      // The one place the process's account becomes the repositories' scope.
+      // Every Prisma repository injects it, so no query can run unscoped.
+      provide: ACCOUNT_ID,
+      useFactory: (config: AppConfigService): string => config.accountAlias,
+      inject: [AppConfigService],
+    },
+    {
       provide: STORAGE_MODE,
       useFactory: (config: AppConfigService): StorageMode =>
         config.hasDurableStorage ? 'DURABLE' : 'IN_MEMORY',
@@ -155,6 +169,7 @@ export type StorageMode = 'DURABLE' | 'IN_MEMORY';
   ],
   exports: [
     ...prismaProviders,
+    ACCOUNT_ID,
     BAR_REPOSITORY,
     ORDER_INTENT_REPOSITORY,
     ORDER_REPOSITORY,
@@ -168,6 +183,7 @@ export type StorageMode = 'DURABLE' | 'IN_MEMORY';
     PER_SYMBOL_LIMIT_CHANGE_REPOSITORY,
     STRATEGY_STATE_SNAPSHOT_REPOSITORY,
     BACKTEST_REPOSITORY,
+    ACCOUNT_DEFINITION_REPOSITORY,
     STORAGE_MODE,
   ],
 })

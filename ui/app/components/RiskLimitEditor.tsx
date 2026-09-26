@@ -12,6 +12,7 @@
 
 import { useState, useTransition } from 'react';
 import { editRiskLimit, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import type { RiskLimitChange } from '../lib/api';
 import { Field } from './ParameterFields';
 
@@ -26,6 +27,7 @@ export function RiskLimitEditor({
   riskLimit?: number | null;
   riskLimitChanges?: RiskLimitChange[];
 }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [reason, setReason] = useState('');
@@ -39,7 +41,7 @@ export function RiskLimitEditor({
     const limit = typeof raw === 'string' ? Number(raw) : NaN;
 
     startTransition(async () => {
-      setResult(await editRiskLimit(symbol, limit, reason));
+      setResult(await editRiskLimit(account, symbol, limit, reason));
       setReason('');
     });
   }

@@ -41,7 +41,7 @@ All backend commands run from `backend/`.
 
 | Command | Purpose |
 |---|---|
-| `npm test` | Full suite (1568 tests), no database required |
+| `npm test` | Full suite (2001 tests), no database required |
 | `npm run test:cov` | Suite + coverage thresholds — what CI gates on |
 | `npm run test:db` | The Prisma suites; needs `DATABASE_URL` |
 | `npm run test:watch` | Watch mode |
@@ -852,6 +852,76 @@ from a mismatch nothing was attempted for.
   acceptable with real money at stake, whether it should require explicit operator confirmation even
   in `LIVE` testing, and whether a size cap belongs alongside the frequency cap.
 
+### Accounts — one daemon per IB account
+
+`docs/decisions/accounts.md` is the decision record. **Every row that belongs to trading is owned by an
+account; one backend process trades exactly one account.** Two accounts trade concurrently by running
+two daemons against the one MySQL — isolation comes from the process boundary, so no singleton service
+(engine, risk manager, halts, kill switch, reconciliation, broker adapter) had to learn about accounts.
+
+- **`ACCOUNT_ALIAS` names the daemon's entry in `src/config/accounts.config.ts`**: label, permitted modes,
+  equity, currency, symbol capital, loss threshold. Unknown alias → refused at config validation. Default
+  `nuuixl118`, the account that predates accounts, so the zero-dependency path is unchanged.
+- **The IB account id never enters git.** It is `IB_ACCOUNT_ID` in the gitignored `.env`, required
+  whenever `IB_HOST` is set. `AccountRegistrationService` (Prisma only) pins alias ↔ id in the `Account`
+  table on the first IB boot and refuses a later boot pairing them differently, or claiming an id
+  another alias owns (`src/config/account-registration.ts` holds the pure decision).
+- **Repositories are scoped at construction** via the `ACCOUNT_ID` token — no method takes an account,
+  so no call site can forget one. Every per-account table has `accountId` in its primary key
+  (`Order(accountId, clientOrderId)`, `Rung(accountId, symbol, price)`, …). `Instrument`, `Bar`, and the
+  backtest tables are shared. In-memory repositories ignore it: their rows live in the one process.
+- **Every IB read is filtered to the account and every order carries it** (`ib-wire.ts`:
+  `belongsToAccount`, `entriesForAccount`, `toIbOrder(order, account)`). Before this, `getPositions`
+  flattened every account the login managed. A login that does not manage `IB_ACCOUNT_ID` fails the
+  connect (`checkManagedAccount`) — an unfiltered empty answer would otherwise read as flat.
+- **`clientOrderId` is `co-<alias>-N`** (`src/domain/client-order-id.ts`). Legacy `co-N` ids belong to
+  the default account; the sequence continues past them. Orphan adoption refuses another alias's ids.
+  Engines constructed without an alias (the unit suites) still issue `co-N`.
+- **Mode is per account too**: `allowedModes` is checked by the startup assertions and `POST /mode`,
+  independently of `allowLiveTrading`. `nuuixl118` permits `PAPER` only.
+- `GET /account` is the daemon's self-description (alias, label, masked IB id, mode, halted) — the
+  dashboard's switcher asks each daemon rather than trusting a URL→account map.
+- `recover:lots` takes `--account` (default: `ACCOUNT_ALIAS`) and refuses an unknown alias.
+
+**The dashboard** lists daemons in `ACCOUNT_BACKENDS` (URLs only). Account pages live under
+`/accounts/[accountId]/…`; `/` redirects to the last-viewed reachable account. The account layout holds
+that account's kill switch, alerts, and order controls; every Server Action takes the account
+explicitly from `AccountContext` — never from a cookie or a default — and refuses when it is missing,
+unclaimed, or claimed by two daemons. The root layout holds the switcher and **Kill all accounts**,
+which only ever engages and reports each account it could not reach.
+
+### Dashboard-created accounts and the supervisor
+
+`docs/decisions/accounts.md` (amendment of 2026-09-24) is the record. **Accounts can be created at
+`/accounts/new`, and each still trades in its own process, in parallel with every other.**
+
+- **The backend container runs `dist/supervisor-main.js`, not `main.js`.** `Supervisor`
+  (`src/supervisor/`) starts the configured account's daemon unchanged (port 3000) plus one `main.js`
+  child per `AccountDefinition` row, re-reads the table every 10s, and restarts any daemon that exits
+  (1s doubling to a 5-min cap, reset after a 60s stable run). Compose's `restart` watches only the
+  container, so without this a crashed account would stay down unnoticed. It holds no trading state
+  and has no broker; stopping a daemon never touches positions. `npm start` still runs one daemon.
+- **A failed registry read changes nothing** — "could not ask the database" is not "no accounts", and
+  stopping every daemon on a DB blip would turn a read error into an outage across accounts.
+- **The definition reaches the child as `ACCOUNT_DEFINITION` JSON**, so `capital.config.ts`'s
+  import-time constants resolve exactly as for a code-registry account. `config.schema.ts` accepts an
+  alias outside `ACCOUNTS` only with a matching definition, and refuses a definition for a code alias
+  — an environment variable must not substitute capital figures for reviewed source.
+  `resolveActiveAccount` / `environmentAccount` in `accounts.config.ts` implement the same rule.
+- **`POST /accounts` writes a row and nothing else** (`AccountsController`); the supervisor starts the
+  daemon. `planAccountDefinition` (pure) refuses a code alias, an existing alias, an alias with rows
+  from a hand-configured daemon, an IB id another account or the serving daemon holds, a missing
+  `TQQQ` allocation, and no IB id when IB is bound. It allocates client ids 11, 13, 15… (each daemon
+  also uses `clientId + 1`) and ports 3101, 3102…; unique keys decide a creation race (409). 503
+  without `DATABASE_URL`. Create-only — no edit or retire yet.
+- **`LIVE` is selectable and still cannot trade.** It becomes the account's only allowed mode, but
+  the startup assertions refuse it until Story 15; the daemon exits and is retried slowly.
+- **The UI discovers created accounts** through `GET /accounts` on `API_URL`, building each URL from
+  that host plus the account's port (`managedAccountUrl`), merged with `ACCOUNT_BACKENDS`. A registry
+  that cannot be read adds nothing rather than failing discovery — kill-all depends on the configured
+  list. `accountFromPath` treats `/accounts/new` as no account; the backend reserves the alias.
+- `recover:lots` accepts a dashboard-created alias only when run with that daemon's environment.
+
 ### The IB adapter (Story 10)
 
 `IB_HOST` is the **only** switch. Set → `IBBrokerAdapter` and the live bar feed; unset → the mock
@@ -1041,17 +1111,20 @@ The resolution is coverage-based: a range is cached when no interior span exceed
 
 ### The capital decisions (Story 13) — now set
 
-The two `PRD.md:500` open items are decided. They live in **`src/config/capital.config.ts`**, a
+The two `PRD.md:500` open items are decided, **per account**. The values live in the account's entry
+in **`src/config/accounts.config.ts`**, and `src/config/capital.config.ts` exports the active account's
+as `ACCOUNT_EQUITY` / `ACCOUNT_SYMBOL_CAPITAL` / `ACCOUNT_DAILY_LOSS_*` (formerly `PAPER_*`) — see
+"Accounts" below. The originals live in
 reviewed source file rather than environment variables, on purpose: which instrument this system
 trades and how much it may deploy belong in a diff someone read, not a deployment variable changeable
 without review. The reasoning is recorded in `docs/decisions/`, which Story 13 requires.
 
 | Value | Setting |
 |---|---|
-| `PAPER_SYMBOL_CAPITAL.TQQQ` | USD 40,000 — *expected deployment, not a ceiling* |
-| `PAPER_ACCOUNT_EQUITY` | USD 175,000 — hand-converted from CAD |
-| `PAPER_DAILY_LOSS_THRESHOLD` | USD 5,000 |
-| `PAPER_DAILY_LOSS_BASIS` | `REALIZED_AND_UNREALIZED` |
+| `symbolCapital.TQQQ` (`nuuixl118`) | USD 40,000 — *expected deployment, not a ceiling* |
+| `equity` (`nuuixl118`) | USD 175,000 — hand-converted from CAD |
+| `dailyLossThreshold` | USD 5,000 |
+| `dailyLossBasis` | `REALIZED_AND_UNREALIZED` |
 
 **These were operator-chosen, not backtest-derived.** Story 13 specifies they should be informed by
 Story 11 backtests; they were not. Both decision documents record that deviation. They are sized to
@@ -1075,7 +1148,7 @@ loosened it), which is why it went unnoticed; relying on that cancellation is no
   market data with its own staleness — and a stale rate mis-sizes every order silently, which is
   worse than not booting. Mixing currencies is a configuration error and is reported as one.
 - The resolution taken is to express every figure in USD and convert the balance **once, by hand**.
-  This makes the arithmetic sound but leaves `PAPER_ACCOUNT_EQUITY` carrying *two* sources of
+  This makes the arithmetic sound but leaves the account's `equity` carrying *two* sources of
   staleness — the balance and the rate. The ~2.5% buffer below the converted figure absorbs ordinary
   daily rate movement, **not a trend**.
 - **The real fix is still open** and mandatory before `LIVE`: a live `USD.CAD` rate from IB treated
@@ -1228,7 +1301,7 @@ curl localhost:3000/lots
 
 ## Testing
 
-1568 backend tests across 77 suites, plus database tests (`npm run test:db`, needs MySQL) and 119 UI
+2001 backend tests across 102 suites, plus database tests (`npm run test:db`, needs MySQL) and 266 UI
 component tests. Coverage thresholds are enforced in CI: **80% global, 95% on
 `src/strategies/**` and `src/risk/**`** — those are pure functions where a bug costs real money.
 

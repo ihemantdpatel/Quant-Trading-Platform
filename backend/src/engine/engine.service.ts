@@ -37,6 +37,7 @@ import {
   OrderStatus,
 } from '../broker/broker-adapter.interface';
 import { ExecutionMode } from '../config/execution-mode';
+import { clientOrderSequenceOf, formatClientOrderId } from '../domain/client-order-id';
 import { Contract, equityContract } from '../domain/contract';
 import { ReplayService } from '../market-data/mock/replay.service';
 import { Bar, BarSize } from '../market-data/types';
@@ -378,6 +379,14 @@ export class EngineService {
      * enables the grid strategy.
      */
     @Inject(GRID_LOT_REPOSITORY) private readonly gridLots: GridLotRepository | null = null,
+    /**
+     * The account this engine trades, stamped into every `clientOrderId` it
+     * issues (`co-<alias>-N`) so two daemons sharing a database or an IB login
+     * never issue the same `orderRef`. Optional for the same reason as the
+     * parameters above; absent, ids keep the legacy `co-N` form the unit suites
+     * were written against. `EngineModule` always supplies it.
+     */
+    private readonly accountAlias: string | null = null,
   ) {
     // A broker fault must reach the engine even when no order is in flight —
     // a socket dropping between bars is exactly as significant as one dropping
@@ -710,7 +719,7 @@ export class EngineService {
     recordId: string,
   ): Promise<{ submitted: boolean; fills: number }> {
     this.clientOrderSequence += 1;
-    const clientOrderId = `co-${this.clientOrderSequence}`;
+    const clientOrderId = formatClientOrderId(this.clientOrderSequence, this.accountAlias);
 
     const order: BrokerOrder = {
       clientOrderId,
@@ -2621,20 +2630,22 @@ export class EngineService {
    * id whenever the table has been pruned or a submission failed after
    * incrementing, which is precisely the collision this closes.
    *
-   * Ids that do not match `co-N` are ignored rather than rejected: orders
-   * recovered from IB or written by hand carry the broker's own vocabulary, and
-   * refusing to boot over one would take the dashboard down for a row that
-   * cannot collide with this generator anyway.
+   * Ids this generator did not issue for this account are ignored rather than
+   * rejected: orders recovered from IB or written by hand carry the broker's
+   * own vocabulary, and refusing to boot over one would take the dashboard down
+   * for a row that cannot collide with this generator anyway. Legacy `co-N` ids
+   * *are* counted, so the first account-scoped id continues past the last
+   * legacy one (`client-order-id.ts`).
    */
   async restoreClientOrderSequence(): Promise<void> {
     const orders = await this.orders.findAll();
     let highest = 0;
 
     for (const order of orders) {
-      const match = /^co-(\d+)$/.exec(order.clientOrderId);
+      const sequence = clientOrderSequenceOf(order.clientOrderId, this.accountAlias);
 
-      if (match) {
-        highest = Math.max(highest, Number(match[1]));
+      if (sequence !== null) {
+        highest = Math.max(highest, sequence);
       }
     }
 
@@ -2643,7 +2654,8 @@ export class EngineService {
     if (highest > this.clientOrderSequence) {
       this.clientOrderSequence = highest;
       this.logger.log(
-        `client order sequence resumed at co-${highest} — ${orders.length} persisted order(s)`,
+        `client order sequence resumed at ${formatClientOrderId(highest, this.accountAlias)} — ` +
+          `${orders.length} persisted order(s)`,
       );
     }
   }

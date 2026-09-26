@@ -19,24 +19,30 @@ function current(): string | null {
 }
 
 describe('Tabs', () => {
-  it('links to all three views', () => {
-    mockPathname.mockReturnValue('/');
+  it('links to all three views within the account on screen', () => {
+    mockPathname.mockReturnValue('/accounts/nuuixl118');
 
     render(<Tabs />);
 
-    expect(screen.getByRole('link', { name: 'Execution' })).toHaveAttribute('href', '/');
-    expect(screen.getByRole('link', { name: 'Parameters' })).toHaveAttribute('href', '/parameters');
+    expect(screen.getByRole('link', { name: 'Execution' })).toHaveAttribute(
+      'href',
+      '/accounts/nuuixl118',
+    );
+    expect(screen.getByRole('link', { name: 'Parameters' })).toHaveAttribute(
+      'href',
+      '/accounts/nuuixl118/parameters',
+    );
     expect(screen.getByRole('link', { name: 'Backtesting' })).toHaveAttribute('href', '/backtest');
   });
 
   it.each([
-    ['/', 'Execution'],
-    ['/parameters', 'Parameters'],
+    ['/accounts/nuuixl118', 'Execution'],
+    ['/accounts/nuuixl118/parameters', 'Parameters'],
     ['/backtest', 'Backtesting'],
   ])('marks the tab for %s as current', (pathname, expected) => {
     mockPathname.mockReturnValue(pathname);
 
-    render(<Tabs />);
+    render(<Tabs fallbackAccount="nuuixl118" />);
 
     expect(current()).toBe(expected);
   });
@@ -45,14 +51,14 @@ describe('Tabs', () => {
     // A run selected by query or a deeper segment is still that tab.
     mockPathname.mockReturnValue('/backtest/run-1');
 
-    render(<Tabs />);
+    render(<Tabs fallbackAccount="nuuixl118" />);
 
     expect(current()).toBe('Backtesting');
   });
 
-  it('does not mark Execution current on another tab', () => {
-    // `/` prefix-matches everything, so this is the mistake worth guarding.
-    mockPathname.mockReturnValue('/parameters');
+  it('does not mark Execution current on another tab of the same account', () => {
+    // Execution is the account's root, so it would prefix-match every tab.
+    mockPathname.mockReturnValue('/accounts/nuuixl118/parameters');
 
     render(<Tabs />);
 
@@ -60,5 +66,26 @@ describe('Tabs', () => {
       'aria-current',
       'page',
     );
+  });
+
+  it('links the account tabs to the fallback account from a page with none', () => {
+    mockPathname.mockReturnValue('/backtest');
+
+    render(<Tabs fallbackAccount="second" />);
+
+    expect(screen.getByRole('link', { name: 'Execution' })).toHaveAttribute(
+      'href',
+      '/accounts/second',
+    );
+  });
+
+  it('omits the account tabs entirely when no account is reachable', () => {
+    // Rather than linking to a page every control on which would fail.
+    mockPathname.mockReturnValue('/backtest');
+
+    render(<Tabs fallbackAccount={null} />);
+
+    expect(screen.queryByRole('link', { name: 'Execution' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Backtesting' })).toBeInTheDocument();
   });
 });

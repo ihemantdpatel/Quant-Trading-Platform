@@ -18,6 +18,7 @@
 
 import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
+import { accountFromPath } from '../lib/api';
 
 /**
  * Routes where a timed refresh would destroy work in progress.
@@ -27,7 +28,9 @@ import { usePathname, useRouter } from 'next/navigation';
  * form unusable, so the timer stops here — the manual button still works, and
  * `revalidatePath` after a successful edit still updates the page.
  */
-const PAUSED_PATHS = ['/parameters'];
+function isPaused(pathname: string): boolean {
+  return accountFromPath(pathname)?.rest.startsWith('/parameters') ?? false;
+}
 
 export function AutoRefresh({ intervalMs = 3000 }: { intervalMs?: number }) {
   const router = useRouter();
@@ -35,7 +38,7 @@ export function AutoRefresh({ intervalMs = 3000 }: { intervalMs?: number }) {
   const [enabled, setEnabled] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
 
-  const paused = PAUSED_PATHS.includes(pathname);
+  const paused = isPaused(pathname);
   const polling = enabled && !paused;
 
   useEffect(() => {

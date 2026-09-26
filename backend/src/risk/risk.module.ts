@@ -15,11 +15,12 @@ import { Inject, Module, OnModuleInit } from '@nestjs/common';
 import { AppConfigModule } from '../config/config.module';
 import { AppConfigService } from '../config/app-config.service';
 import {
-  PAPER_ACCOUNT_EQUITY,
-  PAPER_DAILY_LOSS_BASIS,
-  PAPER_ACCOUNT_CURRENCY,
-  PAPER_DAILY_LOSS_THRESHOLD,
-  PAPER_SYMBOL_CAPITAL,
+  ACTIVE_ACCOUNT,
+  ACCOUNT_EQUITY,
+  ACCOUNT_DAILY_LOSS_BASIS,
+  ACCOUNT_CURRENCY,
+  ACCOUNT_DAILY_LOSS_THRESHOLD,
+  ACCOUNT_SYMBOL_CAPITAL,
 } from '../config/capital.config';
 import { KillSwitchService } from './kill-switch.service';
 import { RiskManagerService } from './risk-manager.service';
@@ -83,11 +84,11 @@ export const SHADOW_NOMINAL_EQUITY = 100_000;
       provide: RISK_CONFIG,
       useFactory: (): RiskConfig =>
         buildRiskConfig({
-          accountEquity: PAPER_ACCOUNT_EQUITY,
-          accountCurrency: PAPER_ACCOUNT_CURRENCY,
-          dailyLossThreshold: PAPER_DAILY_LOSS_THRESHOLD,
-          dailyLossBasis: PAPER_DAILY_LOSS_BASIS,
-          perSymbolLimits: PAPER_SYMBOL_CAPITAL,
+          accountEquity: ACCOUNT_EQUITY,
+          accountCurrency: ACCOUNT_CURRENCY,
+          dailyLossThreshold: ACCOUNT_DAILY_LOSS_THRESHOLD,
+          dailyLossBasis: ACCOUNT_DAILY_LOSS_BASIS,
+          perSymbolLimits: ACCOUNT_SYMBOL_CAPITAL,
         }),
     },
     {
@@ -157,6 +158,7 @@ export class RiskModule implements OnModuleInit {
       this.riskConfig,
       this.symbolCapital,
       this.instrumentCurrencies,
+      ACTIVE_ACCOUNT,
     );
   }
 }
