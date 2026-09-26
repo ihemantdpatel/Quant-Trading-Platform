@@ -23,6 +23,7 @@
 
 import { useState, useTransition } from 'react';
 import { setMode, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import type { ExecutionMode } from '../lib/api';
 
 const MODES: ExecutionMode[] = ['SHADOW', 'PAPER', 'LIVE'];
@@ -34,12 +35,13 @@ const MODE_STYLE: Record<ExecutionMode, string> = {
 };
 
 export function ModeSwitch({ mode }: { mode: ExecutionMode }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
 
   function request(next: ExecutionMode) {
     startTransition(async () => {
-      setResult(await setMode(next));
+      setResult(await setMode(account, next));
     });
   }
 

@@ -24,6 +24,7 @@ import {
   TimeInForce as IbTimeInForce,
 } from '@stoqey/ib';
 import { DateTime } from 'luxon';
+import { maskAccountId } from '../../config/account-registration';
 import { Contract, SecurityType } from '../../domain/contract';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
@@ -56,8 +57,14 @@ export function toIbContract(contract: Contract): IbContract {
 }
 
 /** Our `BrokerOrder` → IB's. Exported so payloads are asserted field-by-field. */
-export function toIbOrder(order: BrokerOrder): IbOrder {
+export function toIbOrder(order: BrokerOrder, account?: string): IbOrder {
   return {
+    // **The account the order is for, stated rather than left to the login's
+    // default.** A login that manages several accounts routes an order with no
+    // `account` to whichever one IB considers default — which need not be the
+    // account this daemon's lots, caps, and loss breaker belong to. Omitted only
+    // where no account is configured (tests against a fake socket).
+    ...(account ? { account } : {}),
     action: order.side === 'BUY' ? OrderAction.BUY : OrderAction.SELL,
     orderType: order.orderType === 'LMT' ? IbOrderType.LMT : IbOrderType.MKT,
     totalQuantity: order.quantity,
@@ -173,10 +180,11 @@ export function toCompletedOrder(
   contract: IbContract,
   order: IbOrder,
   state: IbOrderState,
+  accountId?: string,
 ): CompletedOrder | null {
   const clientOrderId = order.orderRef;
 
-  if (!clientOrderId) {
+  if (!clientOrderId || !belongsToAccount(order.account, accountId)) {
     return null;
   }
 
@@ -353,4 +361,70 @@ export function parseIbTime(time: string): string | null {
   const dateTime = DateTime.fromFormat(trimmed, 'yyyyMMdd HH:mm:ss', { zone: ET_ZONE });
 
   return dateTime.isValid ? formatEt(dateTime) : null;
+}
+
+/**
+ * Whether something IB reported — a position, an order, an execution — belongs
+ * to the account this daemon trades.
+ *
+ * **Rejects only on positive evidence of another account.** A report whose
+ * account field is absent is kept: the one thing worse than attributing another
+ * account's fill here is silently dropping this account's own, which leaves a
+ * position the ladder does not know it holds. `orderRef` correlation downstream
+ * still discards anything this engine did not place. `accountId` undefined
+ * means no account is configured (a fake socket in tests) and filters nothing.
+ */
+export function belongsToAccount(
+  reported: string | null | undefined,
+  accountId: string | undefined,
+): boolean {
+  if (accountId === undefined || !reported) {
+    return true;
+  }
+
+  return reported === accountId;
+}
+
+/**
+ * The entries of an IB per-account map that belong to `accountId`.
+ *
+ * `getPositions` and `getAccountSummary` answer for **every** account the login
+ * manages, keyed by account id. Flattening all of them — what the socket used
+ * to do — reports a login's combined position as this account's, and the
+ * lot-sum assertion then compares this account's lots against shares held in
+ * another. With no account configured every entry is returned, which is the
+ * behaviour a single-account fake expects.
+ */
+export function entriesForAccount<T>(
+  byAccount: ReadonlyMap<string, T>,
+  accountId: string | undefined,
+): T[] {
+  if (accountId === undefined) {
+    return [...byAccount.values()];
+  }
+
+  const entry = byAccount.get(accountId);
+  return entry === undefined ? [] : [entry];
+}
+
+/**
+ * Refuses a login that does not manage the configured account. Returns the
+ * failure, or `null` when the account is present.
+ *
+ * Checked on every connect, because the failure it prevents is silent: an order
+ * sent with an `account` the login cannot trade is rejected one at a time,
+ * while every read — filtered to an account IB never reports — comes back
+ * empty, and an empty position list reads as *flat* rather than as wrong.
+ */
+export function checkManagedAccount(managed: readonly string[], accountId: string): string | null {
+  if (managed.includes(accountId)) {
+    return null;
+  }
+
+  return (
+    `IB login does not manage the configured account ${maskAccountId(accountId)} ` +
+    `(IB_ACCOUNT_ID); it manages ${managed.map(maskAccountId).join(', ') || 'none'}. ` +
+    'Refusing the connection rather than trading or reconciling against an account this ' +
+    'login cannot see.'
+  );
 }

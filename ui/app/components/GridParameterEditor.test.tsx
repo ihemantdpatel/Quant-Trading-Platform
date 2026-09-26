@@ -9,10 +9,16 @@
  * the four editable fields.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render as rtlRender, screen } from '@testing-library/react';
+import { AccountProvider } from './AccountContext';
 import userEvent from '@testing-library/user-event';
 import { GridParameterEditor } from './GridParameterEditor';
 import type { GridParameters } from '../lib/api';
+
+/** Every control acts on the account of the page it is on — rendered inside one here. */
+function render(ui: React.ReactElement) {
+  return rtlRender(<AccountProvider account="nuuixl118">{ui}</AccountProvider>);
+}
 
 const editParameters = jest.fn();
 const editRiskLimit = jest.fn();
@@ -87,6 +93,7 @@ describe('GridParameterEditor', () => {
     await user.click(screen.getByRole('button', { name: /apply to future levels/i }));
 
     expect(editParameters).toHaveBeenCalledWith(
+      'nuuixl118',
       'grid:TQQQ',
       { gap: 1, quantity: 50, maxBuyLevels: 2, maxSellOrders: 2 },
       '',
@@ -193,7 +200,7 @@ describe('GridParameterEditor', () => {
     await user.type(input, '180000');
     await user.click(screen.getByRole('button', { name: /update limit/i }));
 
-    expect(editRiskLimit).toHaveBeenCalledWith('TQQQ', 180_000, '');
+    expect(editRiskLimit).toHaveBeenCalledWith('nuuixl118', 'TQQQ', 180_000, '');
     expect(editParameters).not.toHaveBeenCalled();
   });
 });

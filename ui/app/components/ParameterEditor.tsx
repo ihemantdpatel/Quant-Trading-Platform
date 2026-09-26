@@ -21,6 +21,7 @@
 
 import { useState, useTransition } from 'react';
 import { editParameters, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 import { type LadderParameters, type ParameterChange, type RiskLimitChange } from '../lib/api';
 import { Field, ParameterChangeLog, Select } from './ParameterFields';
 import { RiskLimitEditor } from './RiskLimitEditor';
@@ -131,6 +132,7 @@ export function ParameterEditor({
   riskLimit?: number | null;
   riskLimitChanges?: RiskLimitChange[];
 }) {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [reason, setReason] = useState('');
@@ -184,7 +186,7 @@ export function ParameterEditor({
     }
 
     startTransition(async () => {
-      setResult(await editParameters(strategyId, payload, reason));
+      setResult(await editParameters(account, strategyId, payload, reason));
       setReason('');
     });
   }

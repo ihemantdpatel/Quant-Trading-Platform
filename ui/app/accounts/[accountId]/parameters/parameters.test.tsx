@@ -10,18 +10,21 @@
 
 import { render, screen, within } from '@testing-library/react';
 import ParametersPage from './page';
-import { loadParameters, type GridLot, type Lot, type ParametersData } from '../lib/api';
+import { loadParameters, type GridLot, type Lot, type ParametersData } from '../../../lib/api';
 
-jest.mock('../lib/api', () => {
-  const actual = jest.requireActual('../lib/api');
+jest.mock('../../../lib/api', () => {
+  const actual = jest.requireActual('../../../lib/api');
   return { ...actual, loadParameters: jest.fn() };
 });
 
-jest.mock('../actions', () => ({
+jest.mock('../../../actions', () => ({
   editParameters: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
 }));
 
 const mockLoad = loadParameters as jest.MockedFunction<typeof loadParameters>;
+
+/** The route params Next.js hands the page, as a Promise (App Router, Next 15). */
+const inAccount = { params: Promise.resolve({ accountId: 'nuuixl118' }) };
 
 function lot(id: string, status: Lot['status']): Lot {
   return {
@@ -101,7 +104,7 @@ describe('Parameters page', () => {
   it('renders an editor per strategy', async () => {
     mockLoad.mockResolvedValue(parametersData());
 
-    render(await ParametersPage());
+    render(await ParametersPage(inAccount));
 
     expect(screen.getByRole('region', { name: /parameter editor/i })).toBeInTheDocument();
   });
@@ -111,7 +114,7 @@ describe('Parameters page', () => {
       parametersData({ lots: [lot('a', 'HELD'), lot('b', 'HELD'), lot('c', 'CLOSED')] }),
     );
 
-    render(await ParametersPage());
+    render(await ParametersPage(inAccount));
 
     // Closed lots have no target left to freeze.
     expect(screen.getByTestId('frozen-lot-notice')).toHaveTextContent('2 held lots');
@@ -120,7 +123,7 @@ describe('Parameters page', () => {
   it('states that edits reach future rungs only', async () => {
     mockLoad.mockResolvedValue(parametersData());
 
-    render(await ParametersPage());
+    render(await ParametersPage(inAccount));
 
     // The editor repeats this beside its submit button, so match the page's own
     // statement of the rule rather than either copy in isolation.
@@ -133,7 +136,7 @@ describe('Parameters page', () => {
   it('reports a failed load instead of rendering an empty form', async () => {
     mockLoad.mockResolvedValue(parametersData({ parameters: [], error: 'fetch failed' }));
 
-    render(await ParametersPage());
+    render(await ParametersPage(inAccount));
 
     expect(screen.getByRole('alert')).toHaveTextContent(/fetch failed/i);
     expect(screen.queryByRole('region', { name: /parameter editor/i })).not.toBeInTheDocument();
@@ -150,7 +153,7 @@ describe('Parameters page', () => {
     it('renders the grid editor rather than the ladder one for a grid: id', async () => {
       mockLoad.mockResolvedValue(parametersData({ parameters: [GRID_SET] }));
 
-      render(await ParametersPage());
+      render(await ParametersPage(inAccount));
 
       const editor = screen.getByRole('region', { name: /parameter editor/i });
       expect(within(editor).getByLabelText('Gap ($)')).toBeInTheDocument();
@@ -167,7 +170,7 @@ describe('Parameters page', () => {
         }),
       );
 
-      render(await ParametersPage());
+      render(await ParametersPage(inAccount));
 
       expect(screen.getByTestId('frozen-lot-notice')).toHaveTextContent('1 held lot ');
     });
@@ -181,7 +184,7 @@ describe('Parameters page', () => {
         }),
       );
 
-      render(await ParametersPage());
+      render(await ParametersPage(inAccount));
 
       const editors = screen.getAllByRole('region', { name: /parameter editor/i });
       expect(editors).toHaveLength(2);
@@ -194,5 +197,15 @@ describe('Parameters page', () => {
         ]),
       );
     });
+  });
+
+  it('loads the account named in the route, and no other', async () => {
+    mockLoad.mockClear();
+    mockLoad.mockResolvedValue(parametersData());
+
+    // Next.js passes the segment URL-encoded; the loader must get the alias.
+    render(await ParametersPage({ params: Promise.resolve({ accountId: 'paper%20two' }) }));
+
+    expect(mockLoad).toHaveBeenCalledWith('paper two');
   });
 });

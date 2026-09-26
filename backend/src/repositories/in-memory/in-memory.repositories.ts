@@ -25,7 +25,10 @@ import { Lot, LotStatus } from '../../strategies/dip-ladder/lot';
 import { ParameterChange } from '../../strategies/dip-ladder/parameter-change';
 import { Rung } from '../../strategies/dip-ladder/rung';
 import { GridLot, GridLotStatus } from '../../strategies/grid/lot';
+import { StoredAccountDefinition } from '../../config/account-definition';
 import {
+  AccountDefinitionConflictError,
+  AccountDefinitionRepository,
   BacktestRepository,
   BacktestResultRecord,
   BacktestRunRecord,
@@ -582,4 +585,42 @@ function compareDesc(a: string, b: string): number {
   if (a < b) return 1;
   if (a > b) return -1;
   return 0;
+}
+
+/**
+ * Holds definitions for the life of the process. Nothing starts a daemon for
+ * them — the supervisor reads MySQL — which is why `AccountsController`
+ * refuses creation without durable storage; this binding exists so the module
+ * graph resolves the same way in both storage modes, and for tests.
+ */
+@Injectable()
+export class InMemoryAccountDefinitionRepository implements AccountDefinitionRepository {
+  private readonly definitions: StoredAccountDefinition[] = [];
+
+  async findAll(): Promise<StoredAccountDefinition[]> {
+    return copy(this.definitions);
+  }
+
+  /** One process, one account, and its rows are implicit — nothing to report. */
+  async findRegisteredAccounts(): Promise<{ id: string; ibAccountId: string | null }[]> {
+    return [];
+  }
+
+  async create(definition: StoredAccountDefinition): Promise<void> {
+    const taken = this.definitions.find(
+      (existing) =>
+        existing.alias === definition.alias ||
+        existing.port === definition.port ||
+        existing.ibClientId === definition.ibClientId ||
+        (definition.ibAccountId !== null && existing.ibAccountId === definition.ibAccountId),
+    );
+
+    if (taken) {
+      throw new AccountDefinitionConflictError(
+        `account "${definition.alias}" conflicts with existing account "${taken.alias}"`,
+      );
+    }
+
+    this.definitions.push(copy(definition));
+  }
 }

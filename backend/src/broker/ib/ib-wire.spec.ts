@@ -16,7 +16,10 @@ import { OptionRight, SecurityType, equityContract, optionContract } from '../..
 import { BarSize } from '../../market-data/types';
 import { BrokerOrder, OrderStatus } from '../broker-adapter.interface';
 import {
+  belongsToAccount,
+  checkManagedAccount,
   durationString,
+  entriesForAccount,
   parseIbTime,
   resolveClientOrderId,
   toDomainBar,
@@ -148,6 +151,14 @@ describe('toIbOrder', () => {
 
   it('maps GTC time-in-force', () => {
     expect(toIbOrder({ ...base, timeInForce: 'GTC' }).tif).toBe('GTC');
+  });
+
+  it('states the account, so a multi-account login cannot route it to its default', () => {
+    expect(toIbOrder(base, 'DU1234567').account).toBe('DU1234567');
+  });
+
+  it('omits the account entirely when none is configured', () => {
+    expect('account' in toIbOrder(base)).toBe(false);
   });
 });
 
@@ -450,5 +461,91 @@ describe('toCompletedOrder', () => {
 
     expect(completed?.side).toBe('SELL');
     expect(completed?.status).toBe(OrderStatus.FILLED);
+  });
+});
+
+describe('toCompletedOrder account filter', () => {
+  const contract = { symbol: 'TQQQ' };
+  const order = { orderId: 42, orderRef: 'co-nuuixl118-7', action: 'BUY', totalQuantity: 100 };
+
+  it('skips another account’s completed order', () => {
+    expect(
+      toCompletedOrder(
+        contract as never,
+        { ...order, account: 'DU7654321' } as never,
+        { status: 'Cancelled' } as never,
+        'DU1234567',
+      ),
+    ).toBeNull();
+  });
+
+  it('keeps this account’s', () => {
+    expect(
+      toCompletedOrder(
+        contract as never,
+        { ...order, account: 'DU1234567' } as never,
+        { status: 'Cancelled' } as never,
+        'DU1234567',
+      )?.clientOrderId,
+    ).toBe('co-nuuixl118-7');
+  });
+});
+
+describe('belongsToAccount', () => {
+  it('keeps a report for this account', () => {
+    expect(belongsToAccount('DU1234567', 'DU1234567')).toBe(true);
+  });
+
+  it('drops a report for another account', () => {
+    expect(belongsToAccount('DU7654321', 'DU1234567')).toBe(false);
+  });
+
+  it('keeps a report with no account field, rather than dropping a real fill on missing evidence', () => {
+    expect(belongsToAccount(undefined, 'DU1234567')).toBe(true);
+    expect(belongsToAccount('', 'DU1234567')).toBe(true);
+    expect(belongsToAccount(null, 'DU1234567')).toBe(true);
+  });
+
+  it('filters nothing when no account is configured', () => {
+    expect(belongsToAccount('DU7654321', undefined)).toBe(true);
+  });
+});
+
+describe('entriesForAccount', () => {
+  const byAccount = new Map([
+    ['DU1234567', 'mine'],
+    ['DU7654321', 'theirs'],
+  ]);
+
+  it('returns only this account’s entry — never a login’s combined view', () => {
+    expect(entriesForAccount(byAccount, 'DU1234567')).toEqual(['mine']);
+  });
+
+  it('returns nothing when the account is absent, which the caller reads as flat', () => {
+    // `checkManagedAccount` is what stops "absent" being reached for an account
+    // the login cannot see at all.
+    expect(entriesForAccount(byAccount, 'DU0000000')).toEqual([]);
+  });
+
+  it('returns every entry when no account is configured', () => {
+    expect(entriesForAccount(byAccount, undefined)).toEqual(['mine', 'theirs']);
+  });
+});
+
+describe('checkManagedAccount', () => {
+  it('permits an account the login manages', () => {
+    expect(checkManagedAccount(['DU7654321', 'DU1234567'], 'DU1234567')).toBeNull();
+  });
+
+  it('refuses one it does not, naming both sides masked', () => {
+    const failure = checkManagedAccount(['DU7654321'], 'DU1234567');
+
+    expect(failure).toContain('DU•••567');
+    expect(failure).toContain('DU•••321');
+    expect(failure).not.toContain('DU1234567');
+  });
+
+  it('says so when the login reports no accounts at all', () => {
+    expect(checkManagedAccount([], 'DU1234567')).toContain('manages none');
   });
 });

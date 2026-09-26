@@ -61,6 +61,34 @@ describe('Story 6: engine HTTP API', () => {
   const replay = (fixture = 'chop-range'): request.Test =>
     request(app.getHttpServer()).post('/engine/replay').send({ fixture });
 
+  describe('GET /account', () => {
+    it('names the account this daemon trades, for the dashboard switcher', async () => {
+      const response = await request(app.getHttpServer()).get('/account').expect(200);
+
+      expect(response.body).toEqual({
+        alias: 'nuuixl118',
+        label: 'nuuixl118',
+        // The mock broker has no IB account to name.
+        ibAccountId: null,
+        mode: 'PAPER',
+        allowedModes: ['PAPER'],
+        broker: { name: 'mock', connected: true },
+        halted: false,
+      });
+    });
+
+    it('reports the account as halted while its kill switch is engaged', async () => {
+      await request(app.getHttpServer())
+        .post('/kill-switch')
+        .send({ engaged: true, reason: 'halt check' })
+        .expect(200);
+
+      const response = await request(app.getHttpServer()).get('/account').expect(200);
+
+      expect(response.body.halted).toBe(true);
+    });
+  });
+
   describe('GET /status', () => {
     it('reports PAPER mode, a connected broker, and no active halts', async () => {
       const response = await request(app.getHttpServer()).get('/status').expect(200);

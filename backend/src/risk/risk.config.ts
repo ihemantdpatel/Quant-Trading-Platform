@@ -123,7 +123,7 @@ export function buildRiskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig
     // wrote to it, but `RiskParameterService.edit()` mutates
     // `perSymbolLimits` in place by design (`risk-parameter.service.ts`), and
     // without this copy that mutation would reach through to whatever object
-    // the caller passed in, e.g. the compiled `PAPER_SYMBOL_CAPITAL` constant
+    // the caller passed in, e.g. the compiled `ACCOUNT_SYMBOL_CAPITAL` constant
     // in `capital.config.ts` — silently rewriting a reviewed source file's
     // exported value for the life of the process.
     perSymbolLimits: { ...(overrides.perSymbolLimits ?? DEFAULT_RISK_CONFIG.perSymbolLimits) },

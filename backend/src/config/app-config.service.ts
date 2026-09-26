@@ -12,6 +12,19 @@ import { ExecutionMode } from './execution-mode';
 export class AppConfigService {
   constructor(private readonly config: ConfigService<AppConfig, true>) {}
 
+  /** The `accounts.config.ts` key this daemon trades. Validated at boot. */
+  get accountAlias(): string {
+    return this.config.get('ACCOUNT_ALIAS', { infer: true });
+  }
+
+  /**
+   * The IB account id this daemon trades, or `undefined` under the mock broker,
+   * where there is no account to name. Validated as present whenever IB is bound.
+   */
+  get ibAccountId(): string | undefined {
+    return this.config.get('IB_ACCOUNT_ID', { infer: true });
+  }
+
   get executionMode(): ExecutionMode {
     return this.config.get('EXECUTION_MODE', { infer: true });
   }

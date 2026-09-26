@@ -71,11 +71,31 @@ describe('recover-lots argument parsing', () => {
     ]);
 
     expect(args).toEqual({
+      account: 'nuuixl118',
       symbol: 'TQQQ',
       brokerQuantity: 272,
       averageCost: 73.1,
       takeProfitPercent: 0.04,
       apply: true,
+    });
+  });
+
+  describe('--account', () => {
+    const base = ['--symbol', 'TQQQ', '--broker-quantity', '272'];
+
+    it("defaults to the daemon's own ACCOUNT_ALIAS", () => {
+      expect(parseRecoverLotsArgs(base, { ACCOUNT_ALIAS: 'nuuixl118' }).account).toBe('nuuixl118');
+    });
+
+    it('falls back to the default account when ACCOUNT_ALIAS is unset', () => {
+      expect(parseRecoverLotsArgs(base, {}).account).toBe('nuuixl118');
+    });
+
+    it('refuses an alias the registry does not know rather than repairing another ledger', () => {
+      expect(() => parseRecoverLotsArgs([...base, '--account', 'nobody'], {})).toThrow(
+        /--account "nobody" is not in accounts.config.ts/,
+      );
+      expect(() => parseRecoverLotsArgs(base, { ACCOUNT_ALIAS: 'nobody' })).toThrow(/nobody/);
     });
   });
 });

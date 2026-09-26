@@ -25,7 +25,7 @@ import { RungStatus } from '../strategies/dip-ladder/rung';
 import { ParameterService } from '../strategies/dip-ladder/parameter.service';
 import { DIP_LADDER_CONFIG, DIP_LADDER_SYMBOL } from '../strategies/strategies.module';
 import { buildDipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/config';
-import { PAPER_SYMBOL_CAPITAL } from '../config/capital.config';
+import { ACCOUNT_SYMBOL_CAPITAL } from '../config/capital.config';
 import { buildGridConfig } from '../strategies/grid/config';
 import { GridStrategy } from '../strategies/grid/grid.strategy';
 
@@ -78,7 +78,7 @@ describe('Story 7: live parameter editing', () => {
       .overrideProvider(DIP_LADDER_CONFIG)
       .useValue(
         buildDipLadderConfig(DIP_LADDER_SYMBOL, {
-          symbolCapital: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+          symbolCapital: ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
           orderPlacement: OrderPlacement.IMMEDIATE,
         }),
       )
@@ -300,7 +300,7 @@ describe('Story 7: live parameter editing', () => {
       // display notional, because SHADOW is retired and every mode now sizes
       // from the same source.
       expect(parameters.configOf(LADDER_ID)!.symbolCapital).toBe(
-        PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+        ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
       );
     });
 

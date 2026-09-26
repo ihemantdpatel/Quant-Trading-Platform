@@ -78,6 +78,9 @@ import {
   toIbEndDateTime,
   toCompletedOrder,
   toIbOrder,
+  belongsToAccount,
+  checkManagedAccount,
+  entriesForAccount,
   toOrderStatus,
 } from './ib-wire';
 
@@ -100,6 +103,12 @@ export interface StoqeyIbSocketConfig {
    * leave IB holding the old one's subscriptions until it times out.
    */
   clientId: number;
+  /**
+   * The IB account (`DU…`/`U…`) this daemon trades. Every read is filtered to
+   * it and every order is sent with it: one IB login may manage several
+   * accounts, and each belongs to its own daemon.
+   */
+  accountId: string;
 }
 
 /**
@@ -185,6 +194,11 @@ export class StoqeyIbSocket implements IbSocket {
     // makes bounded retry meaningful.
     await this.awaitConnected();
 
+    // Before anything is requested on the new session: a login that cannot see
+    // this account would answer every filtered read with nothing, and nothing
+    // reads as flat — which reconciliation would happily agree with.
+    await this.assertManagedAccount();
+
     // **Executions must be requested, or `execDetails` never fires.**
     //
     // IB pushes executions only to a client that has asked for them. Without
@@ -202,6 +216,21 @@ export class StoqeyIbSocket implements IbSocket {
 
     this.connected = true;
     this.logger.log(`connected to IB Gateway at ${this.config.host}:${this.config.port}`);
+  }
+
+  /* istanbul ignore next -- Gateway I/O; the decision is `checkManagedAccount` */
+  private async assertManagedAccount(): Promise<void> {
+    const managed = await withTimeout(this.api.getManagedAccounts());
+    const failure = checkManagedAccount(managed, this.config.accountId);
+
+    if (failure !== null) {
+      // Torn down rather than left half-open: the adapter treats the throw as a
+      // failed connect (entries halted, slow retry poll), and a socket left
+      // connected underneath would keep answering reads for the wrong login.
+      this.api.disconnect();
+      this.eventApi.disconnect();
+      throw new Error(failure);
+    }
   }
 
   /**
@@ -380,7 +409,11 @@ export class StoqeyIbSocket implements IbSocket {
     const orderId = await this.nextOrderId();
     this.orderIds.set(order.clientOrderId, orderId);
 
-    await this.api.placeOrder(orderId, toIbContract(order.contract), toIbOrder(order));
+    await this.api.placeOrder(
+      orderId,
+      toIbContract(order.contract),
+      toIbOrder(order, this.config.accountId),
+    );
 
     const ack: OrderAck = {
       clientOrderId: order.clientOrderId,
@@ -433,7 +466,14 @@ export class StoqeyIbSocket implements IbSocket {
     for (const open of update) {
       const clientOrderId = open.order.orderRef;
 
-      if (!clientOrderId || open.orderId === undefined) {
+      // Another account's order is not ours to adopt, even when a sibling
+      // daemon's `orderRef` happens to parse — adopting it would attach this
+      // ladder's rung to exposure in a different account.
+      if (
+        !clientOrderId ||
+        open.orderId === undefined ||
+        !belongsToAccount(open.order.account, this.config.accountId)
+      ) {
         continue;
       }
 
@@ -482,7 +522,7 @@ export class StoqeyIbSocket implements IbSocket {
         const collected: CompletedOrder[] = [];
 
         const onCompleted = (contract: IbContract, order: IbOrder, state: IbOrderState): void => {
-          const completed = toCompletedOrder(contract, order, state);
+          const completed = toCompletedOrder(contract, order, state, this.config.accountId);
 
           // Orders IB reports that carry no `orderRef` are not ones this engine
           // placed — a manual TWS order, most often. Skipped rather than
@@ -520,7 +560,11 @@ export class StoqeyIbSocket implements IbSocket {
     const update = await firstValue(this.api.getPositions());
     const positions: BrokerPosition[] = [];
 
-    for (const accountPositions of update.all.values()) {
+    // Only this account's positions. The update answers for every account the
+    // login manages, and flattening them reported a combined position as this
+    // account's — the lot-sum assertion would compare this ladder's lots
+    // against shares held in another account.
+    for (const accountPositions of entriesForAccount(update.all, this.config.accountId)) {
       for (const position of accountPositions) {
         if (!position.contract.symbol || !position.pos) {
           continue;
@@ -546,7 +590,7 @@ export class StoqeyIbSocket implements IbSocket {
     let availableFunds = 0;
     let currency = 'USD';
 
-    for (const values of update.all.values()) {
+    for (const values of entriesForAccount(update.all, this.config.accountId)) {
       for (const [tag, byCurrency] of values) {
         for (const [cur, value] of byCurrency) {
           const numeric = Number(value.value);
@@ -625,6 +669,12 @@ export class StoqeyIbSocket implements IbSocket {
     this.eventApi.on(
       EventName.execDetails,
       (_reqId: number, contract: IbContract, execution: IbExecution) => {
+        // A sibling daemon's fill on a shared login is its business, not ours.
+        // Routed here it would open a lot for shares this account never bought.
+        if (!belongsToAccount(execution.acctNumber, this.config.accountId)) {
+          return;
+        }
+
         const clientOrderId = this.clientOrderIdFor(execution.orderId, execution.orderRef);
 
         if (!clientOrderId) {

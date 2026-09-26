@@ -8,9 +8,15 @@
  * worst possible failure of this component.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render as rtlRender, screen } from '@testing-library/react';
+import { AccountProvider } from './AccountContext';
 import userEvent from '@testing-library/user-event';
 import { KillSwitch } from './KillSwitch';
+
+/** Every control acts on the account of the page it is on — rendered inside one here. */
+function render(ui: React.ReactElement) {
+  return rtlRender(<AccountProvider account="nuuixl118">{ui}</AccountProvider>);
+}
 
 const setKillSwitch = jest.fn();
 
@@ -70,7 +76,7 @@ describe('KillSwitch', () => {
 
     await user.click(screen.getByRole('button', { name: /engage kill switch/i }));
 
-    expect(setKillSwitch).toHaveBeenCalledWith(true, '');
+    expect(setKillSwitch).toHaveBeenCalledWith('nuuixl118', true, '');
   });
 
   it('passes the operator reason through to the backend', async () => {
@@ -80,7 +86,7 @@ describe('KillSwitch', () => {
     await user.type(screen.getByLabelText(/kill switch reason/i), 'runaway ladder');
     await user.click(screen.getByRole('button', { name: /engage kill switch/i }));
 
-    expect(setKillSwitch).toHaveBeenCalledWith(true, 'runaway ladder');
+    expect(setKillSwitch).toHaveBeenCalledWith('nuuixl118', true, 'runaway ladder');
   });
 
   it('releases when already engaged', async () => {
@@ -89,7 +95,7 @@ describe('KillSwitch', () => {
 
     await user.click(screen.getByRole('button', { name: /release/i }));
 
-    expect(setKillSwitch).toHaveBeenCalledWith(false, '');
+    expect(setKillSwitch).toHaveBeenCalledWith('nuuixl118', false, '');
   });
 
   it('surfaces a failure from the backend rather than reporting success', async () => {
