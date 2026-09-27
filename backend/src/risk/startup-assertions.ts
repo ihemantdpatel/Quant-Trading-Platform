@@ -20,6 +20,7 @@
  * supplies it from the configured strategies at wiring time.
  */
 
+import { AccountDefinition, checkAccountMode } from '../config/accounts.config';
 import { ExecutionMode } from '../config/execution-mode';
 import { checkLiveAccountGuard } from './live-account-guard';
 import { assertSingleCurrency, RiskConfig } from './risk.config';
@@ -71,8 +72,20 @@ export function evaluateStartupAssertions(
    * real list, so the check is live where it matters.
    */
   instrumentCurrencies: string[] = [],
+  /**
+   * The account this process trades. Omitted by callers that predate accounts,
+   * which asserts nothing about it; `RiskModule` and `POST /mode` supply it, so
+   * an account booted into a mode its registry entry does not permit is refused.
+   */
+  account?: AccountDefinition,
 ): StartupAssertionResult {
   const failures: string[] = [];
+
+  const accountFailure = account === undefined ? null : checkAccountMode(account, mode);
+
+  if (accountFailure !== null) {
+    failures.push(accountFailure);
+  }
 
   // The live guard applies before the parameter checks: an unset live flag is a
   // refusal regardless of whether the other values happen to be configured.
@@ -157,8 +170,15 @@ export function assertStartupSafe(
   config: RiskConfig,
   symbolCapital: SymbolCapital = {},
   instrumentCurrencies: string[] = [],
+  account?: AccountDefinition,
 ): void {
-  const result = evaluateStartupAssertions(mode, config, symbolCapital, instrumentCurrencies);
+  const result = evaluateStartupAssertions(
+    mode,
+    config,
+    symbolCapital,
+    instrumentCurrencies,
+    account,
+  );
 
   if (!result.permitted) {
     throw new StartupAssertionError(result.failures);

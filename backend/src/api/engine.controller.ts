@@ -28,6 +28,8 @@ import {
 import { BROKER_ADAPTER, BrokerAdapter } from '../broker/broker-adapter.interface';
 import { IBBrokerAdapter } from '../broker/ib/ib-broker.adapter';
 import { AppConfigService } from '../config/app-config.service';
+import { maskAccountId } from '../config/account-registration';
+import { ACTIVE_ACCOUNT } from '../config/capital.config';
 import { ExecutionMode } from '../config/execution-mode';
 import { EngineService } from '../engine/engine.service';
 import { GridReconciliationService } from '../reconciliation/grid-reconciliation.service';
@@ -508,6 +510,40 @@ export class EngineController {
   }
 
   /** Mode, connection health, and every active halt in one place. */
+  /**
+   * Who this daemon is — the dashboard's account switcher asks every daemon it
+   * knows of, and labels the answers.
+   *
+   * **The daemon states its own identity** rather than the UI assigning one to
+   * a URL. A switcher that mapped URLs to accounts by configuration could show
+   * one account's lots under another account's name after a single mistyped
+   * entry; asking the process that holds the lots cannot.
+   *
+   * The IB id is masked: this is a label for telling accounts apart, and the
+   * full id stays in the daemon's environment. Read-only; nothing here can
+   * change what trades.
+   */
+  @Get('account')
+  getAccount(): unknown {
+    const ibAccountId = this.appConfig.ibAccountId;
+
+    return {
+      alias: this.appConfig.accountAlias,
+      label: ACTIVE_ACCOUNT.label,
+      ibAccountId: ibAccountId === undefined ? null : maskAccountId(ibAccountId),
+      mode: this.appConfig.executionMode,
+      allowedModes: ACTIVE_ACCOUNT.allowedModes,
+      broker: {
+        name: this.broker.name,
+        connected: this.broker.isConnected(),
+      },
+      halted:
+        this.killSwitch.snapshot().engaged ||
+        this.engine.isHalted() ||
+        this.symbolHalts.active().length > 0,
+    };
+  }
+
   @Get('status')
   getStatus(): unknown {
     const health = this.broker.connectionHealth();
@@ -939,7 +975,13 @@ export class EngineController {
     }
 
     const mode = requested as ExecutionMode;
-    const assertions = evaluateStartupAssertions(mode, this.riskConfig, this.symbolCapital);
+    const assertions = evaluateStartupAssertions(
+      mode,
+      this.riskConfig,
+      this.symbolCapital,
+      [],
+      ACTIVE_ACCOUNT,
+    );
 
     if (!assertions.permitted) {
       throw new UnprocessableEntityException({

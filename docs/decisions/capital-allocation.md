@@ -14,7 +14,7 @@
 | `PAPER_ACCOUNT_CURRENCY`    | **USD** — _not_ the account base currency |
 
 > **Corrected 2026-08-14.** The original figures were **USD 50,000 / USD 175,000**, and the equity
-> was wrong in a way that cancelled itself: account `DU7022583` reports `NetLiquidation` in **CAD**
+> was wrong in a way that cancelled itself: account `nuuixl118` reports `NetLiquidation` in **CAD**
 > at **248,973.68**, so a USD position notional was being capped against a CAD number. See below.
 
 ## The currency error, and how it is handled
@@ -93,7 +93,7 @@ either confirm this figure or replace it, updating this document with the eviden
 
 ## Where it lives
 
-`backend/src/config/capital.config.ts` — the single source, read by `capital.module.ts` (which
+`backend/src/config/capital.config.ts` — the single source (since accounts arrived, the values live in the `nuuixl118` entry of `accounts.config.ts` and `capital.config.ts` selects the active account's entry, renaming these `ACCOUNT_*`), read by `capital.module.ts` (which
 publishes it to the risk layer) and `strategies.module.ts` (which sizes rungs from it).
 
 Both read the _same_ constant. In `SHADOW` the ladder continues to use `SHADOW_NOMINAL_CAPITAL`

@@ -28,11 +28,13 @@ import {
   resolveDuplicateOrders,
   type ActionResult,
 } from '../actions';
+import { useAccount } from './AccountContext';
 import type { OrderDiagnosis } from '../lib/api';
 
 type Pending = 'check' | 'place' | 'duplicates' | null;
 
 export function PendingOrders() {
+  const account = useAccount();
   const [busy, startTransition] = useTransition();
   const [pending, setPending] = useState<Pending>(null);
   const [diagnosis, setDiagnosis] = useState<OrderDiagnosis | null>(null);
@@ -43,7 +45,7 @@ export function PendingOrders() {
     setPending('check');
     setConfirming(null);
     startTransition(async () => {
-      const outcome = await checkPendingOrders();
+      const outcome = await checkPendingOrders(account);
       setDiagnosis(outcome.diagnosis ?? null);
       setResult(outcome);
       setPending(null);
@@ -54,7 +56,7 @@ export function PendingOrders() {
     setPending('place');
     setConfirming(null);
     startTransition(async () => {
-      setResult(await placeMissingOrders());
+      setResult(await placeMissingOrders(account));
       // The book has changed, so the findings on screen are now stale. Clearing
       // forces a fresh check before either action can be taken again — acting
       // twice on one diagnosis is how a duplicate gets placed.
@@ -67,7 +69,7 @@ export function PendingOrders() {
     setPending('duplicates');
     setConfirming(null);
     startTransition(async () => {
-      setResult(await resolveDuplicateOrders());
+      setResult(await resolveDuplicateOrders(account));
       setDiagnosis(null);
       setPending(null);
     });

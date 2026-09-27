@@ -22,6 +22,7 @@
 
 import { useState, useTransition } from 'react';
 import { resetEngine, runReplay, type ActionResult } from '../actions';
+import { useAccount } from './AccountContext';
 
 const FIXTURES = [
   'chop-range',
@@ -32,6 +33,7 @@ const FIXTURES = [
 ];
 
 export function EngineControls() {
+  const account = useAccount();
   const [pending, startTransition] = useTransition();
   const [result, setResult] = useState<ActionResult | null>(null);
   const [fixture, setFixture] = useState(FIXTURES[0]);
@@ -61,7 +63,7 @@ export function EngineControls() {
         <button
           type="button"
           disabled={pending}
-          onClick={() => startTransition(async () => setResult(await runReplay(fixture)))}
+          onClick={() => startTransition(async () => setResult(await runReplay(account, fixture)))}
           className="rounded bg-sky-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-sky-500 disabled:opacity-50"
         >
           {pending ? 'Running…' : 'Replay'}
@@ -70,7 +72,7 @@ export function EngineControls() {
         <button
           type="button"
           disabled={pending}
-          onClick={() => startTransition(async () => setResult(await resetEngine()))}
+          onClick={() => startTransition(async () => setResult(await resetEngine(account)))}
           className="rounded border border-slate-700 px-3 py-1.5 text-sm text-slate-300 transition hover:bg-slate-800 disabled:opacity-50"
         >
           Reset

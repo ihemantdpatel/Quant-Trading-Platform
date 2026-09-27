@@ -12,9 +12,15 @@
  * rather than bugs to work around.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render as rtlRender, screen } from '@testing-library/react';
+import { AccountProvider } from './AccountContext';
 import userEvent from '@testing-library/user-event';
 import { ModeSwitch } from './ModeSwitch';
+
+/** Every control acts on the account of the page it is on — rendered inside one here. */
+function render(ui: React.ReactElement) {
+  return rtlRender(<AccountProvider account="nuuixl118">{ui}</AccountProvider>);
+}
 
 const setMode = jest.fn();
 
@@ -76,7 +82,7 @@ describe('ModeSwitch', () => {
 
     await user.click(screen.getByRole('button', { name: 'LIVE' }));
 
-    expect(setMode).toHaveBeenCalledWith('LIVE');
+    expect(setMode).toHaveBeenCalledWith('nuuixl118', 'LIVE');
   });
 
   it('disables the button for the mode already in force', () => {

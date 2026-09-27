@@ -13,6 +13,7 @@
  * two tests replaced the single assertion that used to pin the gap open.
  */
 
+import { DEFAULT_ACCOUNT_ALIAS } from '../../config/accounts.config';
 import { ExecutionMode } from '../../config/execution-mode';
 import { EngineService } from '../../engine/engine.service';
 import { StartupSequence } from '../../engine/startup.sequence';
@@ -179,7 +180,12 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
       expect(intent.clientOrderId).not.toBeNull();
 
       const order = await prisma.order.findUnique({
-        where: { clientOrderId: intent.clientOrderId! },
+        where: {
+          accountId_clientOrderId: {
+            accountId: DEFAULT_ACCOUNT_ALIAS,
+            clientOrderId: intent.clientOrderId!,
+          },
+        },
       });
       expect(order).not.toBeNull();
     }
@@ -296,6 +302,7 @@ describeWithDatabase('engine persistence through Prisma repositories', () => {
     await engine.replayFixture('chop-range');
     await prisma.parameterChange.create({
       data: {
+        accountId: DEFAULT_ACCOUNT_ALIAS,
         id: 'pc-1',
         changeId: 'edit-1',
         strategyId: 'dip-ladder:TQQQ',

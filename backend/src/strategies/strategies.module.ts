@@ -15,7 +15,7 @@
 import { Module } from '@nestjs/common';
 import { AppConfigModule } from '../config/config.module';
 import { AppConfigService } from '../config/app-config.service';
-import { PAPER_SYMBOL_CAPITAL } from '../config/capital.config';
+import { ACCOUNT_SYMBOL_CAPITAL } from '../config/capital.config';
 import { ExecutionMode } from '../config/execution-mode';
 import { NullSentimentProvider } from '../sentiment/null-sentiment.provider';
 import { CoordinatorService } from './coordinator.service';
@@ -188,12 +188,12 @@ export const LADDER_ATR_PERIOD = 14;
  * so a mode that submitted nothing still produced non-zero quantities to look
  * at, and SHADOW is retired (`execution-mode.ts`).
  *
- * `null` for a symbol absent from `PAPER_SYMBOL_CAPITAL`, so a missing
+ * `null` for a symbol absent from `ACCOUNT_SYMBOL_CAPITAL`, so a missing
  * allocation sizes every rung to zero shares (`ladder.ts:47`) **and** trips the
  * startup assertion, rather than silently borrowing another symbol's figure.
  */
 export function ladderCapital(_mode: ExecutionMode, symbol: string): number | null {
-  return PAPER_SYMBOL_CAPITAL[symbol] ?? null;
+  return ACCOUNT_SYMBOL_CAPITAL[symbol] ?? null;
 }
 
 /**

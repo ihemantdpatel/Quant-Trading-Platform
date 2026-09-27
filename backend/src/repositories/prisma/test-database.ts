@@ -22,6 +22,7 @@
  */
 
 import { PrismaClient } from '@prisma/client';
+import { DEFAULT_ACCOUNT_ALIAS } from '../../config/accounts.config';
 
 export const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -119,6 +120,29 @@ export async function resetDatabase(prisma: PrismaClient = testClient()): Promis
   await prisma.position.deleteMany();
   await truncateParameterChanges(prisma);
   await truncatePerSymbolLimitChanges(prisma);
+  await ensureTestAccounts(prisma);
+}
+
+/**
+ * A second account for the isolation suites. Not in `accounts.config.ts` — it
+ * exists only as a row, which is all a repository's foreign key needs.
+ */
+export const SECOND_TEST_ACCOUNT = 'second-test-account';
+
+/**
+ * Every per-account row references `Account`, so the owners must exist before
+ * a suite writes. `Account` rows are never deleted by `resetDatabase`: the
+ * default account is created by the migration and is what every production row
+ * already points at.
+ */
+export async function ensureTestAccounts(prisma: PrismaClient = testClient()): Promise<void> {
+  for (const id of [DEFAULT_ACCOUNT_ALIAS, SECOND_TEST_ACCOUNT]) {
+    await prisma.account.upsert({
+      where: { id },
+      create: { id, label: id, createdAt: '2025-01-01T00:00:00.000Z' },
+      update: {},
+    });
+  }
 }
 
 /**
@@ -139,4 +163,15 @@ export async function truncatePerSymbolLimitChanges(
   prisma: PrismaClient = testClient(),
 ): Promise<void> {
   await prisma.$executeRawUnsafe('TRUNCATE TABLE `PerSymbolLimitChange`');
+}
+
+/**
+ * Empties the dashboard-created account registry and its audit log — the log
+ * by `TRUNCATE`, for the reason `truncateParameterChanges` gives.
+ */
+export async function truncateAccountDefinitions(
+  prisma: PrismaClient = testClient(),
+): Promise<void> {
+  await prisma.accountDefinition.deleteMany();
+  await prisma.$executeRawUnsafe('TRUNCATE TABLE `AccountDefinitionChange`');
 }

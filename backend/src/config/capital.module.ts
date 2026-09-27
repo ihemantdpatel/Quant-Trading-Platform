@@ -26,7 +26,7 @@ import {
   DIP_LADDER_SYMBOL,
   StrategiesModule,
 } from '../strategies/strategies.module';
-import { PAPER_SYMBOL_CAPITAL } from './capital.config';
+import { ACCOUNT_SYMBOL_CAPITAL } from './capital.config';
 import { AppConfigModule } from './config.module';
 
 @Global()
@@ -52,7 +52,7 @@ import { AppConfigModule } from './config.module';
        */
       provide: SYMBOL_CAPITAL_SOURCE,
       useFactory: (): SymbolCapital => ({
-        [DIP_LADDER_SYMBOL]: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL] ?? null,
+        [DIP_LADDER_SYMBOL]: ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL] ?? null,
       }),
     },
     {

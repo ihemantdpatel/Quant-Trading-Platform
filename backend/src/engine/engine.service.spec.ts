@@ -44,7 +44,10 @@ interface Harness {
   lots: InMemoryLotRepository;
 }
 
-async function harness(mode = ExecutionMode.PAPER): Promise<Harness> {
+async function harness(
+  mode = ExecutionMode.PAPER,
+  accountAlias: string | null = null,
+): Promise<Harness> {
   const broker = new MockBrokerAdapter();
   await broker.connect();
 
@@ -81,6 +84,10 @@ async function harness(mode = ExecutionMode.PAPER): Promise<Harness> {
     lots,
     rungs,
     mode,
+    undefined,
+    null,
+    null,
+    accountAlias,
   );
 
   return { engine, broker, coordinator, killSwitch, intents, orders, fills, lots };
@@ -656,6 +663,53 @@ describe('EngineService', () => {
 
       // A fresh install still starts at co-1 — the restore only moves forward.
       expect(ids).toContain('co-1');
+    });
+
+    describe('scoped to an account', () => {
+      it('issues ids carrying the account alias, so two daemons never share an orderRef', async () => {
+        const { engine, orders } = await harness(ExecutionMode.PAPER, 'nuuixl118');
+
+        await engine.replayFixture('chop-range');
+
+        const ids = (await orders.findAll()).map((order) => order.clientOrderId);
+
+        expect(ids.length).toBeGreaterThan(0);
+        expect(ids).toContain('co-nuuixl118-1');
+        for (const id of ids) {
+          expect(id).toMatch(/^co-nuuixl118-\d+$/);
+        }
+      });
+
+      it('continues past the last legacy co-N id rather than restarting at 1', async () => {
+        // The cutover case: the existing `Order` rows are all `co-N`. The first
+        // scoped id must not reuse a number a legacy order already carries,
+        // or a fill resolving by sequence would be ambiguous in the audit trail.
+        const { engine, orders } = await harness(ExecutionMode.PAPER, 'nuuixl118');
+
+        await persistedOrder(orders, 'co-12');
+
+        await engine.restoreClientOrderSequence();
+        await engine.replayFixture('chop-range');
+
+        const generated = (await orders.findAll())
+          .map((order) => order.clientOrderId)
+          .filter((id) => id !== 'co-12');
+
+        expect(generated).toContain('co-nuuixl118-13');
+      });
+
+      it("ignores another account's scoped ids when restoring the sequence", async () => {
+        const { engine, orders } = await harness(ExecutionMode.PAPER, 'nuuixl118');
+
+        await persistedOrder(orders, 'co-other-900');
+
+        await engine.restoreClientOrderSequence();
+        await engine.replayFixture('chop-range');
+
+        const ids = (await orders.findAll()).map((order) => order.clientOrderId);
+
+        expect(ids).toContain('co-nuuixl118-1');
+      });
     });
   });
 });

@@ -1,29 +1,30 @@
 /**
- * The operator shell, shared by every tab.
+ * The operator shell, shared by every route.
  *
- * The kill switch and the alert banner live here rather than on a page because
- * both must be visible on **every dashboard route** (`stories.md:465`,
- * `PRD.md:383`). When they sat on `/`, an operator looking at backtests had no
- * kill switch on screen; adding a third view would have widened that gap.
+ * Holds what spans accounts: the account switcher, the kill-all control, the
+ * refresh toggle, and the tabs. Each account's own kill switch, alert banner,
+ * and order controls live in `accounts/[accountId]/layout.tsx`, where the
+ * account they act on is known.
  *
- * **This component must never throw.** `loadStatus` degrades to `{status: null,
- * error}` instead of raising, and `KillSwitch` renders an armed, clickable
- * control from those defaults. A backend outage is precisely when an operator
- * reaches for the kill switch, so the one thing the shell may not do is
- * disappear along with the backend.
+ * **A kill control is on screen on every route** (`stories.md:465`,
+ * `PRD.md:383`). On an account's pages that is its own kill switch; on
+ * `/backtest`, which belongs to no account, it is kill-all, which is here for
+ * exactly that reason.
  *
- * It fetches only `/status`. Anything added here is fetched on all three tabs.
+ * **This component must never throw.** `loadAccounts` never rejects — an
+ * unreachable daemon is an entry with an error, not an exception — so the
+ * header, and kill-all with it, renders even with every backend down, which is
+ * precisely when an operator reaches for it.
  */
 
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import './globals.css';
-import { AlertBanner } from './components/AlertBanner';
+import { AccountSwitcher } from './components/AccountSwitcher';
 import { AutoRefresh } from './components/AutoRefresh';
-import { KillSwitch } from './components/KillSwitch';
-import { ReconcileButton } from './components/ReconcileButton';
-import { PendingOrders } from './components/PendingOrders';
+import { KillAllButton } from './components/KillAllButton';
 import { Tabs } from './components/Tabs';
-import { loadStatus } from './lib/api';
+import { loadAccounts, pickDefaultAccount } from './lib/api';
 
 export const metadata: Metadata = {
   title: 'Trading Platform',
@@ -31,22 +32,7 @@ export const metadata: Metadata = {
 };
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  const { status, error } = await loadStatus();
-  const killSwitch = status?.halts.killSwitch;
-
-  /*
-    The shell fetches only `/status`, which reports strategy ids but not the
-    symbols they trade — so the instrument shown is the one the feed is
-    actually delivering, read straight from the broker's last bar. `TQQQ` is
-    the label used before any bar has arrived (and under the mock broker,
-    which has no live feed); it names what the ladder trades rather than
-    implying a price exists.
-
-    Passed down to `KillSwitch`, which renders it centred: that panel is on
-    screen on every route, so the price rides along with the guarantee the
-    kill switch already has rather than needing one of its own.
-  */
-  const last = status?.broker.lastPrices?.[0] ?? null;
+  const accounts = await loadAccounts();
 
   return (
     <html lang="en">
@@ -59,35 +45,24 @@ export default async function RootLayout({ children }: { children: React.ReactNo
                 Dip ladder · risk manager is the only path to a broker
               </p>
             </div>
-            <AutoRefresh />
+            <div className="flex flex-wrap items-center gap-3">
+              <AccountSwitcher accounts={accounts} />
+              <Link
+                href="/accounts/new"
+                className="rounded border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition hover:border-slate-500 hover:text-slate-100"
+              >
+                Add account
+              </Link>
+              <KillAllButton />
+              <AutoRefresh />
+            </div>
           </header>
 
-          <AlertBanner status={status} error={error} />
-
-          {/* Always visible, and rendered even when the backend read failed. */}
-          <KillSwitch
-            engaged={killSwitch?.engaged ?? false}
-            reason={killSwitch?.reason ?? null}
-            changedAt={killSwitch?.changedAt ?? null}
-            symbol={last?.symbol ?? 'TQQQ'}
-            lastPrice={last}
-          />
-
           {/*
-            Beside Reconcile, in the header rather than in `EngineControls`, for
-            the same reason: these controls are least useful against fixtures
-            and most useful against a live Gateway, so they must not share that
-            component's hidden-when-IB-is-bound gate.
+            The tabs follow the account in the URL; on a page with no account
+            (`/backtest`) their account links go to the first reachable one.
           */}
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ReconcileButton
-              lastRun={status?.orderReconciliation ?? null}
-              gridLastRun={status?.gridOrderReconciliation ?? null}
-            />
-            <PendingOrders />
-          </div>
-
-          <Tabs />
+          <Tabs fallbackAccount={pickDefaultAccount(accounts, null)} />
 
           {children}
         </div>

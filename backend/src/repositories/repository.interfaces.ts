@@ -14,6 +14,7 @@
  */
 
 import { Fill, OrderStatus } from '../broker/broker-adapter.interface';
+import { StoredAccountDefinition } from '../config/account-definition';
 import { Bar, BarSize } from '../market-data/types';
 import { RiskEvent } from '../risk/risk-event';
 import { RiskDecision } from '../risk/types';
@@ -295,6 +296,32 @@ export interface PerSymbolLimitChangeRepository {
 }
 
 /**
+ * The registry of dashboard-created accounts (`account-definition.ts`).
+ *
+ * **Not account-scoped**, unlike every repository above: it is the list of
+ * accounts itself, read by the daemon that creates one and by the supervisor
+ * that starts them, and a scoped view would hide exactly the collisions
+ * creation must refuse.
+ *
+ * Create-only. `create` writes the definition and its `AccountDefinitionChange`
+ * audit row together, so neither can exist without the other.
+ */
+export interface AccountDefinitionRepository {
+  findAll(): Promise<StoredAccountDefinition[]>;
+  /** Every `Account` row — aliases some daemon has already written rows under. */
+  findRegisteredAccounts(): Promise<{ id: string; ibAccountId: string | null }[]>;
+  create(definition: StoredAccountDefinition, reason: string | null): Promise<void>;
+}
+
+/** Thrown by `create` when a unique key (alias, IB id, client id, port) is taken. */
+export class AccountDefinitionConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AccountDefinitionConflictError';
+  }
+}
+
+/**
  * A persisted backtest run and its metrics (Story 11).
  *
  * `parameters` carries **the full parameter set the run used**, rather than a
@@ -360,3 +387,4 @@ export const PARAMETER_CHANGE_REPOSITORY = Symbol('PARAMETER_CHANGE_REPOSITORY')
 export const PER_SYMBOL_LIMIT_CHANGE_REPOSITORY = Symbol('PER_SYMBOL_LIMIT_CHANGE_REPOSITORY');
 export const STRATEGY_STATE_SNAPSHOT_REPOSITORY = Symbol('STRATEGY_STATE_SNAPSHOT_REPOSITORY');
 export const BACKTEST_REPOSITORY = Symbol('BACKTEST_REPOSITORY');
+export const ACCOUNT_DEFINITION_REPOSITORY = Symbol('ACCOUNT_DEFINITION_REPOSITORY');

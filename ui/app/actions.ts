@@ -23,7 +23,42 @@
  */
 
 import { revalidatePath } from 'next/cache';
-import { loadOrderDiagnosis, post, type OrderDiagnosis } from './lib/api';
+import {
+  loadAccounts,
+  loadOrderDiagnosis,
+  post,
+  postToPrimary,
+  type ManagedAccount,
+  type OrderDiagnosis,
+} from './lib/api';
+
+/**
+ * The account an action is for — the `[accountId]` segment of the page that
+ * invoked it, passed explicitly by the control (`useAccount`).
+ *
+ * **Never inferred** from a cookie or a default. Two tabs can be open on two
+ * accounts, and a kill switch that resolved its target from anything but the
+ * page it was clicked on could halt the account the operator was not looking
+ * at — or, worse, fail to halt the one they were.
+ */
+type AccountRef = string | null;
+
+/** Refused, not defaulted: a control rendered outside an account has no target. */
+const NO_ACCOUNT: ActionResult = {
+  ok: false,
+  message: 'no account selected — this control has no account to act on',
+};
+
+/**
+ * Re-reads the account's pages after a change. Scoped to the account's layout,
+ * which holds its kill switch and alerts, for the reason the module comment
+ * gives for layout scope; and to the root layout too, since the header's
+ * account switcher shows each account's halted state.
+ */
+function revalidateAccount(account: string): void {
+  revalidatePath(`/accounts/${encodeURIComponent(account)}`, 'layout');
+  revalidatePath('/', 'layout');
+}
 
 export interface ActionResult {
   ok: boolean;
@@ -66,13 +101,21 @@ function describe(error: unknown): { message: string; failures?: string[] } {
  * Effective within one evaluation cycle — the risk manager reads it at the top
  * of every `evaluate()`, so there is no queue to drain (`PRD.md:492`).
  */
-export async function setKillSwitch(engaged: boolean, reason?: string): Promise<ActionResult> {
-  const result = await post('/kill-switch', {
+export async function setKillSwitch(
+  account: AccountRef,
+  engaged: boolean,
+  reason?: string,
+): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
+  const result = await post(account, '/kill-switch', {
     engaged,
     reason: reason?.trim() || `operator ${engaged ? 'engaged' : 'released'} via dashboard`,
   });
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -95,10 +138,14 @@ export async function setKillSwitch(engaged: boolean, reason?: string): Promise<
  * them rather than reporting a generic error. An operator needs to know *which*
  * value is missing.
  */
-export async function setMode(mode: string): Promise<ActionResult> {
-  const result = await post<{ detail?: string }>('/mode', { mode });
+export async function setMode(account: AccountRef, mode: string): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
 
-  revalidatePath('/', 'layout');
+  const result = await post<{ detail?: string }>(account, '/mode', { mode });
+
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -111,13 +158,22 @@ export async function setMode(mode: string): Promise<ActionResult> {
   };
 }
 
-export async function setStrategyEnabled(id: string, enabled: boolean): Promise<ActionResult> {
+export async function setStrategyEnabled(
+  account: AccountRef,
+  id: string,
+  enabled: boolean,
+): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   const result = await post(
+    account,
     `/strategies/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`,
     {},
   );
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message } = describe(result.error);
@@ -135,6 +191,7 @@ export async function setStrategyEnabled(id: string, enabled: boolean): Promise<
  * weaken that: it posts named parameters and surfaces whatever the engine says.
  */
 export async function editParameters(
+  account: AccountRef,
   strategyId: string,
   // `null` is a meaningful value, not an absent one: it clears an optional
   // parameter back to its percentage-based fallback. Omitting a key means
@@ -142,12 +199,17 @@ export async function editParameters(
   parameters: Record<string, number | string | null>,
   reason?: string,
 ): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   const result = await post<{ changes: unknown[] }>(
+    account,
     `/parameters/${encodeURIComponent(strategyId)}`,
     { parameters, reason: reason?.trim() || null },
   );
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -176,16 +238,22 @@ export async function editParameters(
  * separate services: they are different facts with different owners.
  */
 export async function editRiskLimit(
+  account: AccountRef,
   symbol: string,
   limit: number,
   reason?: string,
 ): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   const result = await post<{ oldValue: number | null; newValue: number; changed: boolean }>(
+    account,
     `/risk-limits/${encodeURIComponent(symbol)}`,
     { limit, reason: reason?.trim() || null },
   );
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -203,12 +271,20 @@ export async function editRiskLimit(
 }
 
 /** Runs a fixture through the engine so the ladder can be watched cycling. */
-export async function runReplay(fixture: string): Promise<ActionResult> {
-  const result = await post<{ barsProcessed: number; intentsGenerated: number }>('/engine/replay', {
-    fixture,
-  });
+export async function runReplay(account: AccountRef, fixture: string): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
 
-  revalidatePath('/', 'layout');
+  const result = await post<{ barsProcessed: number; intentsGenerated: number }>(
+    account,
+    '/engine/replay',
+    {
+      fixture,
+    },
+  );
+
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message } = describe(result.error);
@@ -240,15 +316,19 @@ export async function runReplay(fixture: string): Promise<ActionResult> {
  * Nothing here can place an order or close a position; `reconcileAll` has no
  * path to either.
  */
-export async function reconcileNow(): Promise<ActionResult> {
+export async function reconcileNow(account: AccountRef): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   const result = await post<{
     clean: boolean;
     haltedSymbols: string[];
     symbols: { symbol: string }[];
     ordersUpdated: number;
-  }>('/reconcile', {});
+  }>(account, '/reconcile', {});
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -295,9 +375,15 @@ export async function reconcileNow(): Promise<ActionResult> {
  *
  * No `revalidatePath`: nothing changed, so there is nothing to re-read.
  */
-export async function checkPendingOrders(): Promise<ActionResult & { diagnosis?: OrderDiagnosis }> {
+export async function checkPendingOrders(
+  account: AccountRef,
+): Promise<ActionResult & { diagnosis?: OrderDiagnosis }> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   try {
-    const diagnosis = await loadOrderDiagnosis();
+    const diagnosis = await loadOrderDiagnosis(account);
 
     if (!diagnosis.brokerReachable) {
       // Reported as a failure rather than as an empty book. An operator reading
@@ -341,13 +427,17 @@ export async function checkPendingOrders(): Promise<ActionResult & { diagnosis?:
  * all still apply, and an order that would be marketable against the last close
  * is refused rather than sent to cross the spread.
  */
-export async function placeMissingOrders(): Promise<ActionResult> {
+export async function placeMissingOrders(account: AccountRef): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   const result = await post<{
     placed: { candidate: { side: string; limitPrice: number }; quantity: number }[];
     declined: { candidate: { side: string; limitPrice: number }; reason: string }[];
-  }>('/orders/place-missing', {});
+  }>(account, '/orders/place-missing', {});
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -393,14 +483,18 @@ export async function placeMissingOrders(): Promise<ActionResult> {
  * resolve in TWS rather than guessed at. A partially filled order is never
  * eligible.
  */
-export async function resolveDuplicateOrders(): Promise<ActionResult> {
+export async function resolveDuplicateOrders(account: AccountRef): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
+
   const result = await post<{
     cancelled: { clientOrderId: string; limitPrice: number; side: string }[];
     skipped: { limitPrice: number; side: string; reason: string }[];
     failed: { clientOrderId: string; reason: string }[];
-  }>('/orders/resolve-duplicates', {});
+  }>(account, '/orders/resolve-duplicates', {});
 
-  revalidatePath('/', 'layout');
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message, failures } = describe(result.error);
@@ -434,10 +528,14 @@ export async function resolveDuplicateOrders(): Promise<ActionResult> {
   };
 }
 
-export async function resetEngine(): Promise<ActionResult> {
-  const result = await post('/engine/reset', {});
+export async function resetEngine(account: AccountRef): Promise<ActionResult> {
+  if (!account) {
+    return NO_ACCOUNT;
+  }
 
-  revalidatePath('/', 'layout');
+  const result = await post(account, '/engine/reset', {});
+
+  revalidateAccount(account);
 
   if (!result.ok) {
     const { message } = describe(result.error);
@@ -445,4 +543,110 @@ export async function resetEngine(): Promise<ActionResult> {
   }
 
   return { ok: true, message: 'Engine reset.' };
+}
+
+/** One account's outcome from `killAllAccounts`. */
+export interface KillAllOutcome {
+  /** The alias, or the backend URL when the daemon could not say who it is. */
+  target: string;
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * Engages the kill switch on **every** account daemon the dashboard knows of.
+ *
+ * The one control that crosses accounts, and only in the safe direction: it can
+ * engage, never release. Releasing is per account, from that account's own
+ * page, because resuming is a decision about one account's state.
+ *
+ * **A partial failure is reported per account, never summarized away.** An
+ * unreachable daemon is listed as not halted — "I pressed kill all" must not
+ * read as "everything is halted" while one account is still trading.
+ */
+export async function killAllAccounts(
+  reason?: string,
+): Promise<ActionResult & { outcomes: KillAllOutcome[] }> {
+  const entries = await loadAccounts();
+  const why = reason?.trim() || 'operator engaged kill-all via dashboard';
+
+  const outcomes = await Promise.all(
+    entries.map(async (entry): Promise<KillAllOutcome> => {
+      if (!entry.account || entry.error) {
+        return {
+          target: entry.account?.alias ?? entry.url,
+          ok: false,
+          message: `NOT halted — ${entry.error ?? 'backend unreachable'}`,
+        };
+      }
+
+      const result = await post(entry.account.alias, '/kill-switch', {
+        engaged: true,
+        reason: why,
+      });
+
+      return {
+        target: entry.account.alias,
+        ok: result.ok,
+        message: result.ok
+          ? 'kill switch engaged'
+          : `NOT halted — ${describe(result.error).message}`,
+      };
+    }),
+  );
+
+  revalidatePath('/', 'layout');
+
+  const failed = outcomes.filter((outcome) => !outcome.ok);
+
+  return {
+    ok: failed.length === 0,
+    message:
+      failed.length === 0
+        ? `Kill switch engaged on all ${outcomes.length} account(s).`
+        : `${failed.length} of ${outcomes.length} account(s) could NOT be halted.`,
+    failures: failed.map((outcome) => `${outcome.target}: ${outcome.message}`),
+    outcomes,
+  };
+}
+
+/** What the new-account form submits. Validated by the backend, not here. */
+export interface NewAccountInput {
+  alias: string;
+  label: string;
+  mode: string;
+  ibAccountId: string;
+  equity: number;
+  symbolCapital: Record<string, number>;
+  dailyLossThreshold: number;
+  dailyLossBasis: string;
+  reason: string;
+}
+
+/**
+ * Creates an account — the one action that belongs to no account, so it goes
+ * to the primary backend, whose registry the supervisor reads.
+ *
+ * Success means the definition was recorded. The daemon starts on the
+ * supervisor's next poll, and appears in the switcher once it answers — so the
+ * message says so rather than implying the account is already trading.
+ */
+export async function createAccount(input: NewAccountInput): Promise<ActionResult> {
+  const result = await postToPrimary<ManagedAccount>('/accounts', input);
+
+  revalidatePath('/', 'layout');
+
+  if (!result.ok || result.data === null) {
+    const { message, failures } = describe(result.error);
+    return { ok: false, message, failures };
+  }
+
+  const created = result.data;
+
+  return {
+    ok: true,
+    message:
+      `Account "${created.alias}" created (${created.mode}, IB client id ${created.ibClientId}). ` +
+      'Its daemon starts within a few seconds; it trades once it has connected and reconciled.',
+  };
 }

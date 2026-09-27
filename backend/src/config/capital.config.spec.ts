@@ -9,11 +9,11 @@
 
 import { ExecutionMode } from './execution-mode';
 import {
-  PAPER_ACCOUNT_CURRENCY,
-  PAPER_ACCOUNT_EQUITY,
-  PAPER_DAILY_LOSS_BASIS,
-  PAPER_DAILY_LOSS_THRESHOLD,
-  PAPER_SYMBOL_CAPITAL,
+  ACCOUNT_CURRENCY,
+  ACCOUNT_EQUITY,
+  ACCOUNT_DAILY_LOSS_BASIS,
+  ACCOUNT_DAILY_LOSS_THRESHOLD,
+  ACCOUNT_SYMBOL_CAPITAL,
 } from './capital.config';
 import { buildRiskConfig, globalCapitalCap, LossBasis, RiskConfig } from '../risk/risk.config';
 import { evaluateStartupAssertions, SymbolCapital } from '../risk/startup-assertions';
@@ -28,35 +28,35 @@ import {
 /** The PAPER risk config exactly as `risk.module.ts` builds it. */
 function paperRiskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig {
   return buildRiskConfig({
-    accountEquity: PAPER_ACCOUNT_EQUITY,
-    accountCurrency: PAPER_ACCOUNT_CURRENCY,
-    dailyLossThreshold: PAPER_DAILY_LOSS_THRESHOLD,
-    dailyLossBasis: PAPER_DAILY_LOSS_BASIS,
-    perSymbolLimits: PAPER_SYMBOL_CAPITAL,
+    accountEquity: ACCOUNT_EQUITY,
+    accountCurrency: ACCOUNT_CURRENCY,
+    dailyLossThreshold: ACCOUNT_DAILY_LOSS_THRESHOLD,
+    dailyLossBasis: ACCOUNT_DAILY_LOSS_BASIS,
+    perSymbolLimits: ACCOUNT_SYMBOL_CAPITAL,
     ...overrides,
   });
 }
 
 const paperSymbolCapital: SymbolCapital = {
-  [DIP_LADDER_SYMBOL]: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+  [DIP_LADDER_SYMBOL]: ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
 };
 
 describe('Story 13 capital configuration', () => {
   it('keys the allocation by the symbol the ladder actually trades', () => {
     // The literal key in capital.config.ts exists to break an import cycle.
     // This is what stops it drifting from DIP_LADDER_SYMBOL unnoticed.
-    expect(PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]).toBeDefined();
-    expect(PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]).toBeGreaterThan(0);
+    expect(ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]).toBeDefined();
+    expect(ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]).toBeGreaterThan(0);
   });
 
   it('resolves the PRD.md:252 tension on the basis that can actually fire', () => {
     // REALIZED-only can never fire on this strategy: lots close solely in
     // profit. Pinning the basis makes a silent change to it a test failure.
-    expect(PAPER_DAILY_LOSS_BASIS).toBe(LossBasis.REALIZED_AND_UNREALIZED);
+    expect(ACCOUNT_DAILY_LOSS_BASIS).toBe(LossBasis.REALIZED_AND_UNREALIZED);
   });
 
   it('sizes a fully-extended ladder to fit under the 60% global cap', () => {
-    const allocation = PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL];
+    const allocation = ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL];
     const { sizePerRung, escalationFactor, maxConcurrentRungs } = DEFAULT_DIP_LADDER_CONFIG;
 
     // Flat ladder: every rung is the same fraction. Sum the actual escalation
@@ -73,16 +73,16 @@ describe('Story 13 capital configuration', () => {
   });
 
   it('sets the loss threshold below the account equity it protects', () => {
-    expect(PAPER_DAILY_LOSS_THRESHOLD).toBeGreaterThan(0);
-    expect(PAPER_DAILY_LOSS_THRESHOLD).toBeLessThan(PAPER_ACCOUNT_EQUITY);
+    expect(ACCOUNT_DAILY_LOSS_THRESHOLD).toBeGreaterThan(0);
+    expect(ACCOUNT_DAILY_LOSS_THRESHOLD).toBeLessThan(ACCOUNT_EQUITY);
   });
 
   it('expresses the capital figures in the currency the instrument trades in', () => {
     // The cap compares position notional against equity directly, so these must
     // agree. They are both USD by an operator decision to hand-convert the CAD
     // balance rather than build FX conversion — see capital.config.ts.
-    expect(PAPER_ACCOUNT_CURRENCY).toBe('USD');
-    expect(PAPER_ACCOUNT_CURRENCY).toBe(DIP_LADDER_CURRENCY);
+    expect(ACCOUNT_CURRENCY).toBe('USD');
+    expect(ACCOUNT_CURRENCY).toBe(DIP_LADDER_CURRENCY);
   });
 });
 
@@ -214,7 +214,7 @@ describe('startup assertions with Story 13 values set', () => {
 describe('ladder sizing per mode', () => {
   it('sizes rungs from the real allocation in PAPER', () => {
     const capital = ladderCapital(ExecutionMode.PAPER, DIP_LADDER_SYMBOL);
-    expect(capital).toBe(PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]);
+    expect(capital).toBe(ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]);
 
     const config = buildDipLadderConfig(DIP_LADDER_SYMBOL, { symbolCapital: capital });
 
@@ -233,10 +233,10 @@ describe('ladder sizing per mode', () => {
     // The SHADOW display notional is gone with SHADOW. There is one allocation
     // now, so a rung is sized the same however the engine was started.
     expect(ladderCapital(ExecutionMode.SHADOW, DIP_LADDER_SYMBOL)).toBe(
-      PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+      ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
     );
     expect(ladderCapital(ExecutionMode.LIVE, DIP_LADDER_SYMBOL)).toBe(
-      PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+      ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
     );
   });
 });

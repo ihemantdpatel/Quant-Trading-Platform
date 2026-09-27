@@ -33,6 +33,83 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// An IB account this system trades — the owner of every per-account row.
+///
+/// Keyed by the **alias** from `accounts.config.ts`, not the IB account id: the
+/// alias is what migrations and rows name, and the id (`DU…`/`U…`) stays out
+/// of git. `ibAccountId` is pinned on first boot by `AccountRegistrationService`
+/// and a later boot pairing the alias with a different id is refused — a
+/// ladder's lots belong to the account whose fills created them.
+///
+/// Shared tables — `Instrument`, `Bar`, `BacktestRun`, `BacktestResult` — have
+/// no owner: market data is the same whichever account reads it, and a
+/// backtest is not something an account traded.
+model Account {
+  id          String  @id @db.VarChar(64)
+  /// Null until a daemon bound to IB registers it; the mock broker has no id.
+  ibAccountId String? @unique @db.VarChar(32)
+  label       String  @db.VarChar(128)
+  createdAt   String  @db.VarChar(32)
+
+  orderIntents          OrderIntent[]
+  orders                Order[]
+  fills                 Fill[]
+  positions             Position[]
+  lots                  Lot[]
+  rungs                 Rung[]
+  gridLots              GridLot[]
+  strategyInstances     StrategyInstance[]
+  strategyStateSnaps    StrategyStateSnapshot[]
+  riskEvents            RiskEvent[]
+  lotRebuildEvents      LotRebuildEvent[]
+  parameterChanges      ParameterChange[]
+  perSymbolLimitChanges PerSymbolLimitChange[]
+}
+
+/// An account created from the dashboard rather than written into
+/// `accounts.config.ts` — its capital figures and what the supervisor needs to
+/// run a daemon for it (`src/config/account-definition.ts`,
+/// `src/supervisor/`).
+///
+/// No relation to `Account`: that row is written by the daemon itself on boot,
+/// the same way for every account, and this one exists before any daemon does.
+/// `ibAccountId`, `ibClientId`, and `port` are unique so two definitions can
+/// never be started against one broker account, one IB session, or one port —
+/// a creation race loses on the constraint rather than both succeeding.
+model AccountDefinition {
+  alias              String  @id @db.VarChar(64)
+  label              String  @db.VarChar(128)
+  /// The mode the daemon is started in; also its only permitted mode.
+  executionMode      String  @db.VarChar(16)
+  currency           String  @db.VarChar(8)
+  equity             Decimal @db.Decimal(18, 6)
+  /// `{ [symbol]: allocation }`, in `currency`.
+  symbolCapital      Json
+  dailyLossThreshold Decimal @db.Decimal(18, 6)
+  dailyLossBasis     String  @db.VarChar(32)
+  ibAccountId        String? @unique @db.VarChar(32)
+  ibClientId         Int     @unique
+  port               Int     @unique
+  createdAt          String  @db.VarChar(32)
+}
+
+/// The append-only audit trail for `AccountDefinition`. Enforced by triggers,
+/// as `ParameterChange` is: which accounts may trade, and with how much, is the
+/// decision reviewed source used to record, and the log is what replaces that
+/// review trail for accounts created at runtime.
+model AccountDefinitionChange {
+  id         Int     @id @default(autoincrement())
+  alias      String  @db.VarChar(64)
+  /// `CREATED` today; retire/edit would add actions rather than rows elsewhere.
+  action     String  @db.VarChar(16)
+  /// The full definition as written, IB id included.
+  definition Json
+  reason     String? @db.Text
+  timestamp  String  @db.VarChar(32)
+
+  @@index([alias], name: "account_definition_change_alias")
+}
+
 /// Instrument vocabulary, mirroring `domain/contract.ts`. Options are modelled
 /// from day one (`PRD.md:226`) — retrofitting them later is a rewrite.
 model Instrument {
@@ -85,7 +162,8 @@ model Bar {
 /// This row is what makes the crash window between "order sent" and "fill
 /// recorded" recoverable at Story 9 rather than a silent gap.
 model OrderIntent {
-  id            String  @id @db.VarChar(191)
+  accountId     String  @db.VarChar(64)
+  id            String  @db.VarChar(191)
   strategyId    String  @db.VarChar(128)
   symbol        String  @db.VarChar(32)
   side          String  @db.VarChar(8)
@@ -105,11 +183,15 @@ model OrderIntent {
   clientOrderId String? @db.VarChar(128)
   createdAt     String  @db.VarChar(32)
 
-  @@index([symbol], name: "order_intent_symbol")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, id])
+  @@index([accountId, symbol], name: "order_intent_symbol")
 }
 
 model Order {
-  clientOrderId String  @id @db.VarChar(128)
+  accountId     String  @db.VarChar(64)
+  clientOrderId String  @db.VarChar(128)
   brokerOrderId String? @db.VarChar(128)
   symbol        String  @db.VarChar(32)
   side          String  @db.VarChar(8)
@@ -120,11 +202,15 @@ model Order {
   strategyId    String  @db.VarChar(128)
   createdAt     String  @db.VarChar(32)
 
-  @@index([symbol], name: "order_symbol")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, clientOrderId])
+  @@index([accountId, symbol], name: "order_symbol")
 }
 
 model Fill {
-  fillId        String  @id @db.VarChar(191)
+  accountId     String  @db.VarChar(64)
+  fillId        String  @db.VarChar(191)
   clientOrderId String  @db.VarChar(128)
   brokerOrderId String? @db.VarChar(128)
   symbol        String  @db.VarChar(32)
@@ -147,16 +233,24 @@ model Fill {
   //
   // Indexed, so the join `findByClientOrderId` performs is still cheap. One
   // order can produce many fills — partial fills are modelled, not an edge case.
-  @@index([clientOrderId], name: "fill_client_order")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, fillId])
+  @@index([accountId, clientOrderId], name: "fill_client_order")
 }
 
 /// Broker net position. IB is authoritative here; the DB is authoritative on
 /// lot composition, and Story 9 asserts the two agree.
 model Position {
-  symbol      String  @id @db.VarChar(32)
+  accountId   String  @db.VarChar(64)
+  symbol      String  @db.VarChar(32)
   quantity    Int
   averageCost Decimal @db.Decimal(18, 6)
   updatedAt   String  @db.VarChar(32)
+
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, symbol])
 }
 
 /// `Lot` — the durable unit of the ladder (`lot.ts:1`).
@@ -165,31 +259,35 @@ model Position {
 /// with a blended basis. IB reports only a net figure, so these rows are the
 /// only authoritative record of which lot is which.
 model Lot {
-  id       String @id @db.VarChar(191)
-  symbol   String @db.VarChar(32)
+  accountId      String   @db.VarChar(64)
+  id             String   @db.VarChar(191)
+  symbol         String   @db.VarChar(32)
   /// The rung level this lot occupies — its re-arm price.
-  rungPrice  Decimal @db.Decimal(18, 6)
+  rungPrice      Decimal  @db.Decimal(18, 6)
   /// What this lot actually paid. The *only* basis for its exit target.
-  fillPrice  Decimal @db.Decimal(18, 6)
-  quantity   Int
+  fillPrice      Decimal  @db.Decimal(18, 6)
+  quantity       Int
   /// ISO-8601 ET. The FIFO sort key — ordering must survive this round trip
   /// (`stories.md:515`), because which lot is sold depends on it.
-  openedAt   String  @db.VarChar(32)
+  openedAt       String   @db.VarChar(32)
   /// Frozen at open from the parameters in force at that moment
   /// (`PRD.md:386`). Stored, never recomputed.
-  exitTarget Decimal @db.Decimal(18, 6)
-  status     String  @db.VarChar(16)
-  closedAt   String? @db.VarChar(32)
-  exitPrice  Decimal? @db.Decimal(18, 6)
+  exitTarget     Decimal  @db.Decimal(18, 6)
+  status         String   @db.VarChar(16)
+  closedAt       String?  @db.VarChar(32)
+  exitPrice      Decimal? @db.Decimal(18, 6)
   /// The resting SELL working against this lot, or null when none is. The
   /// durable record reconciliation rebuilds the engine's in-memory map from
   /// after a restart — an order outlives the process that placed it.
-  workingOrderId String? @db.VarChar(191)
+  workingOrderId String?  @db.VarChar(191)
 
   // FIFO reads are `WHERE symbol = ? ORDER BY openedAt, id`. `id` is in the
   // index so the ordering is total and stable when one bar fills two rungs.
-  @@index([symbol, openedAt, id], name: "lot_symbol_fifo")
-  @@index([symbol, status], name: "lot_symbol_status")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, id])
+  @@index([accountId, symbol, openedAt, id], name: "lot_symbol_fifo")
+  @@index([accountId, symbol, status], name: "lot_symbol_status")
 }
 
 /// `Rung` — a price level, not a one-shot slot (`rung.ts:4`).
@@ -198,21 +296,25 @@ model Lot {
 /// original price*, there is nothing to recompute it from. This table is what
 /// makes **re-arming survive a restart** (`stories.md:490`).
 model Rung {
-  symbol String  @db.VarChar(32)
+  accountId       String  @db.VarChar(64)
+  symbol          String  @db.VarChar(32)
   /// The level. Immutable for the life of the rung — what re-arming preserves.
-  price  Decimal @db.Decimal(18, 6)
-  status String  @db.VarChar(16)
+  price           Decimal @db.Decimal(18, 6)
+  status          String  @db.VarChar(16)
   /// Id of the lot currently held here, or null.
-  lotId  String? @db.VarChar(191)
+  lotId           String? @db.VarChar(191)
   /// clientOrderId of a limit order resting at this level, or null. Nullable
   /// rather than defaulted: "no order here" is a real state, not a missing one.
   workingOrderId  String? @db.VarChar(191)
-  completedCycles Int    @default(0)
+  completedCycles Int     @default(0)
   lastExitAt      String? @db.VarChar(32)
 
-  // A rung is identified by its level within a symbol; there is at most one
-  // rung per price, which is what makes "already holds a lot" answerable.
-  @@id([symbol, price])
+  account Account @relation(fields: [accountId], references: [id])
+
+  // A rung is identified by its level within a symbol and account; there is at
+  // most one rung per price, which is what makes "already holds a lot"
+  // answerable. Two accounts laddering the same symbol hold separate rungs.
+  @@id([accountId, symbol, price])
 }
 
 /// `GridLot` — the durable unit of the grid strategy, parallel to `Lot` but
@@ -222,7 +324,8 @@ model Rung {
 /// `strategyId` is present here from the start (e.g. `grid:TQQQ`) so a future
 /// second grid instance on another symbol needs no migration to coexist.
 model GridLot {
-  id             String   @id @db.VarChar(191)
+  accountId      String   @db.VarChar(64)
+  id             String   @db.VarChar(191)
   strategyId     String   @db.VarChar(128)
   symbol         String   @db.VarChar(32)
   /// What this lot actually paid. The only basis for its sell target.
@@ -239,19 +342,26 @@ model GridLot {
   /// The resting SELL working against this lot, or null when none is.
   workingOrderId String?  @db.VarChar(191)
 
-  @@index([symbol, openedAt, id], name: "grid_lot_symbol_fifo")
-  @@index([strategyId, status], name: "grid_lot_strategy_status")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, id])
+  @@index([accountId, symbol, openedAt, id], name: "grid_lot_symbol_fifo")
+  @@index([accountId, strategyId, status], name: "grid_lot_strategy_status")
 }
 
 /// A registered strategy instance and whether it is enabled.
 model StrategyInstance {
-  id        String  @id @db.VarChar(128)
+  accountId String  @db.VarChar(64)
+  id        String  @db.VarChar(128)
   name      String  @db.VarChar(128)
   enabled   Boolean @default(false)
   symbols   Json
   updatedAt String  @db.VarChar(32)
 
+  account   Account                 @relation(fields: [accountId], references: [id])
   snapshots StrategyStateSnapshot[]
+
+  @@id([accountId, id])
 }
 
 /// Versioned strategy state — the durable recovery unit (`types.ts:107`).
@@ -265,6 +375,7 @@ model StrategyInstance {
 /// to the previous good snapshot if the newest one was written mid-crash.
 model StrategyStateSnapshot {
   id         BigInt @id @default(autoincrement())
+  accountId  String @db.VarChar(64)
   strategyId String @db.VarChar(128)
   /// Schema version of `data`. Checked before the state is trusted.
   version    Int
@@ -272,27 +383,31 @@ model StrategyStateSnapshot {
   data       Json
   capturedAt String @db.VarChar(32)
 
-  strategy StrategyInstance @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  account  Account          @relation(fields: [accountId], references: [id])
+  strategy StrategyInstance @relation(fields: [accountId, strategyId], references: [accountId, id], onDelete: Cascade)
 
   // Recovery wants the newest snapshot for a strategy.
-  @@index([strategyId, capturedAt], name: "snapshot_strategy_time")
+  @@index([accountId, strategyId, capturedAt], name: "snapshot_strategy_time")
 }
 
 /// One row per rejection, resize, halt, and kill-switch activation
 /// (`stories.md:340`). Approvals are deliberately absent — an approved intent
 /// becomes an order, and the order log is that record.
 model RiskEvent {
-  id                BigInt  @id @default(autoincrement())
-  type              String  @db.VarChar(32)
-  reason            String  @db.VarChar(64)
-  detail            String  @db.Text
-  timestamp         String  @db.VarChar(32)
+  id               BigInt @id @default(autoincrement())
+  accountId        String @db.VarChar(64)
+  type             String @db.VarChar(32)
+  reason           String @db.VarChar(64)
+  detail           String @db.Text
+  timestamp        String @db.VarChar(32)
   /// Null for events not tied to a specific intent (halts, kill switch).
-  intent            Json?
+  intent           Json?
   /// Populated on RESIZE. Null otherwise.
-  approvedQuantity  Int?
+  approvedQuantity Int?
 
-  @@index([timestamp], name: "risk_event_time")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@index([accountId, timestamp], name: "risk_event_time")
 }
 
 /// One row per automatic lot-sum/state-version rebuild — the audit trail for
@@ -302,6 +417,7 @@ model RiskEvent {
 /// not cover (it is gated to PAPER; a LIVE mismatch still halts).
 model LotRebuildEvent {
   id                BigInt  @id @default(autoincrement())
+  accountId         String  @db.VarChar(64)
   symbol            String  @db.VarChar(32)
   strategyId        String  @db.VarChar(128)
   /// LOT_SUM_MISMATCH or STATE_VERSION_MISMATCH — the condition that triggered it.
@@ -319,8 +435,10 @@ model LotRebuildEvent {
   detail            String  @db.Text
   timestamp         String  @db.VarChar(32)
 
-  @@index([timestamp], name: "lot_rebuild_event_time")
-  @@index([symbol], name: "lot_rebuild_event_symbol")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@index([accountId, timestamp], name: "lot_rebuild_event_time")
+  @@index([accountId, symbol], name: "lot_rebuild_event_symbol")
 }
 
 /// **Append-only** (`PRD.md:392`).
@@ -331,21 +449,25 @@ model LotRebuildEvent {
 /// `BEFORE DELETE` triggers that raise SQLSTATE 45000, so the property holds
 /// against any client, including a DBA at a mysql prompt (`stories.md:494`).
 model ParameterChange {
-  id         String @id @db.VarChar(191)
+  accountId     String  @db.VarChar(64)
+  id            String  @db.VarChar(191)
   /// Shared by every field in the same edit request.
-  changeId   String @db.VarChar(191)
-  strategyId String @db.VarChar(128)
-  parameter  String @db.VarChar(64)
-  oldValue   Json
-  newValue   Json
-  timestamp  String @db.VarChar(32)
+  changeId      String  @db.VarChar(191)
+  strategyId    String  @db.VarChar(128)
+  parameter     String  @db.VarChar(64)
+  oldValue      Json
+  newValue      Json
+  timestamp     String  @db.VarChar(32)
   /// The strategy's full state at the moment of the edit (`PRD.md:392`) —
   /// what makes a frozen exit target reconstructable after the fact.
   stateAtChange Json?
   reason        String? @db.Text
 
-  @@index([strategyId], name: "parameter_change_strategy")
-  @@index([changeId], name: "parameter_change_group")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, id])
+  @@index([accountId, strategyId], name: "parameter_change_strategy")
+  @@index([accountId, changeId], name: "parameter_change_group")
 }
 
 /// **Append-only.** The audit trail for edits to `RiskConfig.perSymbolLimits`
@@ -356,7 +478,8 @@ model ParameterChange {
 /// `ParameterChange`: `BEFORE UPDATE`/`BEFORE DELETE` triggers reject any
 /// attempt to rewrite a row.
 model PerSymbolLimitChange {
-  id        String   @id @db.VarChar(191)
+  accountId String   @db.VarChar(64)
+  id        String   @db.VarChar(191)
   symbol    String   @db.VarChar(32)
   /// Null when the symbol had no configured limit before this edit.
   oldValue  Decimal? @db.Decimal(18, 6)
@@ -364,7 +487,10 @@ model PerSymbolLimitChange {
   timestamp String   @db.VarChar(32)
   reason    String?  @db.Text
 
-  @@index([symbol], name: "per_symbol_limit_change_symbol")
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, id])
+  @@index([accountId, symbol], name: "per_symbol_limit_change_symbol")
 }
 
 /// Story 11 persists these so results are comparable across parameter sets.
@@ -390,13 +516,13 @@ model BacktestRun {
 }
 
 model BacktestResult {
-  id            String  @id @db.VarChar(191)
-  runId         String  @db.VarChar(191)
-  metric        String  @db.VarChar(64)
-  value         Decimal @db.Decimal(24, 8)
+  id     String  @id @db.VarChar(191)
+  runId  String  @db.VarChar(191)
+  metric String  @db.VarChar(64)
+  value  Decimal @db.Decimal(24, 8)
   /// Free-form detail for metrics that are not a single number — rung
   /// distribution, time at the hard floor.
-  detail        Json?
+  detail Json?
 
   run BacktestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 

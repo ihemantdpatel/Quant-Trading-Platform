@@ -11,10 +11,16 @@
  * retarget a filled rung.
  */
 
-import { render, screen } from '@testing-library/react';
+import { render as rtlRender, screen } from '@testing-library/react';
+import { AccountProvider } from './AccountContext';
 import userEvent from '@testing-library/user-event';
 import { ParameterEditor } from './ParameterEditor';
 import type { LadderParameters } from '../lib/api';
+
+/** Every control acts on the account of the page it is on — rendered inside one here. */
+function render(ui: React.ReactElement) {
+  return rtlRender(<AccountProvider account="nuuixl118">{ui}</AccountProvider>);
+}
 
 const editParameters = jest.fn();
 const editRiskLimit = jest.fn();
@@ -95,6 +101,7 @@ describe('ParameterEditor', () => {
     await user.click(screen.getByRole('button', { name: /apply to future rungs/i }));
 
     expect(editParameters).toHaveBeenCalledWith(
+      'nuuixl118',
       'dip-ladder:TQQQ',
       // 8% is sent as 0.08, matching `DipLadderConfig`.
       expect.objectContaining({ takeProfitPercent: 0.08 }),
@@ -237,7 +244,7 @@ describe('ParameterEditor with fixed-dollar parameters', () => {
 
     await user.click(screen.getByRole('button', { name: /apply to future rungs/i }));
 
-    const payload = editParameters.mock.calls[0][1] as Record<string, unknown>;
+    const payload = editParameters.mock.calls[0][2] as Record<string, unknown>;
 
     expect(payload).not.toHaveProperty('spacingPercent');
     expect(payload).not.toHaveProperty('takeProfitPercent');
@@ -255,7 +262,7 @@ describe('ParameterEditor with fixed-dollar parameters', () => {
     await user.clear(screen.getByLabelText('Fixed quantity'));
     await user.click(screen.getByRole('button', { name: /apply to future rungs/i }));
 
-    const payload = editParameters.mock.calls[0][1] as Record<string, unknown>;
+    const payload = editParameters.mock.calls[0][2] as Record<string, unknown>;
 
     // Explicitly null rather than absent: omitting the key means "leave
     // unchanged", which would make clearing the field impossible.
@@ -325,7 +332,7 @@ describe('ParameterEditor risk limit section', () => {
     await user.type(input, '180000');
     await user.click(screen.getByRole('button', { name: /update limit/i }));
 
-    expect(editRiskLimit).toHaveBeenCalledWith('TQQQ', 180_000, '');
+    expect(editRiskLimit).toHaveBeenCalledWith('nuuixl118', 'TQQQ', 180_000, '');
     expect(editParameters).not.toHaveBeenCalled();
 
     const status = await screen.findByRole('status');

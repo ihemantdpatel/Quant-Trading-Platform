@@ -13,14 +13,14 @@
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import ExecutionPage from './page';
-import { loadExecution, type ExecutionData } from './lib/api';
+import { loadExecution, type ExecutionData } from '../../lib/api';
 
-jest.mock('./lib/api', () => {
-  const actual = jest.requireActual('./lib/api');
+jest.mock('../../lib/api', () => {
+  const actual = jest.requireActual('../../lib/api');
   return { ...actual, loadExecution: jest.fn() };
 });
 
-jest.mock('./actions', () => ({
+jest.mock('../../actions', () => ({
   setKillSwitch: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
   setMode: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
   setStrategyEnabled: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
@@ -30,6 +30,9 @@ jest.mock('./actions', () => ({
 }));
 
 const mockLoad = loadExecution as jest.MockedFunction<typeof loadExecution>;
+
+/** The route params Next.js hands the page, as a Promise (App Router, Next 15). */
+const inAccount = { params: Promise.resolve({ accountId: 'nuuixl118' }) };
 
 function executionData(overrides: Partial<ExecutionData> = {}): ExecutionData {
   return {
@@ -75,7 +78,7 @@ describe('Execution page', () => {
     mockLoad.mockResolvedValue(executionData());
     const user = userEvent.setup();
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
     // Execution mode is a tab within the Overview panel now, not an
     // always-visible block — see `OverviewPanel`.
     await user.click(screen.getByRole('tab', { name: 'Execution mode' }));
@@ -117,7 +120,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.getByRole('region', { name: /^ladder$/i })).toBeInTheDocument();
     expect(screen.getByTestId('rung-95')).toBeInTheDocument();
@@ -162,7 +165,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     const holdings = screen.getByRole('region', { name: /^holdings$/i });
 
@@ -189,7 +192,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.queryByRole('region', { name: /^holdings$/i })).not.toBeInTheDocument();
   });
@@ -203,7 +206,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.queryByRole('region', { name: /^ladder$/i })).not.toBeInTheDocument();
   });
@@ -236,7 +239,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.queryByRole('region', { name: /^ladder$/i })).not.toBeInTheDocument();
   });
@@ -269,7 +272,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.getByRole('region', { name: /^holdings$/i })).toBeInTheDocument();
     expect(screen.getByTestId('lot-row-TQQQ-lot-1')).toBeInTheDocument();
@@ -285,7 +288,7 @@ describe('Execution page', () => {
       }),
     );
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.getByRole('region', { name: /^holdings$/i })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: /^ladder$/i })).not.toBeInTheDocument();
@@ -294,7 +297,7 @@ describe('Execution page', () => {
   it('offers replay controls against the mock broker', async () => {
     mockLoad.mockResolvedValue(withBroker('mock'));
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.getByRole('region', { name: /engine controls/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^replay$/i })).toBeInTheDocument();
@@ -303,7 +306,7 @@ describe('Execution page', () => {
   it('hides replay controls when IB is the bound broker', async () => {
     mockLoad.mockResolvedValue(withBroker('ib'));
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     // Replaying a fixture into a live session would corrupt the session being
     // observed, and Reset would discard the state the daily report reads.
@@ -316,7 +319,7 @@ describe('Execution page', () => {
     // An unreachable backend must not be read as "safe to replay".
     mockLoad.mockResolvedValue(executionData({ status: null, error: 'fetch failed' }));
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.queryByRole('button', { name: /^replay$/i })).not.toBeInTheDocument();
   });
@@ -325,8 +328,18 @@ describe('Execution page', () => {
     // Configuration lives on its own tab; this page is execution state only.
     mockLoad.mockResolvedValue(executionData());
 
-    render(await ExecutionPage());
+    render(await ExecutionPage(inAccount));
 
     expect(screen.queryByRole('button', { name: /apply/i })).not.toBeInTheDocument();
+  });
+
+  it('loads the account named in the route, and no other', async () => {
+    mockLoad.mockClear();
+    mockLoad.mockResolvedValue(executionData());
+
+    // Next.js passes the segment URL-encoded; the loader must get the alias.
+    render(await ExecutionPage({ params: Promise.resolve({ accountId: 'paper%20two' }) }));
+
+    expect(mockLoad).toHaveBeenCalledWith('paper two');
   });
 });

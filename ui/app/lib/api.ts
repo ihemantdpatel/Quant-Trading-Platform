@@ -30,7 +30,222 @@
  * `NEXT_PUBLIC_` prefix and is deliberately not inlined into the client bundle,
  * where a service name would not resolve from a browser anyway.
  */
-const API_URL = process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000';
+/** The environment variables these read — narrower than `ProcessEnv`, so tests can pass a literal. */
+type Env = Record<string, string | undefined>;
+
+function defaultApiUrl(env: Env = process.env): string {
+  return env.API_URL ?? env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000';
+}
+
+/**
+ * Every account daemon the dashboard offers — one backend process per IB
+ * account (`backend/src/config/accounts.config.ts`).
+ *
+ * `ACCOUNT_BACKENDS` is a comma-separated list of **URLs only**. Which account
+ * each one trades is asked of the daemon itself (`GET /account`) rather than
+ * written beside the URL here: a hand-maintained URL→account map could label
+ * one account's lots with another's name after a single typo, and on a control
+ * surface that is how an operator engages the wrong kill switch.
+ *
+ * Unset, it is the one backend `API_URL` names — the single-account setup that
+ * predates accounts.
+ */
+export function accountBackendUrls(env: Env = process.env): string[] {
+  const listed = (env.ACCOUNT_BACKENDS ?? '')
+    .split(',')
+    .map((url) => url.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+
+  return listed.length > 0 ? [...new Set(listed)] : [defaultApiUrl(env)];
+}
+
+/**
+ * An account created from the dashboard (`GET /accounts` on the primary
+ * backend). The supervisor runs a daemon for each, on `port` inside the backend
+ * container.
+ */
+export interface ManagedAccount {
+  alias: string;
+  label: string;
+  mode: ExecutionMode;
+  currency: string;
+  equity: number;
+  symbolCapital: Record<string, number>;
+  dailyLossThreshold: number;
+  dailyLossBasis: string;
+  /** Masked (`DU•••321`). */
+  ibAccountId: string | null;
+  ibClientId: number;
+  port: number;
+  createdAt: string;
+}
+
+/**
+ * The dashboard-created accounts, as the primary backend lists them.
+ *
+ * The primary is `API_URL` — the one daemon every deployment has, whose
+ * registry the supervisor reads. Throws when it cannot be asked; callers decide
+ * what "unknown" means for them.
+ */
+export async function loadManagedAccounts(env: Env = process.env): Promise<ManagedAccount[]> {
+  const listed = await get<unknown>(defaultApiUrl(env), '/accounts', ACCOUNT_PROBE_TIMEOUT_MS);
+
+  // Only entries with a usable port: an older backend without the route, or a
+  // malformed row, must add nothing to discovery rather than a bogus URL.
+  return Array.isArray(listed)
+    ? (listed as ManagedAccount[]).filter(
+        (account) =>
+          typeof account?.alias === 'string' && Number.isInteger(account.port) && account.port > 0,
+      )
+    : [];
+}
+
+/**
+ * Where a dashboard-created account's daemon answers: the primary backend's
+ * host, on the account's own port. The supervisor runs every daemon in the
+ * backend container, so the host that reaches the primary reaches them all —
+ * and no port needs publishing beyond the compose network.
+ */
+export function managedAccountUrl(primaryUrl: string, port: number): string {
+  const url = new URL(primaryUrl);
+  url.port = String(port);
+  return url.toString().replace(/\/+$/, '');
+}
+
+/**
+ * Every backend URL to probe: `ACCOUNT_BACKENDS` plus one per dashboard-created
+ * account.
+ *
+ * A registry that cannot be read adds nothing rather than failing discovery:
+ * the configured backends must still be listed — kill-all depends on them —
+ * and the primary being unreachable already shows as its own entry.
+ */
+async function discoverBackendUrls(env: Env = process.env): Promise<string[]> {
+  const configured = accountBackendUrls(env);
+
+  let managed: ManagedAccount[] = [];
+
+  try {
+    managed = await loadManagedAccounts(env);
+  } catch {
+    managed = [];
+  }
+
+  const primary = defaultApiUrl(env);
+  const urls = managed.map((account) => managedAccountUrl(primary, account.port));
+
+  return [...new Set([...configured, ...urls])];
+}
+
+/** What a daemon says about itself on `GET /account`. */
+export interface AccountInfo {
+  alias: string;
+  label: string;
+  /** Masked (`DU•••567`) — a label for telling accounts apart, never the full id. */
+  ibAccountId: string | null;
+  mode: ExecutionMode;
+  allowedModes: ExecutionMode[];
+  broker: { name: string; connected: boolean };
+  /** Kill switch engaged, entries halted, or any symbol halted. */
+  halted: boolean;
+}
+
+/**
+ * One configured backend and what it answered.
+ *
+ * `account` is null when the daemon could not be asked. It is kept in the list
+ * rather than dropped: "unreachable" and "not configured" must look different
+ * on a control surface, the same reason `GET /positions` answers 503 rather
+ * than `[]`.
+ */
+export interface AccountEntry {
+  url: string;
+  account: AccountInfo | null;
+  error: string | null;
+}
+
+/**
+ * How long the switcher waits on one daemon. Short, because the layout renders
+ * this on every refresh and one hung daemon must not stall the dashboard for
+ * every other account.
+ */
+const ACCOUNT_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Asks every configured daemon who it is. Never throws.
+ *
+ * **Two daemons claiming one alias are both marked in error** rather than one
+ * being picked. That is a misconfiguration in which two processes trade — and
+ * write — the same account's rows, and the dashboard must not quietly show one
+ * of them as though nothing were wrong.
+ */
+export async function loadAccounts(): Promise<AccountEntry[]> {
+  const urls = await discoverBackendUrls();
+
+  const entries = await Promise.all(
+    urls.map(async (url): Promise<AccountEntry> => {
+      try {
+        const account = await get<AccountInfo>(url, '/account', ACCOUNT_PROBE_TIMEOUT_MS);
+        return { url, account, error: null };
+      } catch (error) {
+        return { url, account: null, error: failure(error) };
+      }
+    }),
+  );
+
+  const claims = new Map<string, number>();
+
+  for (const entry of entries) {
+    if (entry.account) {
+      claims.set(entry.account.alias, (claims.get(entry.account.alias) ?? 0) + 1);
+    }
+  }
+
+  return entries.map((entry) =>
+    entry.account && (claims.get(entry.account.alias) ?? 0) > 1
+      ? {
+          ...entry,
+          error: `more than one backend reports account "${entry.account.alias}"`,
+        }
+      : entry,
+  );
+}
+
+export class AccountUnavailableError extends Error {
+  constructor(readonly account: string) {
+    super(`account "${account}" is not served by any reachable backend`);
+    this.name = 'AccountUnavailableError';
+  }
+}
+
+/**
+ * The base URL of the daemon trading `account`.
+ *
+ * Resolved afresh on every call, never cached: a daemon that restarts on a
+ * different port, or a second daemon wrongly started under the same alias,
+ * must change the answer immediately — a stale mapping would send a control
+ * action to the wrong process.
+ */
+async function baseUrlFor(account: string): Promise<string> {
+  const entry = (await loadAccounts()).find(
+    (candidate) => candidate.account?.alias === account && candidate.error === null,
+  );
+
+  if (!entry) {
+    throw new AccountUnavailableError(account);
+  }
+
+  return entry.url;
+}
+
+/**
+ * Any reachable backend, for the reads that belong to no account — backtests
+ * and the bar cache are shared, so every daemon serves the same answer.
+ */
+async function anyBaseUrl(): Promise<string> {
+  const entries = await loadAccounts();
+  return (entries.find((entry) => entry.account !== null) ?? entries[0]).url;
+}
 
 export type ExecutionMode = 'SHADOW' | 'PAPER' | 'LIVE';
 export type LotStatus = 'HELD' | 'CLOSED';
@@ -477,11 +692,25 @@ export interface ParametersData {
  * state; a cached ladder is a *wrong* ladder, and this is a control surface for
  * a system that places real orders.
  */
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
-    cache: 'no-store',
-    headers: { accept: 'application/json' },
-  });
+async function get<T>(baseUrl: string, path: string, timeoutMs?: number): Promise<T> {
+  // A controller rather than `AbortSignal.timeout`, so the timer is cleared the
+  // moment the daemon answers instead of outliving every fast request.
+  const controller = timeoutMs === undefined ? null : new AbortController();
+  const timer = controller === null ? null : setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      cache: 'no-store',
+      headers: { accept: 'application/json' },
+      ...(controller === null ? {} : { signal: controller.signal }),
+    });
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }
 
   if (!response.ok) {
     throw new ApiError(`GET ${path} failed`, response.status, await safeBody(response));
@@ -554,8 +783,8 @@ export interface OrderDiagnosis {
 }
 
 /** Reads the order diagnosis. Nothing about this call changes engine state. */
-export async function loadOrderDiagnosis(): Promise<OrderDiagnosis> {
-  return get<OrderDiagnosis>('/orders/diagnosis');
+export async function loadOrderDiagnosis(account: string): Promise<OrderDiagnosis> {
+  return get<OrderDiagnosis>(await baseUrlFor(account), '/orders/diagnosis');
 }
 
 export class ApiError extends Error {
@@ -585,12 +814,34 @@ async function safeBody(response: Response): Promise<unknown> {
  * (`stories.md:445`), and those must reach the operator, not be swallowed by an
  * exception.
  */
+export type PostResult<T> = { ok: boolean; status: number; data: T | null; error: unknown };
+
 export async function post<T>(
+  account: string,
   path: string,
   body: unknown,
-): Promise<{ ok: boolean; status: number; data: T | null; error: unknown }> {
+): Promise<PostResult<T>> {
+  // Resolved inside the helper's try: an account no reachable daemon claims is
+  // a refused action with a reason, never a request sent somewhere else.
+  return postTo<T>(() => baseUrlFor(account), path, body);
+}
+
+/**
+ * A POST to the primary backend — for the one action that belongs to no
+ * account yet: creating one.
+ */
+export async function postToPrimary<T>(path: string, body: unknown): Promise<PostResult<T>> {
+  return postTo<T>(async () => defaultApiUrl(), path, body);
+}
+
+async function postTo<T>(
+  resolveBaseUrl: () => Promise<string>,
+  path: string,
+  body: unknown,
+): Promise<PostResult<T>> {
   try {
-    const response = await fetch(`${API_URL}${path}`, {
+    const baseUrl = await resolveBaseUrl();
+    const response = await fetch(`${baseUrl}${path}`, {
       method: 'POST',
       cache: 'no-store',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
@@ -644,9 +895,9 @@ function failure(error: unknown): string {
  * the page's status bar succeed or fail together, which is the coupling this
  * split exists to remove.
  */
-export async function loadStatus(): Promise<StatusData> {
+export async function loadStatus(account: string): Promise<StatusData> {
   try {
-    return { status: await get<Status>('/status'), error: null };
+    return { status: await get<Status>(await baseUrlFor(account), '/status'), error: null };
   } catch (error) {
     return { status: null, error: failure(error) };
   }
@@ -672,18 +923,24 @@ export async function loadStatus(): Promise<StatusData> {
  * BACKEND_UNREACHABLE banner keeps meaning what it says rather than firing
  * whenever a single endpoint is unavailable.
  */
-export async function loadExecution(): Promise<ExecutionData> {
+export async function loadExecution(account: string): Promise<ExecutionData> {
+  // Resolved once, up front, so every panel on the page reads the *same*
+  // daemon. Resolving per read could, in principle, split one render across
+  // two processes if the account list changed mid-load.
+  const base = baseUrlFor(account);
+  const read = async <T>(path: string): Promise<T> => get<T>(await base, path);
+
   const [status, lots, rungs, positions, orders, fills, riskEvents, strategies, gridLots] =
     await Promise.allSettled([
-      get<Status>('/status'),
-      get<Lot[]>('/lots'),
-      get<Rung[]>('/rungs'),
-      get<Position[]>('/positions'),
-      get<Order[]>('/orders'),
-      get<Fill[]>('/fills'),
-      get<RiskEvent[]>('/risk-events'),
-      get<StrategySummary[]>('/strategies'),
-      get<GridLot[]>('/grid/lots'),
+      read<Status>('/status'),
+      read<Lot[]>('/lots'),
+      read<Rung[]>('/rungs'),
+      read<Position[]>('/positions'),
+      read<Order[]>('/orders'),
+      read<Fill[]>('/fills'),
+      read<RiskEvent[]>('/risk-events'),
+      read<StrategySummary[]>('/strategies'),
+      read<GridLot[]>('/grid/lots'),
     ]);
 
   const settled = [status, lots, rungs, positions, orders, fills, riskEvents, strategies, gridLots];
@@ -738,7 +995,7 @@ function reasonOf(result: PromiseSettledResult<unknown>): unknown {
  * strategy actually being edited rather than always the ladder's count (see
  * `heldLotCountFor`).
  */
-export async function loadParameters(): Promise<ParametersData> {
+export async function loadParameters(account: string): Promise<ParametersData> {
   const empty: ParametersData = {
     parameters: [],
     parameterChanges: [],
@@ -750,14 +1007,15 @@ export async function loadParameters(): Promise<ParametersData> {
   };
 
   try {
+    const base = await baseUrlFor(account);
     const [parameters, parameterChanges, riskLimits, riskLimitChanges, lots, gridLots] =
       await Promise.all([
-        get<ParameterSet[]>('/parameters'),
-        get<ParameterChange[]>('/parameters/changes'),
-        get<Record<string, number>>('/risk-limits'),
-        get<RiskLimitChange[]>('/risk-limits/changes'),
-        get<Lot[]>('/lots'),
-        get<GridLot[]>('/grid/lots'),
+        get<ParameterSet[]>(base, '/parameters'),
+        get<ParameterChange[]>(base, '/parameters/changes'),
+        get<Record<string, number>>(base, '/risk-limits'),
+        get<RiskLimitChange[]>(base, '/risk-limits/changes'),
+        get<Lot[]>(base, '/lots'),
+        get<GridLot[]>(base, '/grid/lots'),
       ]);
 
     return {
@@ -961,7 +1219,10 @@ export interface BacktestListing {
  */
 export async function loadBacktests(): Promise<BacktestListing> {
   try {
-    const listing = await get<{ runs: BacktestRun[]; count: number }>('/backtest');
+    const listing = await get<{ runs: BacktestRun[]; count: number }>(
+      await anyBaseUrl(),
+      '/backtest',
+    );
 
     return { ...listing, error: null };
   } catch (error) {
@@ -978,6 +1239,7 @@ export async function loadBacktestRun(
 ): Promise<{ run: BacktestRun; results: BacktestResultRow[] } | null> {
   try {
     return await get<{ run: BacktestRun; results: BacktestResultRow[] }>(
+      await anyBaseUrl(),
       `/backtest/${encodeURIComponent(id)}`,
     );
   } catch {
@@ -1008,4 +1270,54 @@ export function formatDuration(ms: number | null): string {
   }
 
   return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * The cookie recording the last account viewed. Read only by the `/` redirect;
+ * nothing that acts on an account consults it (see `AccountContext`).
+ */
+export const LAST_ACCOUNT_COOKIE = 'lastAccount';
+
+/**
+ * Where `/` lands: the preferred account (the last one visited) when a daemon
+ * still answers for it, otherwise the first account that answers. `null` when
+ * none does.
+ *
+ * Only ever chooses among reachable, unambiguous accounts — landing an operator
+ * on a page whose every control would fail is worse than the "nothing is
+ * reachable" page.
+ */
+export function pickDefaultAccount(
+  entries: AccountEntry[],
+  preferred: string | null | undefined,
+): string | null {
+  const usable = entries.filter((entry) => entry.account !== null && entry.error === null);
+
+  return (
+    usable.find((entry) => entry.account!.alias === preferred)?.account!.alias ??
+    usable[0]?.account!.alias ??
+    null
+  );
+}
+
+/**
+ * The account a dashboard path belongs to, and the rest of the path within it:
+ * `/accounts/nuuixl118/parameters` → `{ account: 'nuuixl118', rest: '/parameters' }`.
+ * `null` for a page that belongs to no account (`/backtest`).
+ */
+export function accountFromPath(pathname: string): { account: string; rest: string } | null {
+  const match = /^\/accounts\/([^/]+)(\/.*)?$/.exec(pathname);
+
+  // `/accounts/new` is the create-account page, not an account; the backend
+  // reserves the alias so the two can never collide.
+  if (!match || match[1] === 'new') {
+    return null;
+  }
+
+  return { account: decodeURIComponent(match[1]), rest: match[2] ?? '' };
+}
+
+/** The path of `rest` within `account` — the inverse of `accountFromPath`. */
+export function accountPath(account: string, rest = ''): string {
+  return `/accounts/${encodeURIComponent(account)}${rest}`;
 }

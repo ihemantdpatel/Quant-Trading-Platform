@@ -64,7 +64,9 @@ import {
   OpenOrder,
   OrderStatus,
 } from '../broker/broker-adapter.interface';
+import { ACTIVE_ACCOUNT } from '../config/capital.config';
 import { ExecutionMode } from '../config/execution-mode';
+import { ownsClientOrderId } from '../domain/client-order-id';
 import {
   FILL_REPOSITORY,
   FillRepository,
@@ -1083,8 +1085,15 @@ export class ReconciliationService implements OnModuleInit {
     const knownIds = new Set(
       rungs.map((rung) => rung.workingOrderId).filter((id): id is string => Boolean(id)),
     );
+    // Another account's order is never adopted, even if the broker listed it:
+    // a daemon sharing this IB login issues ids scoped to its own alias, and a
+    // rung here attached to one would be this ladder claiming exposure that
+    // sits in a different account.
     const orphans = restingForSymbol.filter(
-      (order) => order.side === 'BUY' && !knownIds.has(order.clientOrderId),
+      (order) =>
+        order.side === 'BUY' &&
+        !knownIds.has(order.clientOrderId) &&
+        ownsClientOrderId(order.clientOrderId, ACTIVE_ACCOUNT.alias),
     );
 
     for (const orphan of orphans) {

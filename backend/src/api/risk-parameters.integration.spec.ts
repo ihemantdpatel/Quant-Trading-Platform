@@ -14,7 +14,7 @@ import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { AppModule } from '../app.module';
-import { PAPER_SYMBOL_CAPITAL } from '../config/capital.config';
+import { ACCOUNT_SYMBOL_CAPITAL } from '../config/capital.config';
 import { EMPTY_ACCOUNT, RiskManagerService } from '../risk/risk-manager.service';
 import { RiskOutcome, RiskReason } from '../risk/types';
 import { DIP_LADDER_SYMBOL } from '../strategies/strategies.module';
@@ -51,7 +51,7 @@ describe('live editing of the risk layer per-symbol capital limit', () => {
   it('reports the compiled figure before any edit', async () => {
     const response = await http().get('/risk-limits').expect(200);
 
-    expect(response.body[DIP_LADDER_SYMBOL]).toBe(PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]);
+    expect(response.body[DIP_LADDER_SYMBOL]).toBe(ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]);
   });
 
   // 800 shares at $100 = $80,000 notional — past the compiled $40,000 TQQQ
@@ -79,7 +79,7 @@ describe('live editing of the risk layer per-symbol capital limit', () => {
 
     expect(response.body).toMatchObject({
       symbol: DIP_LADDER_SYMBOL,
-      oldValue: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+      oldValue: ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
       newValue: 100_000,
       changed: true,
     });
@@ -100,7 +100,7 @@ describe('live editing of the risk layer per-symbol capital limit', () => {
     expect(response.body).toEqual([
       expect.objectContaining({
         symbol: DIP_LADDER_SYMBOL,
-        oldValue: PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
+        oldValue: ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL],
         newValue: 180_000,
         reason: 'account funded to a larger balance',
       }),
@@ -111,6 +111,6 @@ describe('live editing of the risk layer per-symbol capital limit', () => {
     await http().post(`/risk-limits/${DIP_LADDER_SYMBOL}`).send({ limit: -1 }).expect(422);
 
     const response = await http().get('/risk-limits').expect(200);
-    expect(response.body[DIP_LADDER_SYMBOL]).toBe(PAPER_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]);
+    expect(response.body[DIP_LADDER_SYMBOL]).toBe(ACCOUNT_SYMBOL_CAPITAL[DIP_LADDER_SYMBOL]);
   });
 });

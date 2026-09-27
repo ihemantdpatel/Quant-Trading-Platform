@@ -1288,6 +1288,33 @@ describe('open-order reconciliation across a restart', () => {
     expect(adopted!.workingOrderId).toBe('co-from-before-restart');
   });
 
+  it("never adopts another account's resting order", async () => {
+    // A sibling daemon sharing this IB login issues ids scoped to its own
+    // alias. Adopting one would attach this ladder's rung to exposure held in a
+    // different account — and the next fill would open a lot here for shares
+    // bought there.
+    const broker = new MockBrokerAdapter({ fillMode: FillMode.RESTING });
+    await broker.connect();
+
+    await broker.submit({
+      clientOrderId: 'co-other-account-7',
+      contract: equityContract('TQQQ'),
+      side: 'BUY',
+      quantity: 100,
+      orderType: 'LMT',
+      limitPrice: 95,
+      timeInForce: 'DAY',
+      timestamp: NOW,
+    });
+
+    const harness = buildHarness({ broker });
+    await harness.startup.run(NOW);
+
+    const rungs = harness.engine.ladderRungs();
+
+    expect(rungs.find((rung) => rung.workingOrderId === 'co-other-account-7')).toBeUndefined();
+  });
+
   it('releases a WORKING rung whose order is no longer at the broker', async () => {
     // A DAY order that expired overnight. Left WORKING the level would be
     // blocked forever and the ladder would silently stop laddering.

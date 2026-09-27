@@ -43,4 +43,8 @@ USER node
 
 EXPOSE 3000
 ENTRYPOINT ["./docker-entrypoint.sh"]
-CMD ["node", "dist/main.js"]
+# The supervisor, not a single daemon: it runs the configured account's daemon
+# plus one per dashboard-created account, each its own process
+# (`src/supervisor/supervisor.ts`). Override with `node dist/main.js` to run the
+# configured account alone.
+CMD ["node", "dist/supervisor-main.js"]
