@@ -38,7 +38,14 @@ export interface AccountDefinition {
   allowedModes: readonly ExecutionMode[];
   /** The currency every figure below is expressed in. */
   currency: string;
-  /** Equity the 60% global cap is measured against, in `currency`. */
+  /**
+   * The currency `equity` is denominated in, when that is the account's base
+   * currency rather than `currency` (Story 15). Converted at a live rate per
+   * evaluation; a stale or missing rate blocks new entries. Omitted means
+   * `equity` is already in `currency` and nothing is converted.
+   */
+  equityCurrency?: string;
+  /** Equity the 60% global cap is measured against, in `equityCurrency` ?? `currency`. */
   equity: number;
   /** Per-symbol allocation — expected deployment, not a ceiling. */
   symbolCapital: Readonly<Record<string, number>>;
@@ -68,59 +75,55 @@ export const ACCOUNTS: Readonly<Record<string, AccountDefinition>> = {
     allowedModes: [ExecutionMode.PAPER],
 
     /**
-     * **USD**, matching TQQQ, so the global cap compares like with like.
+     * **USD**, matching TQQQ: every cap and limit is expressed in the traded
+     * currency, because position notional is summed in it and never converted.
      *
-     * **This is not the account's base currency.** IB reports this account in
-     * **CAD** (`NetLiquidation` 248,973.68 on 2026-08-14). Stating USD here is an
-     * operator decision to express the cap in the *traded* currency and convert
-     * the balance once, by hand, rather than block on building FX conversion into
-     * the risk layer.
+     * **This is not the account's base currency** — IB reports it in CAD, which
+     * is `equityCurrency` below. Only equity is converted, at a live `USD.CAD`
+     * rate (Story 15), replacing a hand conversion whose rate went stale the day
+     * it was written.
      *
-     * - The cap arithmetic is sound — a USD notional is compared against a USD
-     *   figure, which is the error this whole check exists to prevent.
-     * - But `equity` below is a **hand-converted snapshot** that goes stale as
-     *   USD/CAD moves, on top of going stale as the balance moves. A weaker CAD
-     *   shrinks the real USD equity while this constant stays put, which loosens
-     *   the cap. The margin below is what absorbs that.
-     *
-     * `assertSingleCurrency` still does its job: it passes because both sides
-     * genuinely say USD, and it would fire again the moment a non-USD instrument
-     * is configured. Resolving this properly — a live `USD.CAD` rate with a
-     * staleness watchdog — remains open; see `docs/decisions/capital-allocation.md`.
+     * `assertSingleCurrency` still does its job: it compares this against the
+     * instruments traded, and would fire the moment a non-USD instrument is
+     * configured.
      */
     currency: 'USD',
 
     /**
+     * The account's real base currency. Because it differs from `currency`, the
+     * risk manager converts `equity` at a live `USD.CAD` ask from IB before
+     * measuring the global cap, and a stale or unavailable rate blocks new
+     * entries (`risk/fx-rate.ts`).
+     */
+    equityCurrency: 'CAD',
+
+    /**
+     * In **CAD**, converted to USD per evaluation.
+     *
      * A static figure rather than a value read from the broker at boot, and that
      * is a deliberate trade-off. `RISK_CONFIG` is built by a **synchronous**
      * factory and asserted in `RiskModule.onModuleInit`, whereas
      * `getAccountSummary()` is async and needs a connected broker — and
      * `StartupSequence.run()` is pointedly *not* awaited so the HTTP server never
-     * waits on IB. Fetching equity before the assertion would reintroduce exactly
-     * that dependency, and the dashboard would go down precisely when IB is
-     * unreachable — when an operator most needs it.
+     * waits on IB.
      *
-     * The cost is that this goes stale if the account balance moves materially.
-     * That is acceptable because it is only a *denominator for a cap*.
-     *
-     * **Hand-converted from CAD, and deliberately set below the result.** The
-     * account reported 248,973.68 CAD on 2026-08-14 at USD.CAD 1.3874 (IDEALPRO
-     * bid/ask), i.e. ~179,455 USD. 175,000 leaves a ~2.5% buffer for balance
-     * drift *and* adverse FX movement — ordinary daily rate movement, not a
-     * sustained CAD rally.
-     *
-     * Re-read the account **and** the rate together when revisiting; converting
-     * one without the other reintroduces exactly the mismatch this replaced.
+     * **One kind of staleness remains, down from two.** The rate is live; the
+     * *balance* is still the 248,973.68 CAD IB reported on 2026-08-14. 242,800 is
+     * that reading less ~2.5%, a buffer that now only has to absorb balance
+     * drift. It is exactly the old 175,000 USD figure at that day's rate
+     * (1.3874), so the cap is unchanged at that rate and now moves with the
+     * market. See `docs/decisions/capital-allocation.md`.
      */
-    equity: 175_000,
+    equity: 242_800,
 
     /**
      * A full 5-rung flat ladder deploys 125% of this (`5 × 25%`), so 40,000
      * peaks at 50,000 against a 105,000 global cap. The headroom is intentional:
      * sizing this so a full ladder only just fits would make the *deepest* rung —
      * the one fired in the worst drawdown — the rung the risk manager resizes
-     * away. Kept at 40,000 rather than the original 50,000 because the equity
-     * denominator carries FX staleness the previous one did not.
+     * away. Kept at 40,000 rather than restored to 50,000: the headroom was
+     * chosen to absorb FX staleness, and the rate being live now is not on its
+     * own a reason to loosen it — Story 15 revisits it with evidence.
      *
      * Keyed by literal symbol rather than by importing `DIP_LADDER_SYMBOL`: this
      * module is read *by* `strategies.module.ts`, and importing the constant back
@@ -144,6 +147,50 @@ export const ACCOUNTS: Readonly<Record<string, AccountDefinition>> = {
      * so it does not fire during the unrealized loss this strategy is *designed*
      * to carry.
      */
+    dailyLossBasis: LossBasis.REALIZED_AND_UNREALIZED,
+  },
+
+  /**
+   * **The live account — real money.** Added 2026-09-27 by operator decision,
+   * ahead of the paper soak sign-off and backtest-backed figures; see
+   * `docs/decisions/live-cutover.md` for what was skipped and what bounds it.
+   *
+   * Traded by its own daemon (`backend-live` in `docker-compose.yml`) against a
+   * separate Gateway logged in with the live username. `LIVE` only: this entry
+   * cannot be booted as `PAPER`, and the paper entry cannot be booted as `LIVE`.
+   */
+  live: {
+    alias: 'live',
+    label: 'Live',
+    allowedModes: [ExecutionMode.LIVE],
+
+    /**
+     * USD, and so is `equity` — nothing is converted, unlike the paper account,
+     * so no FX rate can block this account's entries.
+     */
+    currency: 'USD',
+
+    /**
+     * 200,000 USD as stated by the operator, a static reading like the paper
+     * account's. The global cap is 60% of it: 120,000.
+     */
+    equity: 200_000,
+
+    /**
+     * The same 40,000 the paper account has run on, so live behaves like what
+     * the soak observed. `LIVE` also submits each BUY at 25% of nominal
+     * quantity during the reduced-size period (`live.config.ts`).
+     */
+    symbolCapital: { TQQQ: 40_000 },
+
+    /**
+     * Half the paper account's 5,000. BUYs start at 25% of nominal size, so
+     * paper's figure would be effectively four times looser against what is
+     * actually deployed. Revisit at the step-up to full size. Never liquidates.
+     */
+    dailyLossThreshold: 2_500,
+
+    /** The same reasoning as the paper account: only this basis can fire. */
     dailyLossBasis: LossBasis.REALIZED_AND_UNREALIZED,
   },
 };

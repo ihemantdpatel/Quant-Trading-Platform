@@ -133,9 +133,9 @@ export function NewAccountForm() {
           role="note"
           className="rounded border border-amber-800 bg-amber-950/40 p-2 text-xs text-amber-200"
         >
-          LIVE is recorded as this account&apos;s mode, but the startup assertions still refuse to
-          boot LIVE until Story 15 enables it. The daemon will not trade — it will refuse to start
-          and be retried by the supervisor.
+          LIVE trades real money, but an account created here connects through the paper Gateway and
+          will be refused at connect. Live accounts are added in accounts.config.ts with their own
+          Gateway — see docs/decisions/live-cutover.md.
         </p>
       )}
 

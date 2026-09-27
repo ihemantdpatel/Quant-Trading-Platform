@@ -50,6 +50,7 @@ import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
 import {
   AccountSummary,
+  FxQuoteReading,
   BrokerOrder,
   BrokerPosition,
   Fill,
@@ -74,6 +75,8 @@ import {
   parseIbTime,
   resolveClientOrderId,
   toDomainBar,
+  toFxContract,
+  toFxQuoteReading,
   toIbContract,
   toIbEndDateTime,
   toCompletedOrder,
@@ -612,6 +615,18 @@ export class StoqeyIbSocket implements IbSocket {
     }
 
     return { equity, availableFunds, currency };
+  }
+
+  async getFxQuote(base: string, quote: string): Promise<FxQuoteReading> {
+    // 15s rather than the usual 10s: IB completes a snapshot only once every
+    // requested tick has arrived or ~11s have passed, so the shared bound could
+    // expire on a healthy but slow snapshot.
+    const ticks = await withTimeout(
+      this.api.getMarketDataSnapshot(toFxContract(base, quote), '', false),
+      15_000,
+    );
+
+    return toFxQuoteReading(ticks as ReadonlyMap<number, { value?: number }>, base, quote);
   }
 
   onFill(handler: (fill: Fill) => void): () => void {

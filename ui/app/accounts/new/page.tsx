@@ -5,8 +5,8 @@
  * reserves the alias `new` so no account can be shadowed by this page.
  *
  * The list pairs each definition with whether its daemon answers. A created
- * account whose daemon is not up yet — or refuses to boot, as a `LIVE` one will
- * until Story 15 — must read as "not running", never as missing.
+ * account whose daemon is not up yet — or is refused at connect, as a `LIVE` one
+ * on the paper Gateway is — must read as "not running", never as missing.
  */
 
 import Link from 'next/link';

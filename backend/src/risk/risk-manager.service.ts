@@ -15,7 +15,11 @@
  *    limit. Checked here is what makes it effective within one evaluation
  *    cycle (`PRD.md:492`).
  * 3. **Daily loss breaker** — an automated halt, same absolute character.
- * 4. **Capital caps** — the only control that can *resize* rather than refuse.
+ * 4. **FX rate** — when equity is in another currency, a BUY needs a fresh
+ *    conversion rate or it is refused (`fx-rate.ts`).
+ * 5. **Reduced live size** — in `LIVE`, BUYs are scaled down (`live-sizing.ts`).
+ * 6. **Capital caps** — measured against the converted equity and the scaled
+ *    quantity, so the cap sees what would actually be submitted.
  *
  * Order matters for which reason gets reported, and the reported reason is what
  * an operator acts on. A rejection during a kill-switch halt should say "kill
@@ -35,6 +39,8 @@ import {
   NO_CAPITAL_DEPLOYED,
   withIntentDeployed,
 } from './capital-cap';
+import { convertEquity, FxRateBook } from './fx-rate';
+import { applyLiveSizing } from './live-sizing';
 import { DailyPnl, evaluateLossBreaker, FLAT_PNL } from './loss-breaker';
 import { KillSwitchService } from './kill-switch.service';
 import { RiskConfig } from './risk.config';
@@ -82,6 +88,11 @@ export class RiskManagerService {
     private readonly mode: ExecutionMode,
     private readonly killSwitch: KillSwitchService = new KillSwitchService(),
     private readonly sink: RiskEventSink = new InMemoryRiskEventSink(),
+    /**
+     * The live rate equity is converted at. Null is safe rather than lax: with
+     * equity in another currency it refuses every BUY (`convertEquity`).
+     */
+    private readonly fx: FxRateBook | null = null,
   ) {}
 
   /**
@@ -217,17 +228,56 @@ export class RiskManagerService {
       );
     }
 
-    const capital = applyCapitalCap(intent, this.config, account.deployed);
+    // Exits skip both: the capital cap exempts SELLs, and neither a missing FX
+    // rate nor the live size reduction may strand a lot at its target.
+    let capConfig = this.config;
+    let sized = intent;
+    let sizingDetail: string | null = null;
+
+    if (intent.side === 'BUY') {
+      const conversion = convertEquity(
+        this.config.accountEquity,
+        this.config.equityCurrency ?? this.config.accountCurrency,
+        this.config.accountCurrency,
+        this.fx,
+      );
+
+      if (!conversion.ok) {
+        return reject(RiskReason.FX_RATE_UNAVAILABLE, conversion.detail);
+      }
+
+      if (conversion.equity !== this.config.accountEquity) {
+        // A copy rather than a mutation: `RiskParameterService` mutates the
+        // shared config in place, and writing a converted equity back into it
+        // would compound the conversion on every evaluation.
+        capConfig = { ...this.config, accountEquity: conversion.equity };
+      }
+
+      const sizing = applyLiveSizing(intent, this.mode, this.config.liveSizeMultiplier);
+
+      if (sizing.quantity <= 0) {
+        return reject(RiskReason.LIVE_SIZE_REDUCTION, `${sizing.detail} — nothing left to submit`);
+      }
+
+      sized = { ...intent, quantity: sizing.quantity };
+      sizingDetail = sizing.detail;
+    }
+
+    const capital = applyCapitalCap(sized, capConfig, account.deployed);
 
     if (capital.approvedQuantity <= 0) {
       return reject(capital.reason, capital.detail);
     }
 
     if (capital.approvedQuantity < intent.quantity) {
+      // Named after whichever control cut deepest: the cap when it resized the
+      // already-reduced quantity further, the live reduction otherwise.
+      const capBound = capital.approvedQuantity < sized.quantity;
+
       return {
         outcome: RiskOutcome.RESIZED,
-        reason: capital.reason,
-        detail: capital.detail,
+        reason: capBound ? capital.reason : RiskReason.LIVE_SIZE_REDUCTION,
+        detail: [sizingDetail, capBound ? capital.detail : null].filter(Boolean).join('; '),
         intent,
         approvedQuantity: capital.approvedQuantity,
       };

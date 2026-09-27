@@ -65,12 +65,12 @@ describe('NewAccountForm', () => {
     expect(status).toHaveTextContent('already traded');
   });
 
-  it('warns that a LIVE account will not boot before Story 15', async () => {
+  it('warns that a LIVE account created here cannot reach a live Gateway', async () => {
     render(<NewAccountForm />);
     expect(screen.queryByRole('note')).toBeNull();
 
     await userEvent.selectOptions(screen.getByLabelText('Mode'), 'LIVE');
 
-    expect(screen.getByRole('note')).toHaveTextContent(/refuse to boot LIVE/);
+    expect(screen.getByRole('note')).toHaveTextContent(/refused at connect/);
   });
 });

@@ -29,6 +29,10 @@ import {
   toCompletedOrder,
   toOrderStatus,
   toTerminalStatus,
+  toFxContract,
+  toFxQuoteReading,
+  IB_TICK_ASK,
+  IB_TICK_BID,
 } from './ib-wire';
 
 describe('toIbContract', () => {
@@ -547,5 +551,51 @@ describe('checkManagedAccount', () => {
 
   it('says so when the login reports no accounts at all', () => {
     expect(checkManagedAccount([], 'DU1234567')).toContain('manages none');
+  });
+});
+
+describe('toFxContract', () => {
+  it('builds USD.CAD as a CASH contract on IDEALPRO', () => {
+    expect(toFxContract('USD', 'CAD')).toEqual({
+      symbol: 'USD',
+      secType: 'CASH',
+      currency: 'CAD',
+      exchange: 'IDEALPRO',
+    });
+  });
+});
+
+describe('toFxQuoteReading', () => {
+  const ticks = (entries: [number, number | undefined][]) =>
+    new Map(entries.map(([id, value]) => [id, { value }]));
+
+  it('reads the live bid and ask', () => {
+    expect(
+      toFxQuoteReading(
+        ticks([
+          [IB_TICK_BID, 1.3871],
+          [IB_TICK_ASK, 1.3874],
+        ]),
+        'USD',
+        'CAD',
+      ),
+    ).toEqual({ base: 'USD', quote: 'CAD', bid: 1.3871, ask: 1.3874 });
+  });
+
+  it('accepts an ask without a bid', () => {
+    expect(toFxQuoteReading(ticks([[IB_TICK_ASK, 1.39]]), 'USD', 'CAD').bid).toBeNull();
+  });
+
+  it('ignores delayed ticks — a 15-minute-old quote must not read as fresh', () => {
+    const delayedOnly = ticks([
+      [66, 1.38],
+      [67, 1.3874],
+    ]);
+
+    expect(() => toFxQuoteReading(delayedOnly, 'USD', 'CAD')).toThrow('no live ask for USD.CAD');
+  });
+
+  it.each([0, -1, Number.NaN, undefined])('throws on an unusable ask %p', (ask) => {
+    expect(() => toFxQuoteReading(ticks([[IB_TICK_ASK, ask]]), 'USD', 'CAD')).toThrow();
   });
 });

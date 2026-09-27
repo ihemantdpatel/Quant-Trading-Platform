@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { AccountKind, accountKindOf } from '../broker/ib/account-identity';
 import { parseAccountDefinitionEnv } from './account-definition';
 import { ACCOUNTS, DEFAULT_ACCOUNT_ALIAS } from './accounts.config';
 import { DEFAULT_EXECUTION_MODE, ExecutionMode } from './execution-mode';
@@ -143,7 +144,35 @@ export const configSchema = z
         message: 'is required when IB_HOST is set (the IB account id this daemon trades)',
       });
     }
+
+    // **The id's kind must match the mode.** The socket confirms the login
+    // manages this id and sends every order to it, but not that the id is the
+    // right *kind* of account: a live `U…` id under PAPER passed every other
+    // check, skipped LIVE's reduced sizing, and traded real money at full size.
+    // Refused here, before anything connects — it is a mistake, not a state a
+    // retry could fix.
+    if (config.IB_ACCOUNT_ID !== undefined) {
+      const kind = accountKindOf(config.IB_ACCOUNT_ID);
+      const expected = expectedAccountKind(config.EXECUTION_MODE);
+
+      if (kind !== expected) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['IB_ACCOUNT_ID'],
+          message: `${config.IB_ACCOUNT_ID} is a ${kind} account but EXECUTION_MODE=${config.EXECUTION_MODE} expects a ${expected} account`,
+        });
+      }
+    }
   });
+
+/**
+ * The account kind a mode must trade. `SHADOW` is refused at boot
+ * (`startup-assertions.ts`); mapping it to PAPER keeps this total and errs
+ * toward the account that cannot move real money.
+ */
+export function expectedAccountKind(mode: ExecutionMode): AccountKind {
+  return mode === ExecutionMode.LIVE ? AccountKind.LIVE : AccountKind.PAPER;
+}
 
 export type AppConfig = z.infer<typeof configSchema>;
 

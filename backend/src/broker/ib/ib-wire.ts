@@ -28,7 +28,12 @@ import { maskAccountId } from '../../config/account-registration';
 import { Contract, SecurityType } from '../../domain/contract';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
-import { BrokerOrder, CompletedOrder, OrderStatus } from '../broker-adapter.interface';
+import {
+  BrokerOrder,
+  CompletedOrder,
+  FxQuoteReading,
+  OrderStatus,
+} from '../broker-adapter.interface';
 
 /** Our `Contract` → IB's. Exported for the payload assertions. */
 export function toIbContract(contract: Contract): IbContract {
@@ -427,4 +432,41 @@ export function checkManagedAccount(managed: readonly string[], accountId: strin
     'Refusing the connection rather than trading or reconciling against an account this ' +
     'login cannot see.'
   );
+}
+
+/** IB's tick ids for the live top of book. Delayed ticks (66/67) are ignored. */
+export const IB_TICK_BID = 1;
+export const IB_TICK_ASK = 2;
+
+/**
+ * The IB contract for a currency pair — `USD.CAD` is symbol `USD`, currency
+ * `CAD`, on `IDEALPRO`, IB's FX venue.
+ */
+export function toFxContract(base: string, quote: string): IbContract {
+  return { symbol: base, secType: SecType.CASH, currency: quote, exchange: 'IDEALPRO' };
+}
+
+/**
+ * A market-data snapshot → one FX reading, or a thrown error.
+ *
+ * **Live ticks only.** A delayed quote is up to 15 minutes old and would be
+ * reported as fresh the moment it arrived, which is the staleness this whole
+ * path exists to catch. A missing or non-positive ask throws rather than
+ * returning a rate the cap would then divide by.
+ */
+export function toFxQuoteReading(
+  ticks: ReadonlyMap<number, { value?: number }>,
+  base: string,
+  quote: string,
+): FxQuoteReading {
+  const positive = (value: number | undefined): number | null =>
+    value !== undefined && Number.isFinite(value) && value > 0 ? value : null;
+
+  const ask = positive(ticks.get(IB_TICK_ASK)?.value);
+
+  if (ask === null) {
+    throw new Error(`IB returned no live ask for ${base}.${quote}`);
+  }
+
+  return { base, quote, bid: positive(ticks.get(IB_TICK_BID)?.value), ask };
 }

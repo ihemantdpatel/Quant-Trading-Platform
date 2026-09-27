@@ -206,6 +206,38 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ── The live account (real money) ──────────────────────────────────────────
+  # Its own daemon, beside `backend` (paper): the two share only MySQL, where
+  # every row is owned by its alias, so a halt or crash in one cannot reach the
+  # other. Connects to a SEPARATE Gateway logged in with the live username.
+  #
+  # **Opt-in via the `live` profile** — `COMPOSE_PROFILES=live` in `.env`, or
+  # `docker compose --profile live up`. Without a live account id this daemon
+  # refuses to boot, so a checkout that has none must not start it.
+  backend-live:
+    <<: *backend
+    container_name: ib-backend-live
+    profiles: ['live']
+    # **This daemon alone, not the supervisor.** `backend`'s supervisor already
+    # starts every dashboard-created account; a second supervisor here would
+    # start a second copy of each, and two processes would trade one account.
+    command: ['node', 'dist/main.js']
+    environment:
+      <<: *backend-env
+      ACCOUNT_ALIAS: live
+      EXECUTION_MODE: LIVE
+      IB_ACCOUNT_ID: ${LIVE_IB_ACCOUNT_ID:-}
+      IB_HOST: ${LIVE_IB_HOST:-}
+      IB_PORT: ${LIVE_IB_PORT:-4001}
+      IB_CLIENT_ID: ${LIVE_IB_CLIENT_ID:-3}
+    depends_on:
+      # After `backend` is healthy, so its entrypoint has already applied the
+      # migrations this one would otherwise run concurrently.
+      backend:
+        condition: service_healthy
+    ports:
+      - '${LIVE_BACKEND_PORT:-3002}:3000'
+
   # ── Template: a second account ─────────────────────────────────────────────
   # Uncomment, rename `second` to the alias you added to accounts.config.ts,
   # and add its URL to ACCOUNT_BACKENDS on the ui service. Everything not

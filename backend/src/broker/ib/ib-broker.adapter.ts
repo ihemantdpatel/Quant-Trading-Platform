@@ -38,6 +38,7 @@ import { Contract } from '../../domain/contract';
 import { Bar, BarSize } from '../../market-data/types';
 import {
   AccountSummary,
+  FxQuoteReading,
   BrokerAdapter,
   BrokerOrder,
   BrokerPosition,
@@ -663,6 +664,20 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
 
   async getAccountSummary(): Promise<AccountSummary> {
     return this.socket.getAccountSummary();
+  }
+
+  async getFxQuote(base: string, quote: string): Promise<FxQuoteReading> {
+    // Guarded like `getPositions`: a snapshot against an unauthenticated
+    // Gateway would otherwise sit out its full timeout on every poll.
+    if (!this.isConnected()) {
+      throw new Error(`IB not connected (${this.health.state}) — cannot quote ${base}.${quote}`);
+    }
+
+    if (!this.socket.getFxQuote) {
+      throw new Error(`this IB socket cannot quote ${base}.${quote}`);
+    }
+
+    return this.socket.getFxQuote(base, quote);
   }
 
   onFill(handler: (fill: Fill) => void): () => void {

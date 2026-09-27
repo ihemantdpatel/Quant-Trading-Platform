@@ -17,11 +17,14 @@ import { AppConfigService } from '../config/app-config.service';
 import {
   ACTIVE_ACCOUNT,
   ACCOUNT_EQUITY,
+  ACCOUNT_EQUITY_CURRENCY,
   ACCOUNT_DAILY_LOSS_BASIS,
   ACCOUNT_CURRENCY,
   ACCOUNT_DAILY_LOSS_THRESHOLD,
   ACCOUNT_SYMBOL_CAPITAL,
 } from '../config/capital.config';
+import { LIVE_TRADING_ENABLED, liveSizeMultiplier } from '../config/live.config';
+import { FxRateBook } from './fx-rate';
 import { KillSwitchService } from './kill-switch.service';
 import { RiskManagerService } from './risk-manager.service';
 import { buildRiskConfig, RiskConfig } from './risk.config';
@@ -32,6 +35,13 @@ export const RISK_CONFIG = Symbol('RISK_CONFIG');
 export const RISK_EVENT_SINK = Symbol('RISK_EVENT_SINK');
 export const SYMBOL_CAPITAL = Symbol('SYMBOL_CAPITAL');
 export const INSTRUMENT_CURRENCIES = Symbol('INSTRUMENT_CURRENCIES');
+
+/**
+ * The live rate the risk manager converts equity at, or null when equity is
+ * already in the cap currency. Written by `FxRatePoller` in `EngineModule`,
+ * which holds the broker — the risk layer never asks the broker for anything.
+ */
+export const FX_RATE_BOOK = Symbol('FX_RATE_BOOK');
 
 /**
  * Optional token a higher layer binds to supply per-symbol capital.
@@ -86,10 +96,26 @@ export const SHADOW_NOMINAL_EQUITY = 100_000;
         buildRiskConfig({
           accountEquity: ACCOUNT_EQUITY,
           accountCurrency: ACCOUNT_CURRENCY,
+          equityCurrency: ACCOUNT_EQUITY_CURRENCY,
           dailyLossThreshold: ACCOUNT_DAILY_LOSS_THRESHOLD,
           dailyLossBasis: ACCOUNT_DAILY_LOSS_BASIS,
           perSymbolLimits: ACCOUNT_SYMBOL_CAPITAL,
+          // Story 15 (`live.config.ts`). The flag permits LIVE; an account must
+          // still list it in `allowedModes`, and it trades at the multiplier.
+          allowLiveTrading: LIVE_TRADING_ENABLED,
+          liveSizeMultiplier: liveSizeMultiplier(),
         }),
+    },
+    {
+      provide: FX_RATE_BOOK,
+      useFactory: (config: RiskConfig): FxRateBook | null => {
+        const equityCurrency = config.equityCurrency ?? config.accountCurrency;
+
+        return equityCurrency === config.accountCurrency
+          ? null
+          : new FxRateBook(config.accountCurrency, equityCurrency);
+      },
+      inject: [RISK_CONFIG],
     },
     {
       /**
@@ -138,11 +164,19 @@ export const SHADOW_NOMINAL_EQUITY = 100_000;
         appConfig: AppConfigService,
         killSwitch: KillSwitchService,
         sink: RiskEventSink,
-      ) => new RiskManagerService(config, appConfig.executionMode, killSwitch, sink),
-      inject: [RISK_CONFIG, AppConfigService, KillSwitchService, RISK_EVENT_SINK],
+        fx: FxRateBook | null,
+      ) => new RiskManagerService(config, appConfig.executionMode, killSwitch, sink, fx),
+      inject: [RISK_CONFIG, AppConfigService, KillSwitchService, RISK_EVENT_SINK, FX_RATE_BOOK],
     },
   ],
-  exports: [RiskManagerService, KillSwitchService, RISK_CONFIG, RISK_EVENT_SINK, SYMBOL_CAPITAL],
+  exports: [
+    RiskManagerService,
+    KillSwitchService,
+    RISK_CONFIG,
+    RISK_EVENT_SINK,
+    SYMBOL_CAPITAL,
+    FX_RATE_BOOK,
+  ],
 })
 export class RiskModule implements OnModuleInit {
   constructor(

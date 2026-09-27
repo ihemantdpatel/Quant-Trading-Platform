@@ -110,3 +110,22 @@ describe('account registry', () => {
     expect(result.failures).toEqual([expect.stringContaining('may not run in LIVE')]);
   });
 });
+
+describe('the live account', () => {
+  it('may run only in LIVE, in USD, with every figure set', () => {
+    const live = findAccount('live');
+
+    expect(live).not.toBeNull();
+    expect(live!.allowedModes).toEqual([ExecutionMode.LIVE]);
+    expect(live!.currency).toBe('USD');
+    // No conversion: an FX outage cannot block this account's entries.
+    expect(live!.equityCurrency).toBeUndefined();
+    expect(live!.symbolCapital.TQQQ).toBeGreaterThan(0);
+    expect(live!.dailyLossThreshold).toBeGreaterThan(0);
+    expect(live!.dailyLossThreshold!).toBeLessThan(live!.equity);
+  });
+
+  it('keeps the paper account PAPER-only, so its lots are never traded live', () => {
+    expect(findAccount('nuuixl118')!.allowedModes).toEqual([ExecutionMode.PAPER]);
+  });
+});

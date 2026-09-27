@@ -5,6 +5,7 @@ import { KillSwitchService } from './kill-switch.service';
 import { AccountSnapshot, RiskManagerService } from './risk-manager.service';
 import { InMemoryRiskEventSink, RiskEventType } from './risk-event';
 import { buildRiskConfig, RiskConfig } from './risk.config';
+import { FX_MAX_AGE_MS, FxRateBook } from './fx-rate';
 import { RiskIntent, RiskOutcome, RiskReason } from './types';
 
 const AT = '2026-03-02T10:00:00-05:00';
@@ -416,5 +417,157 @@ describe('defaults', () => {
     );
 
     expect(manager.evaluate(intent()).outcome).toBe(RiskOutcome.APPROVED);
+  });
+});
+
+describe('Story 15: live FX conversion of equity', () => {
+  const T0 = Date.UTC(2026, 8, 28, 14, 0, 0);
+
+  function fxHarness(
+    clock: { t: number },
+    config: Partial<RiskConfig> = {},
+    mode = ExecutionMode.PAPER,
+  ): { manager: RiskManagerService; sink: InMemoryRiskEventSink; fx: FxRateBook } {
+    const sink = new InMemoryRiskEventSink();
+    const fx = new FxRateBook('USD', 'CAD', () => clock.t);
+    const riskConfig = buildRiskConfig({
+      accountEquity: 242_800,
+      accountCurrency: 'USD',
+      equityCurrency: 'CAD',
+      ...config,
+    });
+
+    return {
+      manager: new RiskManagerService(riskConfig, mode, new KillSwitchService(sink), sink, fx),
+      sink,
+      fx,
+    };
+  }
+
+  it('blocks a BUY when no rate has ever arrived', () => {
+    const { manager, sink } = fxHarness({ t: T0 });
+    const decision = manager.evaluate(intent(), account());
+
+    expect(decision.outcome).toBe(RiskOutcome.REJECTED);
+    expect(decision.reason).toBe(RiskReason.FX_RATE_UNAVAILABLE);
+    expect(sink.all()).toHaveLength(1);
+  });
+
+  it('blocks a BUY once the rate goes stale, and never uses the cached value', () => {
+    const clock = { t: T0 };
+    const { manager, fx } = fxHarness(clock);
+    fx.record({ base: 'USD', quote: 'CAD', rate: 1.3874, receivedAt: T0 });
+
+    expect(manager.evaluate(intent(), account()).outcome).toBe(RiskOutcome.APPROVED);
+
+    clock.t = T0 + FX_MAX_AGE_MS + 1;
+    const decision = manager.evaluate(intent(), account());
+
+    expect(decision.reason).toBe(RiskReason.FX_RATE_UNAVAILABLE);
+    expect(decision.detail).toContain('stale');
+  });
+
+  it('lets a SELL through with no rate at all — a missing rate must not strand a lot', () => {
+    const { manager } = fxHarness({ t: T0 });
+
+    expect(manager.evaluate(intent({ side: 'SELL' }), account()).outcome).toBe(
+      RiskOutcome.APPROVED,
+    );
+  });
+
+  it('measures the global cap against the converted equity', () => {
+    const { manager, fx } = fxHarness({ t: T0 });
+    fx.record({ base: 'USD', quote: 'CAD', rate: 1.3874, receivedAt: T0 });
+
+    // 242,800 CAD / 1.3874 = 175,003.60 USD → cap 105,002.16. Unconverted, the
+    // cap would be 145,680 and this intent would pass untouched.
+    const decision = manager.evaluate(
+      intent({ quantity: 1_000, limitPrice: 100 }),
+      account({ deployed: { total: 100_000, bySymbol: {}, byStrategy: {} } }),
+    );
+
+    expect(decision.outcome).toBe(RiskOutcome.RESIZED);
+    expect(decision.reason).toBe(RiskReason.GLOBAL_CAPITAL_CAP);
+    expect(decision.approvedQuantity).toBe(50);
+    expect(decision.detail).toContain('175003.60');
+  });
+
+  it('does not write the converted equity back into the shared config', () => {
+    const config = buildRiskConfig({
+      accountEquity: 242_800,
+      accountCurrency: 'USD',
+      equityCurrency: 'CAD',
+    });
+    const fx = new FxRateBook('USD', 'CAD', () => T0);
+    fx.record({ base: 'USD', quote: 'CAD', rate: 1.3874, receivedAt: T0 });
+    const manager = new RiskManagerService(config, ExecutionMode.PAPER, undefined, undefined, fx);
+
+    manager.evaluate(intent(), account());
+    manager.evaluate(intent(), account());
+
+    expect(config.accountEquity).toBe(242_800);
+  });
+
+  it('consults no rate when equity is already in the cap currency', () => {
+    const { manager } = harness({}, ExecutionMode.PAPER);
+
+    expect(manager.evaluate(intent(), account()).outcome).toBe(RiskOutcome.APPROVED);
+  });
+});
+
+describe('Story 15: reduced-size LIVE period', () => {
+  function liveHarness(config: Partial<RiskConfig> = {}, mode = ExecutionMode.LIVE): Harness {
+    return harness({ allowLiveTrading: true, liveSizeMultiplier: 0.25, ...config }, mode);
+  }
+
+  it('submits 25% of nominal in LIVE', () => {
+    const { manager } = liveHarness();
+    const decision = manager.evaluate(intent({ quantity: 50 }), account());
+
+    expect(decision.outcome).toBe(RiskOutcome.RESIZED);
+    expect(decision.reason).toBe(RiskReason.LIVE_SIZE_REDUCTION);
+    expect(decision.approvedQuantity).toBe(12);
+  });
+
+  it('submits full size in PAPER with the same multiplier configured', () => {
+    const { manager } = liveHarness({}, ExecutionMode.PAPER);
+
+    expect(manager.evaluate(intent({ quantity: 50 }), account()).approvedQuantity).toBe(50);
+  });
+
+  it('never reduces a SELL', () => {
+    const { manager } = liveHarness();
+
+    expect(
+      manager.evaluate(intent({ side: 'SELL', quantity: 50 }), account()).approvedQuantity,
+    ).toBe(50);
+  });
+
+  it('rejects a buy that floors to zero shares rather than submitting nothing', () => {
+    const { manager } = liveHarness();
+    const decision = manager.evaluate(intent({ quantity: 3 }), account());
+
+    expect(decision.outcome).toBe(RiskOutcome.REJECTED);
+    expect(decision.reason).toBe(RiskReason.LIVE_SIZE_REDUCTION);
+  });
+
+  it('applies the capital cap to the reduced quantity, and names it when it binds further', () => {
+    const { manager } = liveHarness({ perSymbolLimits: { TQQQ: 500 } });
+    // 100 → 25 by the reduction, then 25 × 50 = 1,250 exceeds the 500 limit → 10.
+    const decision = manager.evaluate(intent({ quantity: 100, limitPrice: 50 }), account());
+
+    expect(decision.approvedQuantity).toBe(10);
+    expect(decision.reason).toBe(RiskReason.PER_SYMBOL_LIMIT);
+    expect(decision.detail).toContain('LIVE reduced size');
+  });
+
+  it('checks the cap against the reduced quantity, not the nominal one', () => {
+    // Nominal 100 × 50 = 5,000 would exceed a 2,000 limit; the reduced 25 × 50
+    // = 1,250 does not. Capping the nominal first would under-size the order.
+    const { manager } = liveHarness({ perSymbolLimits: { TQQQ: 2_000 } });
+    const decision = manager.evaluate(intent({ quantity: 100, limitPrice: 50 }), account());
+
+    expect(decision.approvedQuantity).toBe(25);
+    expect(decision.reason).toBe(RiskReason.LIVE_SIZE_REDUCTION);
   });
 });

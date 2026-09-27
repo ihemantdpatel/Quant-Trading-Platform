@@ -906,4 +906,42 @@ describe('IBBrokerAdapter', () => {
       expect(seen).toEqual([{ fillId: 'exec-1', commission: 1.05 }]);
     });
   });
+
+  describe('FX quotes (Story 15)', () => {
+    it('refuses to quote while disconnected rather than waiting on a silent Gateway', async () => {
+      const adapter = buildAdapter(new FakeIbSocket());
+
+      await expect(adapter.getFxQuote('USD', 'CAD')).rejects.toThrow(/not connected/);
+    });
+
+    it('passes the socket reading through once connected', async () => {
+      const socket = new FakeIbSocket();
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      await expect(adapter.getFxQuote('USD', 'CAD')).resolves.toMatchObject({
+        base: 'USD',
+        quote: 'CAD',
+        ask: 1.3874,
+      });
+    });
+
+    it('surfaces a socket failure as a rejection, never a remembered rate', async () => {
+      const socket = new FakeIbSocket();
+      socket.fxQuote = new Error('IB did not respond within 15000ms');
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      await expect(adapter.getFxQuote('USD', 'CAD')).rejects.toThrow('15000ms');
+    });
+
+    it('rejects when the socket has no FX capability', async () => {
+      const socket = new FakeIbSocket();
+      (socket as { getFxQuote?: unknown }).getFxQuote = undefined;
+      const adapter = buildAdapter(socket);
+      await adapter.connect();
+
+      await expect(adapter.getFxQuote('USD', 'CAD')).rejects.toThrow(/cannot quote/);
+    });
+  });
 });

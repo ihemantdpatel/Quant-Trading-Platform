@@ -26,10 +26,25 @@ import { resolveActiveAccount } from './accounts.config';
 /** The registry entry for this process's `ACCOUNT_ALIAS`. */
 export const ACTIVE_ACCOUNT = resolveActiveAccount();
 
-/** The currency every figure below is expressed in. See `accounts.config.ts`. */
+/**
+ * The currency every cap and limit is expressed in — the *traded* currency, so
+ * position notional is compared like with like. See `accounts.config.ts`.
+ */
 export const ACCOUNT_CURRENCY = ACTIVE_ACCOUNT.currency;
 
-/** Equity the 60% global cap is measured against, in `ACCOUNT_CURRENCY`. */
+/**
+ * The currency `ACCOUNT_EQUITY` is denominated in, when it differs from
+ * `ACCOUNT_CURRENCY` (Story 15). The risk manager then converts equity at a
+ * live rate from IB, and **a stale or unavailable rate blocks new entries** —
+ * it never falls back to a cached rate of unknown age (`risk/fx-rate.ts`).
+ * Undefined means equity is already in `ACCOUNT_CURRENCY`.
+ */
+export const ACCOUNT_EQUITY_CURRENCY = ACTIVE_ACCOUNT.equityCurrency;
+
+/**
+ * Equity the 60% global cap is measured against, in `ACCOUNT_EQUITY_CURRENCY`
+ * when set and `ACCOUNT_CURRENCY` otherwise.
+ */
 export const ACCOUNT_EQUITY = ACTIVE_ACCOUNT.equity;
 
 /** Per-symbol capital allocation — **expected deployment, not a ceiling**. */

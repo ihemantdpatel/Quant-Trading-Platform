@@ -19,6 +19,7 @@ import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 import { CoordinatorService } from '../strategies/coordinator.service';
+import { FX_MAX_AGE_MS } from '../risk/fx-rate';
 
 /**
  * Replaying a full fixture is ~936 bars through the whole path, and under
@@ -106,6 +107,41 @@ describe('Story 6: engine HTTP API', () => {
       expect(response.body).toHaveLength(4);
       expect(response.body.filter((s: { enabled: boolean }) => s.enabled)).toHaveLength(1);
       expect(response.body.find((s: { enabled: boolean }) => s.enabled).id).toBe('dip-ladder:TQQQ');
+    });
+  });
+
+  describe('Story 15: live USD.CAD conversion', () => {
+    it('reports a fresh rate on /status, from the broker rather than a constant', async () => {
+      const response = await request(app.getHttpServer()).get('/status').expect(200);
+
+      expect(response.body.fx).toMatchObject({ status: 'FRESH', pair: 'USD.CAD', rate: 1.3874 });
+      expect(response.body.liveSizing).toEqual({
+        stage: 'REDUCED',
+        multiplier: 0.25,
+        appliesInCurrentMode: false,
+      });
+    });
+
+    it('a stale rate blocks every new entry and never falls back to the cached rate', async () => {
+      // Ages the one quote the boot poll recorded past the bound. The poller's
+      // next tick is a minute away, so nothing refreshes it mid-replay.
+      jest.spyOn(Date, 'now').mockReturnValue(Date.now() + FX_MAX_AGE_MS + 60_000);
+
+      try {
+        const response = await replay().expect(200);
+
+        expect(response.body.intentsGenerated).toBeGreaterThan(0);
+        expect(response.body.submitted).toBe(0);
+
+        const events = await request(app.getHttpServer()).get('/risk-events').expect(200);
+        const reasons = new Set(events.body.map((event: { reason: string }) => event.reason));
+        expect(reasons).toContain('FX_RATE_UNAVAILABLE');
+
+        const status = await request(app.getHttpServer()).get('/status').expect(200);
+        expect(status.body.fx.status).toBe('STALE');
+      } finally {
+        jest.restoreAllMocks();
+      }
     });
   });
 
@@ -414,14 +450,16 @@ describe('Story 6: engine HTTP API', () => {
       expect(response.body.permitted).toBe(true);
     });
 
-    it('cannot reach LIVE — the explicit flag is absent', async () => {
+    it('cannot switch the paper account into LIVE, even with the live flag set', async () => {
+      // The flag permits LIVE; it does not select it. The paper account lists
+      // only PAPER, so a runtime mode change cannot turn it into real money.
       const response = await request(app.getHttpServer())
         .post('/mode')
         .send({ mode: 'LIVE' })
         .expect(422);
 
       expect(response.body.permitted).toBe(false);
-      expect(response.body.failures.join(' ')).toMatch(/allowLiveTrading flag/);
+      expect(response.body.failures.join(' ')).toMatch(/may not run in LIVE/);
     });
 
     it('refuses SHADOW, which is retired', async () => {

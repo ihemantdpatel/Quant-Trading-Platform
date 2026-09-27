@@ -155,6 +155,19 @@ export interface AccountSummary {
   currency: string;
 }
 
+/**
+ * One quote for a currency pair, `base.quote` — `USD.CAD` is CAD per USD.
+ *
+ * Only the ask is required: it is the side equity is converted at
+ * (`risk/fx-rate.ts`). A reading with no usable ask is an error, not a quote.
+ */
+export interface FxQuoteReading {
+  base: string;
+  quote: string;
+  bid: number | null;
+  ask: number;
+}
+
 export enum ConnectionState {
   DISCONNECTED = 'DISCONNECTED',
   CONNECTING = 'CONNECTING',
@@ -231,6 +244,15 @@ export interface BrokerAdapter {
 
   getPositions(): Promise<BrokerPosition[]>;
   getAccountSummary(): Promise<AccountSummary>;
+
+  /**
+   * A live quote for a currency pair, for converting account equity (Story 15).
+   *
+   * Throws when the broker cannot supply one — never returns a remembered
+   * value, since the caller's whole job is to know how old the rate is.
+   * Optional so a broker with no FX notion simply leaves conversion blocked.
+   */
+  getFxQuote?(base: string, quote: string): Promise<FxQuoteReading>;
 
   /** Subscribes to fills. Returns an unsubscribe function. */
   onFill(handler: (fill: Fill) => void): () => void;

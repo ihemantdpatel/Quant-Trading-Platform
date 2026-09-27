@@ -11,6 +11,7 @@ import { ExecutionMode } from './execution-mode';
 import {
   ACCOUNT_CURRENCY,
   ACCOUNT_EQUITY,
+  ACCOUNT_EQUITY_CURRENCY,
   ACCOUNT_DAILY_LOSS_BASIS,
   ACCOUNT_DAILY_LOSS_THRESHOLD,
   ACCOUNT_SYMBOL_CAPITAL,
@@ -30,6 +31,7 @@ function paperRiskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig {
   return buildRiskConfig({
     accountEquity: ACCOUNT_EQUITY,
     accountCurrency: ACCOUNT_CURRENCY,
+    equityCurrency: ACCOUNT_EQUITY_CURRENCY,
     dailyLossThreshold: ACCOUNT_DAILY_LOSS_THRESHOLD,
     dailyLossBasis: ACCOUNT_DAILY_LOSS_BASIS,
     perSymbolLimits: ACCOUNT_SYMBOL_CAPITAL,
@@ -69,7 +71,16 @@ describe('Story 13 capital configuration', () => {
 
     const peakDeployment = allocation * deployedFraction;
 
-    expect(peakDeployment).toBeLessThanOrEqual(globalCapitalCap(paperRiskConfig()));
+    // Equity is CAD and converted live, so the cap moves with USD.CAD. Checked
+    // at a USD.CAD well above anything recent (a much weaker CAD, so a smaller
+    // USD equity): the ladder must still fit when the conversion is unkind.
+    const stressedUsdEquity = ACCOUNT_EQUITY / 1.5;
+
+    expect(peakDeployment).toBeLessThanOrEqual(
+      globalCapitalCap(
+        paperRiskConfig({ accountEquity: stressedUsdEquity, equityCurrency: 'USD' }),
+      ),
+    );
   });
 
   it('sets the loss threshold below the account equity it protects', () => {
@@ -78,11 +89,12 @@ describe('Story 13 capital configuration', () => {
   });
 
   it('expresses the capital figures in the currency the instrument trades in', () => {
-    // The cap compares position notional against equity directly, so these must
-    // agree. They are both USD by an operator decision to hand-convert the CAD
-    // balance rather than build FX conversion — see capital.config.ts.
+    // The cap compares position notional against equity, so the cap currency
+    // must be the instrument's. Equity itself is CAD and converted at a live
+    // rate — see `equityCurrency` in accounts.config.ts.
     expect(ACCOUNT_CURRENCY).toBe('USD');
     expect(ACCOUNT_CURRENCY).toBe(DIP_LADDER_CURRENCY);
+    expect(ACCOUNT_EQUITY_CURRENCY).toBe('CAD');
   });
 });
 
@@ -99,12 +111,10 @@ describe('the account/instrument currency check', () => {
     expect(result.permitted).toBe(true);
   });
 
-  it('refuses PAPER if the account is ever tagged with the real CAD base currency', () => {
-    // The account genuinely reports CAD; this configuration states USD and
-    // converts by hand. Should someone tag it honestly without adding FX
-    // conversion, the cap becomes wrong by the exchange rate — so it must
-    // refuse. This is the case that keeps the check load-bearing rather than
-    // decorative now that the configured values agree.
+  it('refuses PAPER if the caps are ever expressed in the CAD base currency', () => {
+    // Only equity is converted. Position notional is summed in USD, so caps in
+    // CAD would be wrong by the exchange rate — the right way to state a CAD
+    // account is `equityCurrency`, and this is what stops the wrong way.
     const result = evaluateStartupAssertions(
       ExecutionMode.PAPER,
       paperRiskConfig({ accountCurrency: 'CAD' }),

@@ -28,6 +28,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
   AccountSummary,
+  FxQuoteReading,
   BrokerAdapter,
   BrokerOrder,
   BrokerPosition,
@@ -83,6 +84,14 @@ export interface MockBrokerConfig {
   maxReconnectAttempts: number;
   /** First backoff delay in ms; doubles each attempt. */
   baseBackoffMs: number;
+  /**
+   * Fixed FX asks keyed `BASE.QUOTE`. A pair absent here throws, so a test can
+   * exercise the blocked-entry path by clearing it.
+   *
+   * A constant, like everything else about this broker: it has no clock and no
+   * market, and nothing it "fills" is real money. The live rate comes from IB.
+   */
+  fxRates: Record<string, number>;
 }
 
 export const DEFAULT_MOCK_BROKER_CONFIG: MockBrokerConfig = {
@@ -94,6 +103,8 @@ export const DEFAULT_MOCK_BROKER_CONFIG: MockBrokerConfig = {
   equity: 100_000,
   maxReconnectAttempts: 5,
   baseBackoffMs: 10,
+  // The IDEALPRO ask recorded on 2026-08-14 (`capital.config.ts`).
+  fxRates: { 'USD.CAD': 1.3874 },
 };
 
 /** A resting order the broker still holds. */
@@ -549,6 +560,20 @@ export class MockBrokerAdapter implements BrokerAdapter {
 
   async getAccountSummary(): Promise<AccountSummary> {
     return { equity: this.config.equity, availableFunds: this.config.equity, currency: 'USD' };
+  }
+
+  /**
+   * Answers whether or not connected: the mock's quotes are constants, and the
+   * app's replay path runs before (and independently of) the mock's connect.
+   */
+  async getFxQuote(base: string, quote: string): Promise<FxQuoteReading> {
+    const ask = this.config.fxRates[`${base}.${quote}`];
+
+    if (ask === undefined) {
+      throw new Error(`mock broker has no ${base}.${quote} rate configured`);
+    }
+
+    return { base, quote, bid: ask, ask };
   }
 
   onFill(handler: (fill: Fill) => void): () => void {

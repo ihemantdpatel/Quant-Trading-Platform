@@ -40,7 +40,7 @@ export enum LossBasis {
 export interface RiskConfig {
   /**
    * Account equity the global cap is measured against, denominated in
-   * `accountCurrency`.
+   * `equityCurrency` when set and `accountCurrency` otherwise.
    *
    * Supplied by the broker at Story 6+; configured here so the arithmetic is
    * testable and so SHADOW replay has a figure to reason about.
@@ -48,9 +48,10 @@ export interface RiskConfig {
   accountEquity: number;
 
   /**
-   * The currency `accountEquity` and every limit in this config are expressed
-   * in — IB's *base* currency for the account, not the currency of any
-   * instrument traded.
+   * The currency the cap and every limit in this config are expressed in —
+   * which must be the currency of the instruments traded, since `deployed`
+   * notional is summed in it. Not necessarily the account's base currency;
+   * see `equityCurrency`.
    *
    * Explicit rather than assumed, because the two are genuinely different here:
    * the paper account reports `NetLiquidation` in **CAD** while TQQQ trades in
@@ -58,13 +59,24 @@ export interface RiskConfig {
    * permits roughly `USDCAD` times more exposure than intended (~1.39×), and
    * nothing about the resulting number looks wrong on a dashboard.
    *
-   * Carrying it here does not by itself convert anything — `deployed` totals
-   * are still summed in instrument currency, so a cap comparison is only sound
-   * while every traded symbol shares this currency. `assertSingleCurrency`
-   * below is what enforces that precondition instead of leaving it to a
-   * comment.
+   * Nothing converts position notionals — `deployed` totals are summed in
+   * instrument currency, so a cap comparison is only sound while every traded
+   * symbol shares this currency. `assertSingleCurrency` below enforces that.
+   * Only *equity* is converted, via `equityCurrency`.
    */
   accountCurrency: string;
+
+  /**
+   * The currency `accountEquity` itself is denominated in, when that differs
+   * from `accountCurrency` — the account's real base currency.
+   *
+   * When the two differ, the risk manager converts equity into
+   * `accountCurrency` at a **live** rate before measuring the global cap, and a
+   * stale or missing rate blocks new entries (`fx-rate.ts`). Absent, equity is
+   * already in `accountCurrency` and no rate is consulted — which keeps the
+   * backtester and every test that predates FX unaffected.
+   */
+  equityCurrency?: string;
 
   /**
    * Per-symbol notional ceiling, keyed by symbol. A symbol absent from the map
@@ -95,6 +107,13 @@ export interface RiskConfig {
    * default and is never overridden implicitly.
    */
   allowLiveTrading: boolean;
+
+  /**
+   * Fraction of each BUY's nominal quantity submitted in `LIVE`, in (0, 1].
+   * Ignored in every other mode. Set from `live.config.ts`; see
+   * `live-sizing.ts` for why it lives in the risk layer.
+   */
+  liveSizeMultiplier: number;
 }
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
@@ -105,6 +124,7 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   dailyLossThreshold: null,
   dailyLossBasis: LossBasis.REALIZED_AND_UNREALIZED,
   allowLiveTrading: false,
+  liveSizeMultiplier: 1,
 };
 
 /**
@@ -139,6 +159,17 @@ export function buildRiskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig
   if (config.dailyLossThreshold !== null && config.dailyLossThreshold <= 0) {
     throw new Error(
       `dailyLossThreshold is a positive loss magnitude when set, got ${config.dailyLossThreshold}`,
+    );
+  }
+
+  if (
+    !Number.isFinite(config.liveSizeMultiplier) ||
+    config.liveSizeMultiplier <= 0 ||
+    config.liveSizeMultiplier > 1
+  ) {
+    throw new Error(
+      `liveSizeMultiplier must be in (0, 1], got ${config.liveSizeMultiplier} — it may only ` +
+        'reduce live size, never enlarge it',
     );
   }
 
@@ -188,10 +219,11 @@ export function assertSingleCurrency(config: RiskConfig, instrumentCurrencies: s
   }
 
   return [
-    `account equity is denominated in ${config.accountCurrency} but ` +
-      `${foreign.join(', ')}-denominated instruments are configured. The global ` +
-      `capital cap compares position notional against equity directly, so this ` +
-      `comparison would be wrong by the exchange rate. Either fund the account in ` +
-      `${foreign.join('/')} or implement FX conversion in the risk layer.`,
+    `the capital caps are denominated in ${config.accountCurrency} but ` +
+      `${foreign.join(', ')}-denominated instruments are configured. Position ` +
+      `notional is summed in instrument currency and never converted, so every cap ` +
+      `would be wrong by the exchange rate. Express the caps in the instrument ` +
+      `currency; an equity balance in another currency belongs in equityCurrency, ` +
+      `which is converted at a live rate.`,
   ];
 }

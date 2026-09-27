@@ -18,7 +18,8 @@ system could never actually produce. `assertStartupSafe` therefore **refuses** `
 rather than exempting it; the enum member survives only so historic `ParameterChange` and
 `RiskEvent` rows still parse. See `config/execution-mode.ts`.
 
-**Real orders now reach a paper account.** `PAPER` submits to IB. `LIVE` remains gated on Story 15.
+**Real orders now reach a paper account.** `PAPER` submits to IB. `LIVE` remains gated on Story 15,
+whose mechanism is built but not enabled — see "Live cutover" below.
 
 Story 8 added MySQL/Prisma behind the existing repository interfaces. Story 9 closed the loop:
 state is now **restored on boot, but only after it reconciles against the broker** — see
@@ -1138,23 +1139,29 @@ shares *and* trips the startup assertion, rather than silently borrowing another
 **The guard has not become decoration.** `capital.config.spec.ts` asserts that removing either value
 still refuses a `PAPER` boot, so reverting the file fails startup exactly as before.
 
-**The account is denominated in CAD and TQQQ trades in USD**, and the risk layer converts nothing.
-`globalCapitalCap` compares a sum of position notionals against equity *directly*, so a USD notional
-measured against a CAD figure permitted roughly `USDCAD` — about 1.39× — more exposure than intended.
-Two errors partly cancelled (a stale-low equity tightened the cap while the missing conversion
-loosened it), which is why it went unnoticed; relying on that cancellation is not a control.
+**The account is denominated in CAD and TQQQ trades in USD.** Every cap and limit is expressed in
+USD (`accountCurrency`), because position notional is summed in instrument currency and is never
+converted. Only **equity** is converted: it is configured in CAD (the account's
+`equityCurrency` in `accounts.config.ts`) and divided by a **live** `USD.CAD` ask on every BUY evaluation (Story 15).
+This replaced a hand conversion whose rate went stale the day it was written — and a *weaker* CAD
+(not a stronger one) is the direction that silently loosened it.
 
-- **`assertSingleCurrency` refuses rather than converts.** Converting needs a live FX rate, which is
-  market data with its own staleness — and a stale rate mis-sizes every order silently, which is
-  worse than not booting. Mixing currencies is a configuration error and is reported as one.
-- The resolution taken is to express every figure in USD and convert the balance **once, by hand**.
-  This makes the arithmetic sound but leaves the account's `equity` carrying *two* sources of
-  staleness — the balance and the rate. The ~2.5% buffer below the converted figure absorbs ordinary
-  daily rate movement, **not a trend**.
-- **The real fix is still open** and mandatory before `LIVE`: a live `USD.CAD` rate from IB treated
-  as market data with a staleness watchdog, where an unavailable rate blocks new entries. Until then,
-  re-read the balance **and** the rate together — converting one without the other reintroduces the
-  original mismatch.
+- **A stale or missing rate blocks new entries, never falls back.** `FxRateBook` (`risk/fx-rate.ts`)
+  holds the latest quote; older than `FX_MAX_AGE_MS` (180s) or absent → `FX_RATE_UNAVAILABLE`. Exits
+  are never blocked by it, for the same reason the capital cap exempts them.
+- **The risk layer never asks the broker.** `FxRatePoller` (`market-data/fx/`) is started from
+  `EngineModule` and pushes readings into the book `RiskModule` provides under `FX_RATE_BOOK` — the
+  same direction `SYMBOL_CAPITAL_SOURCE` flows. A snapshot poll every 60s, not a subscription, because
+  an IB subscription does not survive the daily Gateway logout.
+- **Started for every broker, unlike the live feed.** `MockBrokerAdapter.getFxQuote` answers with a
+  constant (1.3874), which keeps fixture replay trading. Gating the poller on IB would block every
+  replayed BUY on a rate that can never arrive.
+- **Live ticks only** (`toFxQuoteReading`): a delayed tick is up to 15 minutes old and would read as
+  fresh on arrival. The ask, not the mid, because dividing by the higher side gives the tighter cap.
+- The **balance** is still a static reading — one staleness source left, down from two.
+  `GET /status` reports the rate under `fx`.
+- `assertSingleCurrency` still refuses caps in a currency other than the instruments'. A CAD balance
+  belongs in `equityCurrency`, not `accountCurrency`.
 
 `INSTRUMENT_CURRENCY_SOURCE` publishes the traded currency the same way `SYMBOL_CAPITAL_SOURCE`
 publishes allocation: through `CapitalModule`, so the risk layer never imports a strategy to learn
@@ -1163,6 +1170,32 @@ what it trades.
 **A failed startup assertion now exits cleanly** (`main.ts`) with a single legible message instead of
 an unhandled rejection — the raw stack buried the one line an operator needs, and compose reprinted
 it every few seconds on restart. The refusal itself is unchanged; only the reporting is.
+
+### Live cutover (Story 15) — enabled 2026-09-27, ahead of two gates
+
+`src/config/live.config.ts` holds the second `LIVE` signal and the reduced-size period;
+`docs/decisions/live-cutover.md` is the record and the checklist.
+
+- **`LIVE_TRADING_ENABLED` is `true`** (operator decision, 2026-09-27, before the soak sign-off and
+  backtest-backed figures — `live-cutover.md` records what was skipped). It permits `LIVE`; each
+  account's `allowedModes` decides who uses it. The live account is `live` in `accounts.config.ts`,
+  traded by the `backend-live` compose service (profile `live`, `node dist/main.js` so it does not
+  run a second supervisor) against TWS logged into the live username (`LIVE_IB_PORT`, 7496). The paper account stays `PAPER`-only.
+- **Reduced size is applied in the risk layer** (`risk/live-sizing.ts`), BUYs only, `LIVE` only,
+  floored, and *before* the capital caps so they measure what would actually be submitted. It lives in
+  the chokepoint rather than a strategy because both the ladder's `fixedQuantity` and the grid's
+  `quantity` bypass `symbolCapital` — scaling the allocation would not have shrunk an order. Exits
+  already sell the lot's filled quantity, and entry dedup matches on price only, so a reduced entry
+  neither oversells nor stacks.
+- **The account's kind must match the mode.** The socket confirms the login manages
+  `IB_ACCOUNT_ID` and sends every order to it; `config.schema.ts` additionally refuses an id whose
+  kind contradicts `EXECUTION_MODE` (`broker/ib/account-identity.ts`: `D…` is paper, anything else
+  live). Without it, a live `U…` id under `PAPER` skipped reduced sizing and traded real money at
+  full size. A `LIVE` account also needs `LIVE` in its `allowedModes` (`accounts.config.ts`).
+- **The step-up is a source edit and nothing else.** `FULL` without `LIVE_STEP_UP_RECORD` throws at
+  boot; nothing in the file reads a clock, and `live.config.spec.ts` scans the source to keep it so.
+- **The backtester only runs the dip ladder, and the live engine trades the grid.** Backtest evidence
+  for the capital figures must cover the strategy actually enabled.
 
 ### The daily soak report (Story 12, revised for PAPER)
 

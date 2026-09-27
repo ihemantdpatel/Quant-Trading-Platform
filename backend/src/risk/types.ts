@@ -71,6 +71,10 @@ export enum RiskReason {
   ZERO_QUANTITY = 'ZERO_QUANTITY',
   /** Malformed intent: non-positive quantity or price. */
   INVALID_INTENT = 'INVALID_INTENT',
+  /** Equity needs FX conversion and no fresh rate is available — see `fx-rate.ts`. */
+  FX_RATE_UNAVAILABLE = 'FX_RATE_UNAVAILABLE',
+  /** Scaled down by the reduced-size `LIVE` period — see `live-sizing.ts`. */
+  LIVE_SIZE_REDUCTION = 'LIVE_SIZE_REDUCTION',
 }
 
 /**

@@ -21,6 +21,7 @@ import { Contract } from '../../domain/contract';
 import { Bar, BarSize } from '../../market-data/types';
 import {
   AccountSummary,
+  FxQuoteReading,
   BrokerOrder,
   BrokerPosition,
   Fill,
@@ -242,6 +243,17 @@ export class FakeIbSocket implements IbSocket {
 
   async getAccountSummary(): Promise<AccountSummary> {
     return { ...this.summary };
+  }
+
+  /** What the next `getFxQuote` returns; an `Error` makes it reject. */
+  fxQuote: FxQuoteReading | Error = { base: 'USD', quote: 'CAD', bid: 1.387, ask: 1.3874 };
+
+  async getFxQuote(base: string, quote: string): Promise<FxQuoteReading> {
+    if (this.fxQuote instanceof Error) {
+      throw this.fxQuote;
+    }
+
+    return { ...this.fxQuote, base, quote };
   }
 
   onFill(handler: (fill: Fill) => void): () => void {

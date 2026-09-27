@@ -1,17 +1,36 @@
 # Decision — Per-symbol capital allocation (TQQQ)
 
-**Status:** Set for `PAPER` (Story 13). Revisit before `LIVE` (Story 15).
+**Status:** Set for `PAPER` (Story 13). Equity now converted at a live rate (Story 15, 2026-09-26).
+Allocation still to be revisited with backtest evidence before `LIVE`.
 **Date:** 2026-08-10
 **Closes:** `PRD.md:503` — per-symbol capital allocation
 **Decided by:** Operator, directly. **Not backtest-derived** — see "What informed this" below.
 
 ## The value
 
-| Field                       | Value                                     |
-| --------------------------- | ----------------------------------------- |
-| `PAPER_SYMBOL_CAPITAL.TQQQ` | **USD 40,000**                            |
-| `PAPER_ACCOUNT_EQUITY`      | **USD 175,000** (hand-converted from CAD) |
-| `PAPER_ACCOUNT_CURRENCY`    | **USD** — _not_ the account base currency |
+| Field                       | Value                                            |
+| --------------------------- | ------------------------------------------------ |
+| `symbolCapital.TQQQ`        | **USD 40,000**                                   |
+| `equity`                    | **CAD 242,800**, converted to USD at a live rate |
+| `equityCurrency`            | **CAD** — the account base currency              |
+| `currency`                  | **USD** — the currency every cap and limit is in |
+
+> **Amended 2026-09-26 (Story 15): the hand conversion is replaced by a live `USD.CAD` rate.**
+> Equity is now stated in the account's real base currency and converted per evaluation at the
+> IDEALPRO **ask** polled from IB every 60s (`risk/fx-rate.ts`, `market-data/fx/fx-rate-poller.ts`).
+> A rate older than 180s, or none at all, **blocks new entries** — it never falls back to a cached
+> rate. Exits are unaffected. `GET /status` reports it under `fx`.
+>
+> 242,800 CAD is the 2026-08-14 reading (248,973.68) less the same ~2.5% buffer, and equals the old
+> 175,000 USD at that day's 1.3874 — so the cap is unchanged at that rate and now tracks the market.
+> The buffer now absorbs **balance** drift only; the balance is still a static reading, which is
+> the one staleness source left. The allocation itself (40,000) is **not** changed by this and is
+> still not backtest-derived.
+>
+> **Direction, corrected.** Earlier text here and in Story 15 said a CAD _rally_ loosens the cap.
+> It is the reverse: a stronger CAD raises the real USD equity (a static figure then under-states it
+> and the cap is merely tight); a **weaker** CAD lowers it, and a static figure then over-states it —
+> the loose direction. The "Revisit when" bullet below always had this right.
 
 > **Corrected 2026-08-14.** The original figures were **USD 50,000 / USD 175,000**, and the equity
 > was wrong in a way that cancelled itself: account `nuuixl118` reports `NetLiquidation` in **CAD**
@@ -102,14 +121,12 @@ startup assertion still correctly refuses a `PAPER` boot if this file is reverte
 
 ## Revisit when
 
-- **Before `LIVE`, mandatorily** — the hand-converted equity figure must be replaced by live FX
-  conversion. A manually-converted constant is acceptable for `PAPER`, where the cost of a loose cap
-  is a paper loss; it is not acceptable where the cost is real money.
-- **If `USD.CAD` moves more than ~2.5% from 1.3874**, since that is the entire buffer. A stronger CAD
-  raises real USD equity (harmless, cap merely tightens); a weaker CAD lowers it and loosens the cap.
+- ~~**Before `LIVE`, mandatorily** — the hand-converted equity figure must be replaced by live FX
+  conversion.~~ **Done 2026-09-26** — see the amendment above.
+- ~~**If `USD.CAD` moves more than ~2.5% from 1.3874**~~ — no longer applies; the rate is live.
 - Before `LIVE` (Story 15) — mandatory, with backtest evidence.
 - If the paper account balance moves materially from 248,973.68 CAD, since the cap derives from it.
   Re-read it with `reqAccountSummary` rather than assuming; it was found to be ~74,000 off once
-  already. **Re-read the FX rate in the same sitting.**
+  already. Update the **CAD** figure; the rate no longer needs re-reading by hand.
 - If `sizePerRung`, `escalationFactor`, or `maxConcurrentRungs` change — all three move peak
   deployment, and the 125% figure above stops holding.

@@ -40,7 +40,9 @@ import {
 } from '../reconciliation/order-diagnosis.service';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 import { KillSwitchService } from '../risk/kill-switch.service';
-import { RISK_CONFIG, SYMBOL_CAPITAL } from '../risk/risk.module';
+import { FX_RATE_BOOK, RISK_CONFIG, SYMBOL_CAPITAL } from '../risk/risk.module';
+import { FxRateBook, FxStatus } from '../risk/fx-rate';
+import { LIVE_SIZE_STAGE } from '../config/live.config';
 import { RiskConfig } from '../risk/risk.config';
 import { evaluateStartupAssertions, SymbolCapital } from '../risk/startup-assertions';
 import { CoordinatorService } from '../strategies/coordinator.service';
@@ -194,6 +196,7 @@ export class EngineController {
     @Inject(STORAGE_MODE) private readonly storageMode: StorageMode,
     @Inject(RISK_CONFIG) private readonly riskConfig: RiskConfig,
     @Inject(SYMBOL_CAPITAL) private readonly symbolCapital: SymbolCapital,
+    @Inject(FX_RATE_BOOK) private readonly fxRateBook: FxRateBook | null,
   ) {}
 
   /**
@@ -618,6 +621,24 @@ export class EngineController {
       // `GET /alerts`.
       alerts: this.engine.activeAlerts(),
       strategies: this.coordinator.snapshots().map((s) => ({ id: s.id, enabled: s.enabled })),
+      // The equity conversion rate (Story 15). A stale or unavailable rate
+      // blocks every BUY while every other field here can read healthy, so it
+      // is reported rather than left to the risk-event log.
+      fx: this.fxRateBook?.snapshot() ?? {
+        status: FxStatus.NOT_REQUIRED,
+        pair: null,
+        rate: null,
+        receivedAt: null,
+        ageMs: null,
+        lastError: null,
+      },
+      // Reported in every mode so the reduced-size setting is visible before
+      // LIVE is ever entered, not discovered from the first undersized order.
+      liveSizing: {
+        stage: LIVE_SIZE_STAGE,
+        multiplier: this.riskConfig.liveSizeMultiplier,
+        appliesInCurrentMode: this.appConfig.executionMode === ExecutionMode.LIVE,
+      },
     };
   }
 

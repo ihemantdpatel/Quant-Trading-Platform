@@ -43,9 +43,11 @@ const positiveMoney = z.number().finite().positive();
  *
  * `mode` is a single mode rather than a set: the daemon is started in it, and
  * `allowedModes` is `[mode]`, so `POST /mode` cannot later move the account
- * into a mode nobody chose for it. Choosing `LIVE` records permission only —
- * the startup assertions refuse to boot `LIVE` until Story 15, whatever this
- * row says.
+ * into a mode nobody chose for it. Choosing `LIVE` trades real money at
+ * `LIVE`'s reduced size (`live.config.ts`) — but a dashboard-created daemon
+ * inherits the supervisor's `IB_HOST`/`IB_PORT`, which is the paper Gateway, so
+ * its login cannot manage a live id and it is refused at connect. Live
+ * accounts are added in `accounts.config.ts` with their own compose service.
  */
 export const accountDefinitionInputSchema = z.object({
   alias: z

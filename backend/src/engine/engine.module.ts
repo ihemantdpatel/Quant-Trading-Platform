@@ -34,6 +34,8 @@ import {
   HistoryCacheService,
 } from '../market-data/history/cache.service';
 import { LiveFeedService } from '../market-data/live/live-feed.service';
+import { FxRatePoller } from '../market-data/fx/fx-rate-poller';
+import { FxRateBook } from '../risk/fx-rate';
 import { BarSize } from '../market-data/types';
 import { OrderPollService } from '../reconciliation/order-poll.service';
 import { PostCloseReconcileService } from '../reconciliation/post-close-reconcile.service';
@@ -87,7 +89,7 @@ function isForwardableSink(sink: RiskEventSink): sink is ForwardableSink {
 import { RiskEvent, RiskEventSink } from '../risk/risk-event';
 import { RiskManagerService } from '../risk/risk-manager.service';
 import { RiskParameterService } from '../risk/risk-parameter.service';
-import { RISK_EVENT_SINK, RiskModule } from '../risk/risk.module';
+import { FX_RATE_BOOK, RISK_EVENT_SINK, RiskModule } from '../risk/risk.module';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { DipLadderConfig } from '../strategies/dip-ladder/config';
@@ -366,6 +368,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
   private liveFeed: LiveFeedService | null = null;
   private postClose: PostCloseReconcileService | null = null;
   private orderPoll: OrderPollService | null = null;
+  private fxPoller: FxRatePoller | null = null;
   // The grid strategy's own instances — see `startLiveFeed` for why these
   // are separate from the ladder's rather than one job serving both.
   private gridPostClose: PostCloseReconcileService | null = null;
@@ -425,11 +428,20 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     private readonly gridReconciliation: GridReconciliationService,
     private readonly orderDiagnosis: OrderDiagnosisService,
     private readonly appConfig: AppConfigService,
+    @Inject(FX_RATE_BOOK) private readonly fxRateBook: FxRateBook | null,
     // Present only with durable storage (`repositories.module.ts`).
     @Optional() private readonly accountRegistration?: AccountRegistrationService,
   ) {}
 
   async onModuleInit(): Promise<void> {
+    // The rate the risk manager converts equity at (Story 15). Started first
+    // and for every broker — see `fx-rate-poller.ts` for why it is not gated on
+    // IB like the live feed. Null book means equity needs no conversion.
+    if (this.fxRateBook) {
+      this.fxPoller = new FxRatePoller(this.broker, this.fxRateBook);
+      this.fxPoller.start();
+    }
+
     // **The IB account id is pinned only once IB has confirmed it.** A
     // `CONNECTED` from the IB adapter means `connect()` resolved, which the
     // socket allows only after `checkManagedAccount` passed — so this is the
@@ -724,6 +736,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleDestroy(): void {
+    this.fxPoller?.stop();
     this.liveFeed?.stop();
     this.postClose?.stop();
     this.orderPoll?.stop();

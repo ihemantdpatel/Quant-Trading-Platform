@@ -38,6 +38,7 @@ import {
   CompletedOrder,
   OpenOrder,
   AccountSummary,
+  FxQuoteReading,
   Fill,
   OrderAck,
 } from '../broker-adapter.interface';
@@ -138,6 +139,13 @@ export interface IbSocket {
 
   getPositions(): Promise<BrokerPosition[]>;
   getAccountSummary(): Promise<AccountSummary>;
+
+  /**
+   * One live snapshot of a currency pair (Story 15). Bounded by a timeout like
+   * every other IB call. Optional so existing fakes need not implement it; the
+   * adapter treats its absence as "no rate", which blocks new entries.
+   */
+  getFxQuote?(base: string, quote: string): Promise<FxQuoteReading>;
 
   onFill(handler: (fill: Fill) => void): () => void;
   onOrderStatus(handler: (ack: OrderAck) => void): () => void;

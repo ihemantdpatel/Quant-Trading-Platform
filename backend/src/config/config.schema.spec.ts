@@ -98,9 +98,40 @@ describe('validateConfig', () => {
       ).toThrow(/IB_ACCOUNT_ID: must be an IB account id/);
     });
 
-    it('accepts live and paper account ids', () => {
-      expect(validateConfig({ IB_ACCOUNT_ID: 'U1234567' }).IB_ACCOUNT_ID).toBe('U1234567');
+    it('accepts a paper id under PAPER and a live id under LIVE', () => {
       expect(validateConfig({ IB_ACCOUNT_ID: ' DU1234567 ' }).IB_ACCOUNT_ID).toBe('DU1234567');
+      expect(
+        validateConfig({ EXECUTION_MODE: ExecutionMode.LIVE, IB_ACCOUNT_ID: 'U1234567' })
+          .IB_ACCOUNT_ID,
+      ).toBe('U1234567');
+    });
+
+    it('rejects a live id under PAPER, before anything connects', () => {
+      // The socket confirms the login manages the id; only this confirms the id
+      // is the kind of account the mode claims.
+      expect(() =>
+        validateConfig({ EXECUTION_MODE: ExecutionMode.PAPER, IB_ACCOUNT_ID: 'U1234567' }),
+      ).toThrow(/U1234567 is a LIVE account but EXECUTION_MODE=PAPER/);
+    });
+
+    it('accepts the backend-live service environment as compose resolves it', () => {
+      const config = validateConfig({
+        ACCOUNT_ALIAS: 'live',
+        EXECUTION_MODE: ExecutionMode.LIVE,
+        IB_HOST: 'host.docker.internal',
+        IB_PORT: '4001',
+        IB_ACCOUNT_ID: 'U4707298',
+        IB_CLIENT_ID: '113',
+      });
+
+      expect(config.ACCOUNT_ALIAS).toBe('live');
+      expect(config.IB_ACCOUNT_ID).toBe('U4707298');
+    });
+
+    it('rejects a paper id under LIVE', () => {
+      expect(() =>
+        validateConfig({ EXECUTION_MODE: ExecutionMode.LIVE, IB_ACCOUNT_ID: 'DU1234567' }),
+      ).toThrow(/DU1234567 is a PAPER account but EXECUTION_MODE=LIVE/);
     });
 
     it('is required whenever IB is bound, so no IB read can go unfiltered', () => {
