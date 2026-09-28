@@ -112,4 +112,56 @@ describe('validateConfig', () => {
       ).toThrow(/IB_ACCOUNT_ID/);
     });
   });
+
+  describe('SMTP / email', () => {
+    const smtp = {
+      SMTP_USER: 'me@gmail.com',
+      SMTP_PASS: 'app-password',
+      EMAIL_TO: 'a@x.com, b@y.com',
+    };
+
+    it('leaves email off when none of it is set, with Gmail defaults', () => {
+      const config = validateConfig({});
+
+      expect(config.SMTP_USER).toBeUndefined();
+      expect(config.EMAIL_TO).toBeUndefined();
+      expect(config.SMTP_HOST).toBe('smtp.gmail.com');
+      expect(config.SMTP_PORT).toBe(465);
+      expect(config.SMTP_SECURE).toBe(true);
+    });
+
+    it('treats blank values as unset — compose passes them as ""', () => {
+      const config = validateConfig({ SMTP_USER: '', SMTP_PASS: '', EMAIL_TO: ' ', SMTP_PORT: '' });
+
+      expect(config.SMTP_USER).toBeUndefined();
+      expect(config.SMTP_PORT).toBe(465);
+    });
+
+    it('parses a comma-separated EMAIL_TO', () => {
+      expect(validateConfig(smtp).EMAIL_TO).toEqual(['a@x.com', 'b@y.com']);
+    });
+
+    it('refuses an invalid recipient', () => {
+      expect(() => validateConfig({ ...smtp, EMAIL_TO: 'a@x.com,not-an-address' })).toThrow(
+        /EMAIL_TO/,
+      );
+    });
+
+    it.each(['SMTP_USER', 'SMTP_PASS', 'EMAIL_TO'])(
+      'refuses a partial configuration missing %s rather than silently sending nothing',
+      (missing) => {
+        const partial: Record<string, string> = { ...smtp };
+        delete partial[missing];
+
+        expect(() => validateConfig(partial)).toThrow(new RegExp(`${missing}: is required`));
+      },
+    );
+
+    it('parses SMTP_SECURE=false and a custom port', () => {
+      const config = validateConfig({ ...smtp, SMTP_SECURE: 'false', SMTP_PORT: '587' });
+
+      expect(config.SMTP_SECURE).toBe(false);
+      expect(config.SMTP_PORT).toBe(587);
+    });
+  });
 });

@@ -176,6 +176,15 @@ services:
       IB_HOST: ${IB_HOST:-}
       IB_PORT: ${IB_PORT:-4002}
       IB_CLIENT_ID: ${IB_CLIENT_ID:-1}
+      # Daily/monthly P&L emails. Off unless SMTP_USER, SMTP_PASS and EMAIL_TO
+      # are all set; shared by every account daemon (see `.env.example`).
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_SECURE: ${SMTP_SECURE:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_TO: ${EMAIL_TO:-}
     depends_on:
       mysql:
         condition: service_healthy

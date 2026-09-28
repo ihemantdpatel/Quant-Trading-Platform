@@ -3,6 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { AppConfig } from './config.schema';
 import { ExecutionMode } from './execution-mode';
 
+/** Resolved SMTP settings for the P&L emails. */
+export interface EmailConfig {
+  host: string;
+  port: number;
+  secure: boolean;
+  user: string;
+  pass: string;
+  from: string;
+  to: string[];
+}
+
 /**
  * Typed accessor over Nest's ConfigService. Call sites get `ExecutionMode`
  * rather than `string | undefined`, so no consumer has to re-validate or
@@ -85,4 +96,59 @@ export class AppConfigService {
   get usesIbBroker(): boolean {
     return this.ibHost !== undefined;
   }
+
+  /**
+   * SMTP settings, or `null` when email is not configured. The schema has
+   * already refused a partial configuration, so `null` means "deliberately off".
+   */
+  get email(): EmailConfig | null {
+    return resolveEmailConfig({
+      SMTP_HOST: this.config.get('SMTP_HOST', { infer: true }),
+      SMTP_PORT: this.config.get('SMTP_PORT', { infer: true }),
+      SMTP_SECURE: this.config.get('SMTP_SECURE', { infer: true }),
+      SMTP_USER: this.config.get('SMTP_USER', { infer: true }),
+      SMTP_PASS: this.config.get('SMTP_PASS', { infer: true }),
+      EMAIL_FROM: this.config.get('EMAIL_FROM', { infer: true }),
+      EMAIL_TO: this.config.get('EMAIL_TO', { infer: true }),
+    });
+  }
+}
+
+type EmailFields = Pick<
+  AppConfig,
+  'SMTP_HOST' | 'SMTP_PORT' | 'SMTP_SECURE' | 'SMTP_USER' | 'SMTP_PASS' | 'EMAIL_FROM' | 'EMAIL_TO'
+>;
+
+/**
+ * Resolves validated SMTP fields to an `EmailConfig`, or `null` when email is off.
+ *
+ * Blank means unset, as for `ibHost`: the validated value of a blank variable is
+ * `undefined`, and `ConfigService.get` then falls through to the raw `''`
+ * compose passes. `EMAIL_TO` is re-split for the same reason — a fall-through
+ * returns the raw comma-separated string rather than the parsed list.
+ */
+export function resolveEmailConfig(fields: EmailFields): EmailConfig | null {
+  const text = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
+  const raw: unknown = fields.EMAIL_TO;
+  const to = (Array.isArray(raw) ? (raw as string[]) : (text(raw)?.split(',') ?? []))
+    .map((address) => address.trim())
+    .filter((address) => address !== '');
+  const user = text(fields.SMTP_USER);
+  const pass =
+    typeof fields.SMTP_PASS === 'string' && fields.SMTP_PASS !== '' ? fields.SMTP_PASS : undefined;
+
+  if (user === undefined || pass === undefined || to.length === 0) {
+    return null;
+  }
+
+  return {
+    host: text(fields.SMTP_HOST) ?? 'smtp.gmail.com',
+    port: Number(fields.SMTP_PORT ?? 465),
+    secure: fields.SMTP_SECURE !== false && String(fields.SMTP_SECURE) !== 'false',
+    user,
+    pass,
+    from: text(fields.EMAIL_FROM) ?? user,
+    to,
+  };
 }

@@ -41,7 +41,7 @@ All backend commands run from `backend/`.
 
 | Command | Purpose |
 |---|---|
-| `npm test` | Full suite (2001 tests), no database required |
+| `npm test` | Full suite (2070 tests), no database required |
 | `npm run test:cov` | Suite + coverage thresholds — what CI gates on |
 | `npm run test:db` | The Prisma suites; needs `DATABASE_URL` |
 | `npm run test:watch` | Watch mode |
@@ -52,6 +52,7 @@ All backend commands run from `backend/`.
 | `npm start` / `npm run start:dev` | Run the daemon (watch mode with `:dev`) |
 | `npm run replay -- --fixture chop-range` | Stream a fixture's bars to stdout |
 | `npm run recover:lots -- --symbol TQQQ` | Operator repair for a position stranded by a dropped fill |
+| `npm run email:sample -- --days 7` | Render (and send, `[SAMPLE]`-prefixed) the P&L emails from recent trades |
 | `npm run fixtures:build` | Regenerate fixture JSON from `definitions.ts` |
 
 **Running a single test:**
@@ -1235,6 +1236,32 @@ than left disagreeing with a position the broker already holds; and it has **its
 failed write is not reported as a failed bar and does not stall the queue behind it. The engine keeps
 running on in-memory state, and reconciliation catches a persistent divergence on the next restart.
 
+### P&L emails — daily after the close, monthly on the 1st
+
+`PnlEmailService` / `PnlEmailScheduler` (`src/observability/`) email each account's **realized** P&L:
+daily at **16:30 ET on weekdays** (after the 16:15 post-close reconcile), and monthly at **08:00 ET on
+the 1st** for the previous month. Each daemon sends its own account's email; subjects name the
+account, mode, and the exact dates covered (`Daily P&L · Fri, Sep 25, 2026 (session close)`).
+
+- **Grid only.** A trade is one closed `GridLot` — its own buy paired with its own sell, gain
+  `(exit − fill) × quantity`. The dip ladder is retired and its `Lot` rows are not read.
+  `GridLotRepository.findStrategyIds()` exists for this: `findAll()` returns lots with no strategy.
+- **Gross per trade; commissions cash-basis.** A lot carries no commission, so commissions are every
+  `Fill` in the period (entries for held lots included) and net = gross − that. **Known gap:**
+  nothing persists IB's late commission reports (`IBBrokerAdapter.onCommission` has no subscriber),
+  so every `Fill.commission` is 0 and net currently equals gross.
+- Days are **ET** dates; stored timestamps mix `Z` and `-04:00`, so everything is normalized before
+  bucketing (`pnl-summary.ts`).
+- **Gated like the post-close job**: the scheduler starts only when IB is bound *and*
+  `SMTP_USER`/`SMTP_PASS`/`EMAIL_TO` are set (setting some but not all is refused at boot). A failed
+  send is logged and dropped — never retried, never rethrown into a timer. No catch-up on a missed
+  run; `POST /reports/email/daily?date=` and `/reports/email/monthly?month=` are the manual resend.
+- Re-arming one-shot timers (DST-safe), chunked past `setTimeout`'s ~24.8-day ceiling, and floored at
+  the last run so an early-firing timer cannot send twice.
+- `mailer.ts` is the only file importing `nodemailer`. `SMTP_PASS` is a Gmail **App Password**.
+  `docker run --env-file` keeps quotes literally where compose strips them — leave the value unquoted.
+- Read-only over persisted rows; nothing here can reach a broker.
+
 ### HTTP API
 
 Read: `GET /health` `/status` `/intents` `/orders` `/fills` `/lots` `/rungs` `/positions`
@@ -1268,7 +1295,8 @@ Read: `GET /parameters` `/parameters/changes` `/parameters/:strategyId`
 Control: `POST /engine/replay` `{fixture}` · `/engine/reset` · `/engine/clear-halt` · `/reconcile` ·
 `/broker/reconnect` · `/kill-switch` `{engaged, reason}` · `/strategies/:id/enable|disable` ·
 `/mode` `{mode}` · `/parameters/:strategyId` `{parameters, reason}` · `/halts/:symbol/release` ·
-`/orders/place-missing` · `/orders/resolve-duplicates`
+`/orders/place-missing` · `/orders/resolve-duplicates` · `/reports/email/daily?date=` ·
+`/reports/email/monthly?month=`
 
 `POST /reconcile` takes no body and runs the **full** startup reconciliation — it can halt symbols
 and it restores persisted state over live memory. See "Reconciliation on demand and after the close"
@@ -1301,7 +1329,7 @@ curl localhost:3000/lots
 
 ## Testing
 
-2001 backend tests across 102 suites, plus database tests (`npm run test:db`, needs MySQL) and 266 UI
+2070 backend tests across 108 suites, plus database tests (`npm run test:db`, needs MySQL) and 266 UI
 component tests. Coverage thresholds are enforced in CI: **80% global, 95% on
 `src/strategies/**` and `src/risk/**`** — those are pure functions where a bug costs real money.
 

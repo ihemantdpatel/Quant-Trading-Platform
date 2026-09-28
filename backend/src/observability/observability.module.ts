@@ -14,6 +14,7 @@
 
 import { Module } from '@nestjs/common';
 import { ReportsController } from '../api/reports.controller';
+import { AppConfigService } from '../config/app-config.service';
 import { AppConfigModule } from '../config/config.module';
 import { EngineModule } from '../engine/engine.module';
 import { ReconciliationModule } from '../reconciliation/reconciliation.module';
@@ -25,6 +26,8 @@ import {
   RECONCILIATION_READ_MODEL,
   ReconciliationReadModel,
 } from './daily-report.service';
+import { MAILER, Mailer, NodemailerMailer } from './mailer';
+import { PnlEmailScheduler, PnlEmailService } from './pnl-email.service';
 
 @Module({
   imports: [
@@ -37,6 +40,16 @@ import {
   controllers: [ReportsController],
   providers: [
     DailyReportService,
+    PnlEmailService,
+    PnlEmailScheduler,
+    {
+      provide: MAILER,
+      // `null` when SMTP is not configured: the manual routes then answer 503
+      // and the scheduler never starts.
+      useFactory: (config: AppConfigService): Mailer | null =>
+        config.email === null ? null : new NodemailerMailer(config.email),
+      inject: [AppConfigService],
+    },
     {
       provide: RECONCILIATION_READ_MODEL,
       // Narrowed deliberately: the report receives only `lastReconciliation`,
@@ -47,6 +60,6 @@ import {
       inject: [ReconciliationService],
     },
   ],
-  exports: [DailyReportService],
+  exports: [DailyReportService, PnlEmailService],
 })
 export class ObservabilityModule {}
