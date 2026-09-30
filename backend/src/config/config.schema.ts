@@ -101,6 +101,41 @@ export const configSchema = z
      * previous one until it times out.
      */
     IB_CLIENT_ID: z.coerce.number().int().nonnegative().default(1),
+    /**
+     * SMTP settings for the daily/monthly P&L emails (`observability/pnl-email.service.ts`).
+     *
+     * **Optional, and `SMTP_USER` + `SMTP_PASS` + `EMAIL_TO` together are the
+     * switch** — the same presence convention `DATABASE_URL` and `IB_HOST` use.
+     * Defaults target Gmail over implicit TLS; `SMTP_PASS` must be a Gmail *App
+     * Password*, since Gmail refuses the account password over SMTP.
+     */
+    SMTP_HOST: z.preprocess(blankAsUnset, z.string().trim().default('smtp.gmail.com')),
+    SMTP_PORT: z.preprocess(blankAsUnset, z.coerce.number().int().positive().default(465)),
+    SMTP_SECURE: z.preprocess(
+      blankAsUnset,
+      z
+        .enum(['true', 'false'])
+        .default('true')
+        .transform((value) => value === 'true'),
+    ),
+    SMTP_USER: z.preprocess(blankAsUnset, z.string().trim().optional()),
+    SMTP_PASS: z.preprocess(blankAsUnset, z.string().optional()),
+    /** Defaults to `SMTP_USER` — Gmail rewrites any other sender to it anyway. */
+    EMAIL_FROM: z.preprocess(blankAsUnset, z.string().trim().optional()),
+    /** Comma-separated recipients. */
+    EMAIL_TO: z.preprocess(
+      blankAsUnset,
+      z
+        .string()
+        .transform((value) =>
+          value
+            .split(',')
+            .map((address) => address.trim())
+            .filter((address) => address !== ''),
+        )
+        .pipe(z.array(z.string().email()).min(1))
+        .optional(),
+    ),
   })
   .superRefine((config, context) => {
     const inRegistry = Object.prototype.hasOwnProperty.call(ACCOUNTS, config.ACCOUNT_ALIAS);
@@ -142,6 +177,27 @@ export const configSchema = z
         path: ['IB_ACCOUNT_ID'],
         message: 'is required when IB_HOST is set (the IB account id this daemon trades)',
       });
+    }
+
+    // Half an SMTP configuration is a typo, not a choice to disable email: a
+    // daemon that silently sent nothing would look exactly like a quiet day.
+    const email = {
+      SMTP_USER: config.SMTP_USER,
+      SMTP_PASS: config.SMTP_PASS,
+      EMAIL_TO: config.EMAIL_TO,
+    };
+    const present = Object.entries(email).filter(([, value]) => value !== undefined);
+
+    if (present.length > 0 && present.length < 3) {
+      for (const [name, value] of Object.entries(email)) {
+        if (value === undefined) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [name],
+            message: 'is required when any of SMTP_USER, SMTP_PASS, EMAIL_TO is set',
+          });
+        }
+      }
     }
   });
 

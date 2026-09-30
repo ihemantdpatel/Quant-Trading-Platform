@@ -519,6 +519,19 @@ export function runGridLotRepositoryContract(create: RepositoryFactory<GridLotRe
       expect(await repo.findByStrategy('grid:TQQQ')).toEqual([]);
     });
 
+    it('lists each strategy with stored lots once, sorted, and drops an emptied one', async () => {
+      await repo.saveAll(
+        [gridLotFixture({ id: 'a' }), gridLotFixture({ id: 'b' })],
+        'grid:TQQQ',
+        'TQQQ',
+      );
+      await repo.save(gridLotFixture({ id: 'c' }), 'grid:SOXL', 'SOXL');
+      await repo.save(gridLotFixture({ id: 'd' }), 'grid:UPRO', 'UPRO');
+      await repo.saveAll([], 'grid:UPRO', 'UPRO');
+
+      expect(await repo.findStrategyIds()).toEqual(['grid:SOXL', 'grid:TQQQ']);
+    });
+
     it('keeps strategies separate', async () => {
       await repo.save(gridLotFixture({ id: 'tqqq-1' }), 'grid:TQQQ', 'TQQQ');
       await repo.save(gridLotFixture({ id: 'spy-1' }), 'grid:SPY', 'SPY');

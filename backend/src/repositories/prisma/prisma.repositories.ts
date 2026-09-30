@@ -558,6 +558,17 @@ export class PrismaGridLotRepository implements GridLotRepository {
     return rows.map(toGridLot);
   }
 
+  async findStrategyIds(): Promise<string[]> {
+    const rows = await this.prisma.gridLot.findMany({
+      where: { accountId: this.accountId },
+      distinct: ['strategyId'],
+      select: { strategyId: true },
+      orderBy: { strategyId: 'asc' },
+    });
+
+    return rows.map((row) => row.strategyId);
+  }
+
   async clear(): Promise<void> {
     await this.prisma.gridLot.deleteMany({ where: { accountId: this.accountId } });
   }

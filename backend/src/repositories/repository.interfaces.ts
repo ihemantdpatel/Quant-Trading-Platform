@@ -126,6 +126,14 @@ export interface GridLotRepository {
   findAll(): Promise<GridLot[]>;
   findByStrategy(strategyId: string): Promise<GridLot[]>;
   findHeld(strategyId: string): Promise<GridLot[]>;
+  /**
+   * Every strategy id with at least one stored lot, sorted.
+   *
+   * `findAll` returns bare `GridLot`s, which carry no strategy — this is how a
+   * reader attributes lots to a strategy (and its symbol) without depending on
+   * which strategies happen to be registered in this process.
+   */
+  findStrategyIds(): Promise<string[]>;
   clear(): Promise<void>;
 }
 

@@ -251,6 +251,13 @@ export class InMemoryGridLotRepository implements GridLotRepository {
     );
   }
 
+  async findStrategyIds(): Promise<string[]> {
+    return [...this.lots.entries()]
+      .filter(([, byStrategy]) => byStrategy.size > 0)
+      .map(([strategyId]) => strategyId)
+      .sort();
+  }
+
   async clear(): Promise<void> {
     this.lots.clear();
   }
