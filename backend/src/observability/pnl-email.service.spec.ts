@@ -10,11 +10,11 @@ import { GridLotStatus } from '../strategies/grid/lot';
 import { RecordingMailer } from './mailer';
 import {
   EmailNotConfiguredError,
-  MAX_TIMER_MS,
   nextDailyRun,
   nextMonthlyRun,
   PnlEmailScheduler,
   PnlEmailService,
+  TICK_MS,
 } from './pnl-email.service';
 
 const et = (iso: string): DateTime => DateTime.fromISO(iso, { zone: ET_ZONE });
@@ -152,6 +152,15 @@ describe('PnlEmailScheduler', () => {
     await jest.advanceTimersByTimeAsync(ms);
   }
 
+  /**
+   * A host sleep: the wall clock moves on while the monotonic clock behind
+   * timers does not, then one tick runs after waking.
+   */
+  async function sleepThenWake(ms: number): Promise<void> {
+    now = now.plus({ milliseconds: ms });
+    await jest.advanceTimersByTimeAsync(TICK_MS);
+  }
+
   it('does not start without IB or without email', async () => {
     const { emails } = await service();
     const withoutIb = new PnlEmailScheduler(emails, appConfig(false));
@@ -163,12 +172,13 @@ describe('PnlEmailScheduler', () => {
     expect(jest.getTimerCount()).toBe(0);
   });
 
-  it('starts both timers when IB and email are configured, and stops on destroy', async () => {
+  it('starts one ticker when IB and email are configured, and stops on destroy', async () => {
     const { emails } = await service();
     const scheduler = new PnlEmailScheduler(emails, appConfig());
 
     scheduler.onApplicationBootstrap();
-    expect(jest.getTimerCount()).toBe(2);
+    scheduler.start(); // idempotent — a second start must not add a ticker
+    expect(jest.getTimerCount()).toBe(1);
 
     scheduler.onModuleDestroy();
     expect(jest.getTimerCount()).toBe(0);
@@ -192,17 +202,57 @@ describe('PnlEmailScheduler', () => {
     scheduler.stop();
   });
 
-  it('does not send twice when a timer fires a moment early', async () => {
+  it('sends on the first tick after a sleep that spanned 16:30, once', async () => {
     const { emails, mailer } = await service();
     now = et('2026-09-25T16:00');
     const scheduler = new PnlEmailScheduler(emails, appConfig());
     scheduler.start(clock);
 
-    // The clock lags the timer by 5ms: when it fires, "now" is before 16:30.
-    now = now.minus({ milliseconds: 5 });
-    await advance(30 * 60 * 1000);
-    await advance(10);
+    // Asleep from 16:00 to 16:50: only one tick's worth of timer time passes.
+    await sleepThenWake(50 * 60 * 1000);
+    expect(mailer!.sent.map((m) => m.subject)).toEqual([
+      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 trade)',
+    ]);
 
+    await advance(10 * TICK_MS);
+    expect(mailer!.sent).toHaveLength(1);
+    scheduler.stop();
+  });
+
+  it('sends one late email after a multi-day sleep, then re-arms from the present', async () => {
+    const { emails, mailer } = await service();
+    now = et('2026-09-28T16:00'); // Monday
+    const scheduler = new PnlEmailScheduler(emails, appConfig());
+    scheduler.start(clock);
+
+    // Asleep until Thursday 09:00: Monday's run is sent, Tue/Wed are not replayed.
+    await sleepThenWake(et('2026-10-01T09:00').toMillis() - now.toMillis());
+    const daily = mailer!.sent.filter((m) => m.subject.includes('Daily'));
+    expect(daily.map((m) => m.subject)).toEqual([expect.stringContaining('Mon, Sep 28, 2026')]);
+
+    // The monthly run due Oct 1 08:00 was also slept through, and goes too.
+    expect(mailer!.sent.filter((m) => m.subject.includes('Monthly'))).toHaveLength(1);
+
+    // Next daily is Thursday 16:30, not a backlog.
+    await advance(et('2026-10-01T16:30').toMillis() - now.toMillis());
+    expect(mailer!.sent.filter((m) => m.subject.includes('Daily')).at(-1)!.subject).toContain(
+      'Thu, Oct 1, 2026',
+    );
+    expect(mailer!.sent.filter((m) => m.subject.includes('Daily'))).toHaveLength(2);
+    scheduler.stop();
+  });
+
+  it('does not send twice when the wall clock steps back after a send', async () => {
+    const { emails, mailer } = await service();
+    now = et('2026-09-25T16:29');
+    const scheduler = new PnlEmailScheduler(emails, appConfig());
+    scheduler.start(clock);
+
+    await advance(TICK_MS);
+    expect(mailer!.sent).toHaveLength(1);
+
+    now = et('2026-09-25T16:29:30'); // NTP correction, back before 16:30
+    await advance(3 * TICK_MS);
     expect(mailer!.sent).toHaveLength(1);
     scheduler.stop();
   });
@@ -217,7 +267,12 @@ describe('PnlEmailScheduler', () => {
     await advance(60 * 1000);
 
     expect(mailer!.sent).toHaveLength(0);
-    expect(jest.getTimerCount()).toBe(2);
+    expect(jest.getTimerCount()).toBe(1);
+
+    // Re-armed for Monday, not retried on the next tick.
+    mailer!.failWith = null;
+    await advance(10 * TICK_MS);
+    expect(mailer!.sent).toHaveLength(0);
     scheduler.stop();
   });
 
@@ -235,22 +290,22 @@ describe('PnlEmailScheduler', () => {
     scheduler.stop();
   });
 
-  it('chunks a wait longer than setTimeout can hold instead of firing at once', async () => {
+  it('holds a wait longer than setTimeout can, firing only when due', async () => {
     const { emails, mailer } = await service();
-    // 2 Oct → 1 Nov is ~30 days, past the ~24.8-day timer ceiling.
+    // 1 Oct 09:00 → 1 Nov 08:00 is ~31 days, past the ~24.8-day timer ceiling.
     now = et('2026-10-01T09:00');
     const scheduler = new PnlEmailScheduler(emails, appConfig());
     scheduler.start(clock);
-    scheduler.stop(); // drop the daily timer; re-arm only the monthly below
-    (scheduler as unknown as { armMonthly(): void }).armMonthly();
 
-    await advance(MAX_TIMER_MS);
-    expect(mailer!.sent).toHaveLength(0);
+    await sleepThenWake(et('2026-11-01T07:59').toMillis() - now.toMillis());
+    expect(mailer!.sent.filter((m) => m.subject.includes('Monthly'))).toHaveLength(0);
 
-    await advance(et('2026-11-01T08:00').toMillis() - now.toMillis());
-    expect(mailer!.sent.map((m) => m.subject)).toEqual([
-      '[IB nuuixl118 · PAPER] Monthly P&L · October 2026 (Oct 1 – Oct 31, 2026): $0.00 (0 trades)',
-    ]);
+    await advance(TICK_MS);
+    expect(mailer!.sent.filter((m) => m.subject.includes('Monthly')).map((m) => m.subject)).toEqual(
+      [
+        '[IB nuuixl118 · PAPER] Monthly P&L · October 2026 (Oct 1 – Oct 31, 2026): $0.00 (0 trades)',
+      ],
+    );
     scheduler.stop();
   });
 });

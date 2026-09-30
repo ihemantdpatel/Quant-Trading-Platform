@@ -115,10 +115,10 @@ export const DAILY_SEND_AT = { hour: 16, minute: 30 };
 export const MONTHLY_SEND_AT = { day: 1, hour: 8, minute: 0 };
 
 /**
- * `setTimeout` overflows past 2^31−1 ms (~24.8 days) and fires immediately, and
- * a monthly delay can exceed that. Longer waits are chunked and re-armed.
+ * How often the scheduler compares the wall clock against its pending runs.
+ * A send therefore lands up to this long after its nominal time.
  */
-export const MAX_TIMER_MS = 2 ** 31 - 1;
+export const TICK_MS = 60_000;
 
 /** The next weekday 16:30 ET strictly after `now`. */
 export function nextDailyRun(now: DateTime): DateTime {
@@ -144,12 +144,27 @@ export function nextMonthlyRun(now: DateTime): DateTime {
 
 type Clock = () => DateTime;
 
+interface PendingRun {
+  label: string;
+  at: DateTime;
+  job: () => Promise<void>;
+  rearm: () => void;
+  running: boolean;
+}
+
 /**
  * Sends the daily email at 16:30 ET on weekdays and the monthly one at 08:00 ET
  * on the 1st, for the previous month.
  *
- * **One-shot timers that re-arm**, for the reason `PostCloseReconcileService`
- * gives: a fixed interval drifts across DST and anchors to process start.
+ * **A short interval that checks the wall clock, not a long one-shot timer.**
+ * Node timers run on the monotonic clock, and under Docker Desktop that clock
+ * stops while the host sleeps: a 24-hour `setTimeout` armed before a night of
+ * laptop sleep fired ~16 hours late, the next morning. The wall clock keeps
+ * counting, so a tick compares it against each pending run and a send that fell
+ * due during a sleep goes out on the first tick after waking. Each job holds at
+ * most one pending run, so a long sleep sends one late email and then re-arms
+ * from the present — it never replays every day it missed. Comparing against an
+ * absolute instant also keeps 16:30 ET fixed across DST.
  *
  * **Started only when IB is bound and email is configured.** Under the mock
  * broker the only lots are fixture replays, and emailing those would be noise.
@@ -163,13 +178,14 @@ type Clock = () => DateTime;
 @Injectable()
 export class PnlEmailScheduler implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(PnlEmailScheduler.name);
-  private dailyTimer: ReturnType<typeof setTimeout> | null = null;
-  private monthlyTimer: ReturnType<typeof setTimeout> | null = null;
+  private ticker: ReturnType<typeof setInterval> | null = null;
+  private daily: PendingRun | null = null;
+  private monthly: PendingRun | null = null;
   private clock: Clock = () => DateTime.now().setZone(ET_ZONE);
   /**
    * The last run instant. Re-arming computes from no earlier than this, so a
-   * timer that fires a millisecond before its target cannot schedule — and
-   * send — the same email twice.
+   * wall clock stepped backwards after a send (an NTP correction) cannot
+   * schedule — and send — the same email twice.
    */
   private floor: DateTime | null = null;
 
@@ -194,12 +210,12 @@ export class PnlEmailScheduler implements OnApplicationBootstrap, OnModuleDestro
     if (clock) {
       this.clock = clock;
     }
-    if (this.dailyTimer === null) {
-      this.armDaily();
+    if (this.ticker !== null) {
+      return;
     }
-    if (this.monthlyTimer === null) {
-      this.armMonthly();
-    }
+    this.armDaily();
+    this.armMonthly();
+    this.ticker = setInterval(() => this.tick(), TICK_MS);
   }
 
   onModuleDestroy(): void {
@@ -207,67 +223,74 @@ export class PnlEmailScheduler implements OnApplicationBootstrap, OnModuleDestro
   }
 
   stop(): void {
-    if (this.dailyTimer) clearTimeout(this.dailyTimer);
-    if (this.monthlyTimer) clearTimeout(this.monthlyTimer);
-    this.dailyTimer = null;
-    this.monthlyTimer = null;
+    if (this.ticker) clearInterval(this.ticker);
+    this.ticker = null;
+    this.daily = null;
+    this.monthly = null;
   }
 
   private armDaily(): void {
     const at = nextDailyRun(this.now());
     this.logger.log(`daily P&L email scheduled for ${at.toISO()}`);
-    this.dailyTimer = this.schedule(
+    this.daily = {
+      label: 'daily',
       at,
-      () => this.emails.sendDaily(at.toISODate()!).then(() => undefined),
-      () => this.armDaily(),
-      'daily',
-    );
+      job: () => this.emails.sendDaily(at.toISODate()!).then(() => undefined),
+      rearm: () => this.armDaily(),
+      running: false,
+    };
   }
 
   private armMonthly(): void {
     const at = nextMonthlyRun(this.now());
     this.logger.log(`monthly P&L email scheduled for ${at.toISO()}`);
-    this.monthlyTimer = this.schedule(
+    this.monthly = {
+      label: 'monthly',
       at,
-      () =>
+      job: () =>
         this.emails.sendMonthly(at.minus({ months: 1 }).toFormat('yyyy-MM')).then(() => undefined),
-      () => this.armMonthly(),
-      'monthly',
-    );
+      rearm: () => this.armMonthly(),
+      running: false,
+    };
+  }
+
+  private tick(): void {
+    const now = this.clock();
+    for (const run of [this.daily, this.monthly]) {
+      if (run !== null && !run.running && now >= run.at) {
+        this.fire(run, now);
+      }
+    }
   }
 
   /**
-   * Waits until `at` — in chunks no longer than `MAX_TIMER_MS` — runs `job`,
-   * then calls `rearm`. The chunk path re-arms without running, recomputing the
-   * target from the clock so a long wait cannot drift.
+   * Runs one due job, then re-arms it. `running` stops the next tick starting a
+   * second send while a slow SMTP exchange is still in flight.
    */
-  private schedule(
-    at: DateTime,
-    job: () => Promise<void>,
-    rearm: () => void,
-    label: string,
-  ): ReturnType<typeof setTimeout> {
-    const delay = at.toMillis() - this.clock().toMillis();
-
-    if (delay > MAX_TIMER_MS) {
-      return setTimeout(rearm, MAX_TIMER_MS);
+  private fire(run: PendingRun, now: DateTime): void {
+    run.running = true;
+    const lateMs = now.toMillis() - run.at.toMillis();
+    if (lateMs > TICK_MS) {
+      this.logger.warn(
+        `${run.label} P&L email is ${Math.round(lateMs / 60_000)} min late ` +
+          `(due ${run.at.toISO()}) — was the host asleep?`,
+      );
     }
 
-    return setTimeout(
-      () => {
-        job()
-          .then(() => this.logger.log(`${label} P&L email sent`))
-          .catch((error: unknown) =>
-            this.logger.warn(`${label} P&L email failed: ${(error as Error).message}`),
-          )
-          .finally(() => {
-            if (this.floor === null || at > this.floor) {
-              this.floor = at;
-            }
-            rearm();
-          });
-      },
-      Math.max(0, delay),
-    );
+    run
+      .job()
+      .then(() => this.logger.log(`${run.label} P&L email sent`))
+      .catch((error: unknown) =>
+        this.logger.warn(`${run.label} P&L email failed: ${(error as Error).message}`),
+      )
+      .finally(() => {
+        if (this.floor === null || run.at > this.floor) {
+          this.floor = run.at;
+        }
+        // A stop() while the send was in flight must stay stopped.
+        if (this.ticker !== null) {
+          run.rearm();
+        }
+      });
   }
 }

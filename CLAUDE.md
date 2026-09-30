@@ -1256,8 +1256,12 @@ account, mode, and the exact dates covered (`Daily P&L · Fri, Sep 25, 2026 (ses
   `SMTP_USER`/`SMTP_PASS`/`EMAIL_TO` are set (setting some but not all is refused at boot). A failed
   send is logged and dropped — never retried, never rethrown into a timer. No catch-up on a missed
   run; `POST /reports/email/daily?date=` and `/reports/email/monthly?month=` are the manual resend.
-- Re-arming one-shot timers (DST-safe), chunked past `setTimeout`'s ~24.8-day ceiling, and floored at
-  the last run so an early-firing timer cannot send twice.
+- **A 60s ticker compared against the wall clock, not long one-shot timers.** Node timers run on the
+  monotonic clock, which stops while Docker Desktop's host sleeps — a 24h `setTimeout` armed before a
+  night of laptop sleep fired ~16h late. A run slept through goes out on the first tick after waking
+  (logged as late); each job holds one pending run, so a long sleep sends one email, never a backlog.
+  Floored at the last run so a wall clock stepped backwards cannot send twice.
+  `PostCloseReconcileService` still uses a one-shot timer and drifts the same way.
 - `mailer.ts` is the only file importing `nodemailer`. `SMTP_PASS` is a Gmail **App Password**.
   `docker run --env-file` keeps quotes literally where compose strips them — leave the value unquoted.
 - Read-only over persisted rows; nothing here can reach a broker.
