@@ -72,6 +72,7 @@ import {
 import {
   durationString,
   parseIbTime,
+  executionClientOrderId,
   resolveClientOrderId,
   toDomainBar,
   toIbContract,
@@ -240,9 +241,8 @@ export class StoqeyIbSocket implements IbSocket {
    * this socket silently ignoring a fill for anything the filter did not
    * anticipate — a manual TWS order against the same account, or a symbol
    * added to the ladder later — and a dropped execution is invisible rather
-   * than loud. Fills the engine cannot attribute are discarded downstream by
-   * `clientOrderIdFor`, which is the right place for that decision because it
-   * has the `orderRef` correlation this layer does not.
+   * than loud. Fills no order claims are forwarded as manual fills
+   * (`executionClientOrderId`) for the engine to adopt.
    *
    * IB replays the day's executions in response, including ones already
    * processed before a reconnect. That replay is the reason `routeFill`
@@ -675,7 +675,11 @@ export class StoqeyIbSocket implements IbSocket {
           return;
         }
 
-        const clientOrderId = this.clientOrderIdFor(execution.orderId, execution.orderRef);
+        const clientOrderId = executionClientOrderId(
+          this.clientOrderIdFor(execution.orderId, execution.orderRef),
+          contract.secType,
+          execution.execId,
+        );
 
         if (!clientOrderId) {
           return;

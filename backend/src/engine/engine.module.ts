@@ -6,11 +6,9 @@
  * registrations, so enabling the Wheel at Story 16 is a change here rather
  * than anywhere in the strategy layer.
  *
- * **Current operator choice: the grid strategy trades TQQQ; the dip ladder,
- * Wheel, and Leaps are all disabled.** This inverts the Story 2 default (the
- * ladder enabled, everything else off) — see `ladderEnabled`/`gridEnabled`
- * below for the reasoning and the same-symbol guard that keeps the two from
- * ever running together.
+ * **Current operator choice: the grid strategy trades TQQQ; Wheel and Leaps
+ * are disabled, and the dip ladder is retired** — not registered at all, so
+ * nothing can re-enable it. See `onModuleInit`.
  */
 
 import { AccountsController } from '../api/accounts.controller';
@@ -89,7 +87,6 @@ import { RiskManagerService } from '../risk/risk-manager.service';
 import { RiskParameterService } from '../risk/risk-parameter.service';
 import { RISK_EVENT_SINK, RiskModule } from '../risk/risk.module';
 import { CoordinatorService } from '../strategies/coordinator.service';
-import { DipLadderStrategy } from '../strategies/dip-ladder/dip-ladder.strategy';
 import { DipLadderConfig } from '../strategies/dip-ladder/config';
 import { GridConfig } from '../strategies/grid/config';
 import { GridStrategy } from '../strategies/grid/grid.strategy';
@@ -376,36 +373,11 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
   private disabledStrategyProtection: DisabledStrategyProtectionService | null = null;
 
   /**
-   * Whether the dip ladder is wired to trade.
-   *
-   * **Operator decision: disabled**, so the grid strategy can trade TQQQ
-   * instead — the two must never both be enabled on one symbol (see the
-   * same-symbol guard below). Kept as a named flag rather than a bare
-   * `enabled: false` at the registration call, so a future re-enable is a
-   * one-line, legible change and the guard stays meaningful in both
-   * directions.
-   *
-   * **Consequence worth knowing before flipping this back on while Grid
-   * stays enabled too**: reconciliation still protects a disabled ladder's
-   * real broker position (the lot-sum assertion runs for every registered
-   * ladder-prefixed snapshot regardless of `enabled`), and `GET /lots`, the
-   * order diagnosis, and `DisabledStrategyProtectionService` all fall back to
-   * the database for a disabled strategy's real lots (`CoordinatorService.
-   * initializeAll` only initializes enabled ones, so live strategy state is
-   * never populated for it) — so a disabled ladder holding real shares is
-   * both visible on the dashboard and kept protected by a fresh sell every
-   * session, without being re-enabled. What it does *not* get is anything
-   * bar-driven: no new entries, no rung re-arming, no dip-buys — a disabled
-   * strategy still makes no trading decisions of its own.
-   */
-  private readonly ladderEnabled = false;
-
-  /**
    * Whether the grid strategy is wired to trade.
    *
-   * **Operator decision: enabled**, trading the same TQQQ symbol the ladder
-   * used to. Safe only because `ladderEnabled` is `false` above — the
-   * same-symbol guard below refuses to boot otherwise.
+   * **Operator decision: enabled**, trading the TQQQ symbol the dip ladder
+   * used to. The ladder is retired, not merely disabled — see
+   * `onModuleInit`.
    */
   private readonly gridEnabled = true;
 
@@ -416,7 +388,6 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     @Inject(BROKER_ADAPTER) private readonly broker: BrokerAdapter,
     @Inject(RISK_EVENT_SINK) private readonly riskEventSink: RiskEventSink,
     @Inject(RISK_EVENT_REPOSITORY) private readonly riskEvents: RiskEventRepository,
-    private readonly parameters: ParameterService,
     private readonly gridParameters: GridParameterService,
     private readonly riskParameters: RiskParameterService,
     private readonly startup: StartupSequence,
@@ -466,43 +437,18 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       this.riskEventSink.subscribe((event) => void this.riskEvents.save(event));
     }
 
-    // **Same-symbol guard.** The grid strategy and the dip ladder cannot
-    // safely hold live positions in the same symbol at once — each one's
-    // reconciliation is blind to the other's shares, so both enabled here
-    // would make each halt on the other's exposure as a spurious mismatch
-    // the moment either holds a position. Refusing to boot turns an operator
-    // mistake into a legible startup error instead of two confusing halts,
-    // mirroring `assertSingleCurrency`'s "refuse rather than silently
-    // misbehave" precedent. Checked against **both** enabled flags — a
-    // disabled ladder holding a stale position is not the unsafe case this
-    // guards against; two strategies actively trading it at once is.
-    if (
-      this.gridEnabled &&
-      this.ladderEnabled &&
-      this.gridConfig.symbol === this.ladderConfig.symbol
-    ) {
-      throw new Error(
-        `refusing to start: GridStrategy and DipLadderStrategy are both enabled on ` +
-          `${this.gridConfig.symbol} — each strategy's reconciliation is blind to the other's ` +
-          'shares and would halt on a spurious mismatch. Enable at most one of them per symbol.',
-      );
-    }
-
-    // Registration order is display order on the dashboard; the ladder first
-    // for historical continuity even though it is disabled by the current
-    // operator choice above.
-    const ladder = new DipLadderStrategy(this.ladderConfig);
-
-    this.coordinator.register({
-      strategy: ladder,
-      enabled: this.ladderEnabled,
-      symbols: [this.ladderConfig.symbol],
-    });
-
-    // The **same object instance** the strategy holds, so a live edit is
-    // visible to the next bar's `evaluateBar`. Registering a copy would let
-    // edits apply to nothing (`parameter.service.ts:24`).
-    this.parameters.register(ladder.id, this.ladderConfig);
+    // **The dip ladder is retired and is deliberately not registered.**
+    //
+    // It used to be registered disabled, which was not off enough.
+    // Reconciliation ran its lot-sum assertion for every ladder snapshot
+    // whether or not it was enabled, so grid shares the grid failed to record
+    // were "explained" by Tier 2 synthesizing *ladder* lots for them
+    // (2026-09-29 and 2026-10-01), and those surfaced on the dashboard as
+    // dip-ladder holdings. `POST /strategies/dip-ladder:TQQQ/enable` could
+    // also have revived it beside the grid on the same symbol. Unregistered,
+    // nothing can enable, reconcile, rebuild, protect, or display it; the
+    // code stays for history and the fixture suites.
+    // `retired-ladder.integration.spec.ts` pins this.
 
     // Rebuilds the engine's in-memory working-order registry from the orders
     // reconciliation found still resting at the broker. A callback rather than
@@ -532,8 +478,9 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
       symbols: [this.gridConfig.symbol],
     });
 
-    // The same object instance the strategy holds — see the identical note
-    // on `this.parameters.register` above.
+    // The **same object instance** the strategy holds, so a live edit is
+    // visible to the next recompute. Registering a copy would let edits
+    // apply to nothing.
     this.gridParameters.register(grid.id, this.gridConfig);
 
     for (const strategy of [new WheelStrategy(), new LeapsStrategy()]) {
@@ -541,7 +488,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
         strategy,
         // Disabled with no live wiring until Story 16.
         enabled: false,
-        symbols: [this.ladderConfig.symbol],
+        symbols: [this.gridConfig.symbol],
       });
     }
 
@@ -573,13 +520,13 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // rather than injected into `StartupSequence`, which would close a cycle:
     // `EngineService` already depends on the sequence.
     //
-    // **Risk-limit restore runs before ladder parameter restore, which runs
+    // **Risk-limit restore runs before grid parameter restore, which runs
     // before everything else in the chain.** A runtime edit to a per-symbol
-    // risk limit or a ladder parameter, made before the last restart, must be
-    // back in force before a single bar can reach the risk manager or
-    // `evaluateBar`. `RiskParameterService.restore` reads its own audit table
+    // risk limit or a grid parameter, made before the last restart, must be
+    // back in force before a single bar can reach the risk manager or the
+    // strategy. `RiskParameterService.restore` reads its own audit table
     // (`findAll`), which can genuinely fail against an unreachable database —
-    // unlike `ParameterService.restore`, whose non-fatal internals never
+    // unlike `GridParameterService.restore`, whose non-fatal internals never
     // throw — so it gets its own `.catch` here, leaving the compiled
     // `capital.config.ts` defaults in force rather than blocking the boot.
     void this.riskParameters
@@ -592,18 +539,15 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
         );
       })
       .then(() =>
-        this.parameters
-          .restore(ladder.id)
-          // The grid strategy's own parameter restore, alongside the ladder's —
-          // both must be back in force before a single bar or fill can reach
-          // either strategy. Non-fatal internally, matching `ParameterService.restore`,
-          // so no separate `.catch` is needed here either.
-          .then(() => this.gridParameters.restore(grid.id))
+        // Back in force before a single bar or fill can reach the strategy.
+        // Non-fatal internally, so no separate `.catch` is needed here.
+        this.gridParameters
+          .restore(grid.id)
           .then(() => this.engine.restoreClientOrderSequence())
           .catch((error: unknown) => {
             // Non-fatal. A failed read leaves the counter at zero, which is the
             // pre-existing behaviour — the collision risk returns, but refusing to
-            // boot would take the operator's only view of the ladder down with it.
+            // boot would take the operator's only view of the account down with it.
             this.logger.error(
               `could not restore the client order sequence: ${
                 error instanceof Error ? error.message : String(error)
@@ -664,15 +608,9 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
     // the active strategy re-evaluates and places new orders, not fill
     // mechanics.
     //
-    // **Whichever strategy is actually enabled**, not unconditionally the
-    // ladder's symbol. Both happen to be TQQQ today, so this was silently
-    // correct before — but hard-coding `ladderConfig.symbol` here would have
-    // subscribed to the wrong instrument entirely the moment an operator
-    // pointed the grid strategy at a different symbol while leaving the
-    // ladder's compiled default alone, leaving the enabled strategy fed no
-    // bars at all with nothing in the logs to explain why.
-    const liveSymbol = this.gridEnabled ? this.gridConfig.symbol : this.ladderConfig.symbol;
-    this.liveFeed.start(equityContract(liveSymbol), BarSize.ONE_MIN);
+    // The grid's symbol — the only strategy that trades now the ladder is
+    // retired.
+    this.liveFeed.start(equityContract(this.gridConfig.symbol), BarSize.ONE_MIN);
     this.liveFeed.startWatchdog();
 
     // **Started alongside the live feed, and gated on the same condition.**

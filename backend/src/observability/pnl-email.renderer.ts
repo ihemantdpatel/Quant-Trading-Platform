@@ -9,7 +9,8 @@
 import { DateTime } from 'luxon';
 import { ExecutionMode } from '../config/execution-mode';
 import { ET_ZONE } from '../market-data/types';
-import { DailyPnl, PeriodPnl, PnlTotals } from './pnl-summary';
+import { BasisMismatch } from './average-cost-pnl';
+import { Coverage, DailyPnl, PeriodPnl, PnlTotals } from './pnl-summary';
 
 export interface EmailAccount {
   alias: string;
@@ -58,12 +59,6 @@ function etTime(timestamp: string): string {
   return DateTime.fromISO(timestamp, { setZone: true }).setZone(ET_ZONE).toFormat('HH:mm');
 }
 
-/** `HH:mm` when on `date`, else `MMM d HH:mm` — a lot can be bought days before it sells. */
-function etTimeOn(timestamp: string, date: string): string {
-  const et = DateTime.fromISO(timestamp, { setZone: true }).setZone(ET_ZONE);
-  return et.toISODate() === date ? et.toFormat('HH:mm') : et.toFormat('MMM d HH:mm');
-}
-
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -93,7 +88,36 @@ function subjectTag(account: EmailAccount, options: RenderOptions): string {
 }
 
 function tradeCount(n: number): string {
-  return `${n} trade${n === 1 ? '' : 's'}`;
+  return `${n} sell${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * Why a figure covers less than its period, or null when it covers all of it.
+ * An untracked period must never read as a quiet $0.
+ */
+export function coverageNote(coverage: Coverage): string | null {
+  if (!coverage.tracked) {
+    return 'Not tracked: no IB position snapshot exists for this period, so its realized P&L cannot be computed on an average-cost basis.';
+  }
+  if (coverage.partial) {
+    return `Partial: average-cost tracking began ${etStamp(coverage.trackedSince!)} ET; sells before that are not included.`;
+  }
+  return null;
+}
+
+/** One line per snapshot whose quantity disagreed with the recorded fills. */
+export function mismatchNotes(mismatches: BasisMismatch[]): string[] {
+  return mismatches.map(
+    (m) =>
+      `${m.symbol} at ${etStamp(m.takenAt)} ET: IB held ${m.brokerQuantity} sh @ ` +
+      `${m.brokerAverageCost.toFixed(4)}, recorded fills explain ${m.replayedQuantity} sh @ ` +
+      `${m.replayedAverageCost.toFixed(4)} — a fill is missing (e.g. a trade placed in TWS). Our ` +
+      `average and realized P&L stay off until the missing fill is recorded.`,
+  );
+}
+
+function etStamp(timestamp: string): string {
+  return DateTime.fromISO(timestamp, { setZone: true }).setZone(ET_ZONE).toFormat('LLL d HH:mm');
 }
 
 // --- HTML building blocks -------------------------------------------------
@@ -134,10 +158,10 @@ function totalsBlock(totals: PnlTotals): string {
     `<td style="padding:4px 10px;text-align:right;${strong ? 'font-size:18px;' : ''}">${value}</td></tr>`;
 
   return `<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:14px;margin-top:8px">
-${row('Trades closed', String(totals.trades))}
-${row('Gross capital gain', money(totals.gross))}
-${row('Commissions paid (all fills)', escapeHtml(usd.format(totals.commissions)))}
-${row('Net capital gain', money(totals.net), true)}
+${row('Sells', String(totals.trades))}
+${row('Gross vs. average cost', money(totals.gross))}
+${row('Sell commissions', escapeHtml(usd.format(totals.commissions)))}
+${row('Realized P&L', money(totals.net), true)}
 </table>`;
 }
 
@@ -149,10 +173,16 @@ function page(title: string, subtitle: string, sections: string[]): string {
 <div style="color:${MUTED};font-size:13px;margin-bottom:16px">${escapeHtml(subtitle)}</div>
 ${sections.join('\n')}
 <div style="color:${MUTED};font-size:12px;margin-top:24px;border-top:1px solid ${BORDER};padding-top:12px">
-Gross gain per trade is (sell − buy) × quantity for one closed grid lot. Commissions are every fill in the period, including buys for lots still held. Net = gross − commissions. Times are ET.
+${escapeHtml(FOOTNOTE)}
 </div>
 </div></body></html>`;
 }
+
+const FOOTNOTE =
+  'Realized P&L uses the average-cost method: each sell realizes (sell − position average cost) × quantity, ' +
+  'less its commission. Buy commissions are included in the average cost. The average is our own running ' +
+  "count from recorded fills, opened once from IB's position; IB's later positions are only a check, so it " +
+  "can differ from IB's by cents. Times are ET.";
 
 function section(heading: string, body: string): string {
   return `<h2 style="font-size:15px;margin:20px 0 8px">${escapeHtml(heading)}</h2>${body}`;
@@ -162,14 +192,23 @@ function note(text: string): string {
   return `<p style="color:${MUTED};font-size:14px;margin:8px 0">${escapeHtml(text)}</p>`;
 }
 
+function warning(text: string): string {
+  return `<p style="color:${LOSS};font-size:14px;margin:8px 0">${escapeHtml(text)}</p>`;
+}
+
+function warnings(coverage: Coverage, mismatches: BasisMismatch[]): string[] {
+  const coverageText = coverageNote(coverage);
+  return [...(coverageText === null ? [] : [coverageText]), ...mismatchNotes(mismatches)];
+}
+
 // --- Plain-text building blocks ------------------------------------------
 
 function textTotals(totals: PnlTotals): string[] {
   return [
-    `Trades closed:                ${totals.trades}`,
-    `Gross capital gain:           ${signedUsd(totals.gross)}`,
-    `Commissions paid (all fills): ${usd.format(totals.commissions)}`,
-    `Net capital gain:             ${signedUsd(totals.net)}`,
+    `Sells:                  ${totals.trades}`,
+    `Gross vs. average cost: ${signedUsd(totals.gross)}`,
+    `Sell commissions:       ${usd.format(totals.commissions)}`,
+    `Realized P&L:           ${signedUsd(totals.net)}`,
   ];
 }
 
@@ -183,81 +222,78 @@ export function renderDaily(
   // The subject names the session outright: the email lands after the close,
   // and a resend for an earlier day must not read as today's.
   const title = `Daily P&L · ${longDate(summary.date)} (session close)`;
-  const subject =
-    `${subjectTag(account, options)} ${title}: ` +
-    `${signedUsd(summary.totals.net)} (${tradeCount(summary.totals.trades)})`;
+  const headline = summary.coverage.tracked
+    ? `${signedUsd(summary.totals.net)} (${tradeCount(summary.totals.trades)})`
+    : 'not tracked';
+  const subject = `${subjectTag(account, options)} ${title}: ${headline}`;
 
-  const tradeRows = summary.trades.map((t) => [
+  const sellRows = summary.sells.map((t) => [
     escapeHtml(t.symbol),
-    escapeHtml(etTimeOn(t.openedAt, summary.date)),
-    escapeHtml(etTime(t.closedAt)),
+    escapeHtml(etTime(t.timestamp)),
     String(t.quantity),
-    escapeHtml(price(t.buyPrice)),
-    escapeHtml(price(t.sellPrice)),
-    money(t.gain),
+    escapeHtml(price(t.price)),
+    escapeHtml(price(t.averageCost)),
+    escapeHtml(usd.format(t.commission)),
+    money(t.realized),
   ]);
 
-  const tradesHtml =
-    summary.trades.length === 0
-      ? note('No trades closed today.')
-      : table(['Symbol', 'Bought', 'Sold', 'Qty', 'Buy', 'Sell', 'Gain'], tradeRows, 3);
+  const sellsHtml =
+    summary.sells.length === 0
+      ? note('No sells today.')
+      : table(['Symbol', 'Time', 'Qty', 'Sell', 'Avg cost', 'Commission', 'Realized'], sellRows, 2);
 
   const heldHtml =
     summary.held.length === 0
-      ? note('No lots held.')
+      ? note('No position held.')
       : table(
-          ['Symbol', 'Strategy', 'Lots', 'Quantity'],
+          ['Symbol', 'Quantity', 'Avg cost'],
           summary.held.map((h) => [
             escapeHtml(h.symbol),
-            escapeHtml(h.strategyId),
-            String(h.lots),
             String(h.quantity),
+            escapeHtml(price(h.averageCost)),
           ]),
-          2,
+          1,
         );
 
   const mtd = summary.monthToDate;
-  const mtdHtml = note(
+  const mtdNote = coverageNote(summary.monthCoverage);
+  const mtdLine =
     `${tradeCount(mtd.trades)} · gross ${signedUsd(mtd.gross)} · ` +
-      `commissions ${usd.format(mtd.commissions)} · net ${signedUsd(mtd.net)}`,
-  );
+    `commissions ${usd.format(mtd.commissions)} · realized ${signedUsd(mtd.net)}`;
+  const dayWarnings = warnings(summary.coverage, summary.mismatches);
 
-  const html = page(
-    title,
-    `${account.alias} · ${account.mode} · trades closed ${summary.date} ET`,
-    [
-      section('Summary', totalsBlock(summary.totals)),
-      section('Trades', tradesHtml),
-      section('Month to date', mtdHtml),
-      section('Currently held', heldHtml),
-    ],
-  );
+  const html = page(title, `${account.alias} · ${account.mode} · sells on ${summary.date} ET`, [
+    ...dayWarnings.map(warning),
+    section('Summary', totalsBlock(summary.totals)),
+    section('Sells', sellsHtml),
+    section('Month to date', note(mtdLine) + (mtdNote === null ? '' : note(mtdNote))),
+    section('Position at close', heldHtml),
+  ]);
 
   const text = [
     `${title} — ${account.alias} · ${account.mode}`,
+    ...dayWarnings.map((w) => `! ${w}`),
     '',
     ...textTotals(summary.totals),
     '',
-    'Trades',
-    ...(summary.trades.length === 0
-      ? ['  No trades closed today.']
-      : summary.trades.map(
+    'Sells',
+    ...(summary.sells.length === 0
+      ? ['  No sells today.']
+      : summary.sells.map(
           (t) =>
-            `  ${t.symbol} ${etTimeOn(t.openedAt, summary.date)} → ${etTime(t.closedAt)} ${t.quantity} sh ` +
-            `buy ${price(t.buyPrice)} sell ${price(t.sellPrice)} gain ${signedUsd(t.gain)}`,
+            `  ${t.symbol} ${etTime(t.timestamp)} ${t.quantity} sh sell ${price(t.price)} ` +
+            `avg ${price(t.averageCost)} commission ${usd.format(t.commission)} realized ${signedUsd(t.realized)}`,
         )),
     '',
-    `Month to date: ${tradeCount(mtd.trades)}, gross ${signedUsd(mtd.gross)}, ` +
-      `commissions ${usd.format(mtd.commissions)}, net ${signedUsd(mtd.net)}`,
+    `Month to date: ${mtdLine}`,
+    ...(mtdNote === null ? [] : [`  ${mtdNote}`]),
     '',
-    'Currently held',
+    'Position at close',
     ...(summary.held.length === 0
-      ? ['  No lots held.']
-      : summary.held.map(
-          (h) => `  ${h.symbol} (${h.strategyId}): ${h.lots} lots, ${h.quantity} sh`,
-        )),
+      ? ['  No position held.']
+      : summary.held.map((h) => `  ${h.symbol}: ${h.quantity} sh @ avg ${price(h.averageCost)}`)),
     '',
-    'Times are ET. Commissions include buys for lots still held.',
+    FOOTNOTE,
   ].join('\n');
 
   return { subject, html, text };
@@ -272,15 +308,16 @@ export function renderPeriod(
   const title = options.periodLabel
     ? `P&L · ${options.periodLabel} (${range})`
     : `Monthly P&L · ${DateTime.fromISO(summary.from, { zone: ET_ZONE }).toFormat('LLLL yyyy')} (${range})`;
-  const subject =
-    `${subjectTag(account, options)} ${title}: ` +
-    `${signedUsd(summary.totals.net)} (${tradeCount(summary.totals.trades)})`;
+  const headline = summary.coverage.tracked
+    ? `${signedUsd(summary.totals.net)} (${tradeCount(summary.totals.trades)})`
+    : 'not tracked';
+  const subject = `${subjectTag(account, options)} ${title}: ${headline}`;
 
   const daysHtml =
     summary.days.length === 0
-      ? note('No trades closed in this period.')
+      ? note('No sells in this period.')
       : table(
-          ['Date', 'Trades', 'Gross', 'Commissions', 'Net'],
+          ['Date', 'Sells', 'Gross', 'Commissions', 'Realized'],
           summary.days.map((d) => [
             escapeHtml(DateTime.fromISO(d.date).toFormat('ccc, MMM d')),
             String(d.trades),
@@ -291,48 +328,46 @@ export function renderPeriod(
           1,
         );
 
-  const strategyHtml =
-    summary.byStrategy.length === 0
+  const symbolHtml =
+    summary.bySymbol.length === 0
       ? note('—')
       : table(
-          ['Symbol', 'Strategy', 'Trades', 'Gross'],
-          summary.byStrategy.map((s) => [
-            escapeHtml(s.symbol),
-            escapeHtml(s.strategyId),
-            String(s.trades),
-            money(s.gross),
-          ]),
-          2,
+          ['Symbol', 'Sells', 'Realized'],
+          summary.bySymbol.map((s) => [escapeHtml(s.symbol), String(s.trades), money(s.net)]),
+          1,
         );
+
+  const periodWarnings = warnings(summary.coverage, summary.mismatches);
 
   const html = page(
     title,
-    `${account.alias} · ${account.mode} · trades closed ${summary.from} to ${summary.to} ET`,
+    `${account.alias} · ${account.mode} · sells ${summary.from} to ${summary.to} ET`,
     [
+      ...periodWarnings.map(warning),
       section('Summary', totalsBlock(summary.totals)),
       section('By day', daysHtml),
-      section('By strategy', strategyHtml),
+      section('By symbol', symbolHtml),
     ],
   );
 
   const text = [
     `${title} — ${account.alias} · ${account.mode}`,
+    ...periodWarnings.map((w) => `! ${w}`),
     '',
     ...textTotals(summary.totals),
     '',
     'By day',
     ...(summary.days.length === 0
-      ? ['  No trades closed in this period.']
+      ? ['  No sells in this period.']
       : summary.days.map(
           (d) =>
             `  ${d.date}  ${tradeCount(d.trades)}, gross ${signedUsd(d.gross)}, ` +
-            `commissions ${usd.format(d.commissions)}, net ${signedUsd(d.net)}`,
+            `commissions ${usd.format(d.commissions)}, realized ${signedUsd(d.net)}`,
         )),
     '',
-    'By strategy',
-    ...summary.byStrategy.map(
-      (s) =>
-        `  ${s.symbol} (${s.strategyId}): ${tradeCount(s.trades)}, gross ${signedUsd(s.gross)}`,
+    'By symbol',
+    ...summary.bySymbol.map(
+      (s) => `  ${s.symbol}: ${tradeCount(s.trades)}, realized ${signedUsd(s.net)}`,
     ),
   ].join('\n');
 

@@ -1,6 +1,6 @@
 import { buildGridConfig } from './config';
-import { computeGridIntents, isRestable, isRestableExit } from './levels';
-import { GridLot, GridLotStatus, openGridLot } from './lot';
+import { computeGridIntents, isRestable, isRestableExit, rebuyCandidate } from './levels';
+import { closeGridLot, GridLot, GridLotStatus, openGridLot } from './lot';
 
 const TS = '2025-01-02T10:00:00.000-05:00';
 
@@ -202,7 +202,8 @@ describe('computeGridIntents', () => {
       const held = lot({ fillPrice: 100 });
 
       // close = 98.7: level 1 (99.5) and level 2 (99.0) are both >= close, so
-      // both would be marketable and neither should be emitted.
+      // both would be marketable and neither is emitted. The grid steps down
+      // from the close instead — every buy still rests a full gap below it.
       const intents = computeGridIntents({
         symbol: 'TQQQ',
         close: 98.7,
@@ -212,7 +213,9 @@ describe('computeGridIntents', () => {
         buyPricing: 'GRID_STEPS',
       });
 
-      expect(intents.filter((i) => i.side === 'BUY')).toEqual([]);
+      const buys = intents.filter((i) => i.side === 'BUY').map((b) => b.limitPrice);
+      expect(buys).toEqual([98.2, 97.7]);
+      expect(buys.every((price) => isRestable(price, 98.7))).toBe(true);
     });
 
     it('never emits a buy level at or below zero', () => {
@@ -230,6 +233,60 @@ describe('computeGridIntents', () => {
 
       // level 1 = 0.1 (restable, kept), level 2 = -0.4 (dropped for being <= 0)
       expect(intents.filter((i) => i.side === 'BUY').map((b) => b.limitPrice)).toEqual([0.1]);
+    });
+
+    describe('rebuyLot: the stranded fallback', () => {
+      // The 2026-10-07 shape: the pegged 82.32 lot sold at 82.82, leaving
+      // 84.44 as the lowest held lot with the market at 83.22.
+      const held = lot({ id: 'held', fillPrice: 84.44 });
+      const sold = closeGridLot(lot({ id: 'sold', fillPrice: 82.32 }), 82.82, TS);
+
+      function buysAt(close: number, rebuyLot: GridLot | null): number[] {
+        return computeGridIntents({
+          symbol: 'TQQQ',
+          close,
+          timestamp: TS,
+          heldLots: [held],
+          config,
+          buyPricing: 'GRID_STEPS',
+          rebuyLot,
+        })
+          .filter((i) => i.side === 'BUY')
+          .map((b) => b.limitPrice);
+      }
+
+      it("rests one buy at the sold lot's own fill when every step is through the market", () => {
+        expect(buysAt(83.22, sold)).toEqual([82.32]);
+      });
+
+      it('is ignored while any stepped level is restable', () => {
+        expect(buysAt(83.6, sold)).toEqual([83.44]);
+      });
+
+      it('never pegs: steps down from the close when the re-buy level is at or above the market', () => {
+        expect(buysAt(82.32, sold)).toEqual([81.82, 81.32]);
+        expect(buysAt(82.1, sold)).toEqual([81.6, 81.1]);
+      });
+
+      it('steps down from the close without a candidate', () => {
+        // The 2026-10-08 shape: lowest held lot 84.44, market at 79.42.
+        expect(buysAt(79.42, null)).toEqual([78.92, 78.42]);
+      });
+
+      it('is not consulted by DAILY_AVERAGE', () => {
+        const intents = computeGridIntents({
+          symbol: 'TQQQ',
+          close: 83.22,
+          timestamp: TS,
+          heldLots: [held],
+          config,
+          buyPricing: 'DAILY_AVERAGE',
+          rebuyLot: sold,
+        });
+
+        // 84.44 − 0.5 = 83.94 is through the market, so it pegs to the close.
+        expect(intents.filter((i) => i.side === 'BUY').map((b) => b.limitPrice)).toEqual([83.22]);
+      });
     });
   });
 
@@ -322,5 +379,40 @@ describe('computeGridIntents', () => {
     // fill price rather than the flat-entry rule — heldGridLots() is what the
     // adapter uses to avoid this, and this test documents the contract.
     expect(intents.some((i) => i.side === 'BUY' && i.limitPrice === 100.05)).toBe(false);
+  });
+});
+
+describe('rebuyCandidate', () => {
+  const MORNING = '2025-01-02T10:00:00.000-05:00';
+  const NOON = '2025-01-02T12:00:00.000-05:00';
+  const AFTERNOON = '2025-01-02T14:00:00.000-05:00';
+  const YESTERDAY = '2025-01-01T15:00:00.000-05:00';
+
+  function closed(id: string, openedAt: string, closedAt: string): GridLot {
+    return closeGridLot(lot({ id, openedAt }), 100.5, closedAt);
+  }
+
+  it("returns today's most recently closed lot when nothing has opened since", () => {
+    const lots = [closed('early', MORNING, MORNING), closed('late', MORNING, NOON)];
+    expect(rebuyCandidate(lots, AFTERNOON)?.id).toBe('late');
+  });
+
+  it('returns null once a lot has opened after the sale', () => {
+    const lots = [closed('sold', MORNING, NOON), lot({ id: 'rebought', openedAt: AFTERNOON })];
+    expect(rebuyCandidate(lots, AFTERNOON)).toBeNull();
+  });
+
+  it('returns null for a sale on an earlier session', () => {
+    expect(rebuyCandidate([closed('old', YESTERDAY, YESTERDAY)], AFTERNOON)).toBeNull();
+  });
+
+  it('returns null with no closed lots', () => {
+    expect(rebuyCandidate([lot({ status: GridLotStatus.HELD })], AFTERNOON)).toBeNull();
+  });
+
+  it('compares instants, not strings, across mixed offsets', () => {
+    // 16:30Z is 11:30 ET — earlier than the 12:00 ET close despite sorting later as text.
+    const lots = [closed('et', MORNING, NOON), closed('utc', MORNING, '2025-01-02T16:30:00.000Z')];
+    expect(rebuyCandidate(lots, AFTERNOON)?.id).toBe('et');
   });
 });

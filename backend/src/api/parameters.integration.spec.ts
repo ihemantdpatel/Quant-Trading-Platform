@@ -28,6 +28,7 @@ import { buildDipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/c
 import { ACCOUNT_SYMBOL_CAPITAL } from '../config/capital.config';
 import { buildGridConfig } from '../strategies/grid/config';
 import { GridStrategy } from '../strategies/grid/grid.strategy';
+import { registerRetiredLadderForTest } from './testing/retired-ladder';
 
 jest.setTimeout(120_000);
 
@@ -90,12 +91,10 @@ describe('Story 7: live parameter editing', () => {
     coordinator = app.get(CoordinatorService);
     parameters = app.get(ParameterService);
 
-    // This suite is about the dip ladder's own frozen-target behaviour, but
-    // the current operator default boots the grid strategy enabled on TQQQ
-    // and the ladder disabled. `coordinator.enable` initializes on demand,
-    // so this is deterministic regardless of the app's own (unawaited)
-    // startup chain.
-    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    // The dip ladder is retired and production never registers it
+    // (`EngineModule`). This suite covers the ladder's own behaviour, so it
+    // registers it explicitly and turns the grid off on the shared symbol.
+    await registerRetiredLadderForTest(app);
     coordinator.disable('grid:TQQQ');
   });
 
@@ -450,6 +449,7 @@ describe('Story 13: clearing absolute parameters', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleRef.createNestApplication();
     await app.init();
+    await registerRetiredLadderForTest(app, { enabled: false });
   });
 
   afterAll(async () => {

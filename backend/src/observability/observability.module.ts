@@ -10,9 +10,16 @@
  * `EngineModule` is imported only to resolve that port, since it is the module
  * that provides `ReconciliationService` (it needs the same broker instance the
  * engine trades through). The adapter below narrows it back down on the way in.
+ *
+ * The position snapshots and commission recorder behind average-cost P&L do
+ * need the broker, and get it the same way: `BROKER_POSITION_READER` exposes
+ * `getPositions`, `isConnected`, and two subscriptions — nothing that submits,
+ * cancels, or routes.
  */
 
 import { Module } from '@nestjs/common';
+import { BROKER_ADAPTER, BrokerAdapter, ConnectionState } from '../broker/broker-adapter.interface';
+import { CommissionCorrection } from '../broker/ib/ib-socket';
 import { ReportsController } from '../api/reports.controller';
 import { AppConfigService } from '../config/app-config.service';
 import { AppConfigModule } from '../config/config.module';
@@ -20,7 +27,8 @@ import { EngineModule } from '../engine/engine.module';
 import { ReconciliationModule } from '../reconciliation/reconciliation.module';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
 import { RepositoriesModule } from '../repositories/repositories.module';
-import { StrategiesModule } from '../strategies/strategies.module';
+import { GridConfig } from '../strategies/grid/config';
+import { GRID_CONFIG, StrategiesModule } from '../strategies/strategies.module';
 import {
   DailyReportService,
   RECONCILIATION_READ_MODEL,
@@ -28,6 +36,22 @@ import {
 } from './daily-report.service';
 import { MAILER, Mailer, NodemailerMailer } from './mailer';
 import { PnlEmailScheduler, PnlEmailService } from './pnl-email.service';
+import {
+  BROKER_POSITION_READER,
+  CommissionRecorderService,
+  PositionReader,
+  PositionSnapshotService,
+  SNAPSHOT_SYMBOLS,
+} from './position-snapshot.service';
+
+/** IB's adapter reports commissions; the mock and simulated brokers stamp them on the fill. */
+interface CommissionSource {
+  onCommission(handler: (report: CommissionCorrection) => void): () => void;
+}
+
+function hasCommissions(broker: BrokerAdapter): broker is BrokerAdapter & CommissionSource {
+  return typeof (broker as Partial<CommissionSource>).onCommission === 'function';
+}
 
 @Module({
   imports: [
@@ -42,6 +66,29 @@ import { PnlEmailScheduler, PnlEmailService } from './pnl-email.service';
     DailyReportService,
     PnlEmailService,
     PnlEmailScheduler,
+    PositionSnapshotService,
+    CommissionRecorderService,
+    {
+      provide: BROKER_POSITION_READER,
+      useFactory: (broker: BrokerAdapter): PositionReader => ({
+        isConnected: () => broker.isConnected(),
+        getPositions: () => broker.getPositions(),
+        onConnected: (handler) =>
+          broker.onConnectionChange((health) => {
+            if (health.state === ConnectionState.CONNECTED) {
+              handler();
+            }
+          }),
+        onCommission: (handler) =>
+          hasCommissions(broker) ? broker.onCommission(handler) : () => undefined,
+      }),
+      inject: [BROKER_ADAPTER],
+    },
+    {
+      provide: SNAPSHOT_SYMBOLS,
+      useFactory: (grid: GridConfig): string[] => [grid.symbol],
+      inject: [GRID_CONFIG],
+    },
     {
       provide: MAILER,
       // `null` when SMTP is not configured: the manual routes then answer 503

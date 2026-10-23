@@ -2,7 +2,8 @@
  * Trade history table component tests.
  *
  * Split out of `LotTable.test.tsx`: this table owns closed lots exclusively,
- * so its own realized P&L and fill/exit price pair for each cycle.
+ * so its own fill/exit price pair for each cycle. It deliberately shows no
+ * realized P&L — that is computed on IB's average-cost basis elsewhere.
  */
 
 import { render, screen, within } from '@testing-library/react';
@@ -28,7 +29,7 @@ function lot(overrides: Partial<Lot> = {}): Lot {
 }
 
 describe('TradeHistoryTable', () => {
-  it('renders fill price, exit price, quantity, held-for, and realized P&L', () => {
+  it('renders fill price, exit price, quantity, and held-for', () => {
     render(<TradeHistoryTable lots={[lot()]} />);
 
     const row = screen.getByTestId('history-row-TQQQ-lot-1');
@@ -38,7 +39,6 @@ describe('TradeHistoryTable', () => {
     expect(within(row).getByTestId('cell-qty')).toHaveTextContent('10');
     // Opened 09:50, closed 11:00 → 1h.
     expect(within(row).getByTestId('cell-held-for')).toHaveTextContent('1h');
-    expect(within(row).getByTestId('cell-realized')).toHaveTextContent('$47.50');
   });
 
   it('excludes held lots from the table entirely', () => {
@@ -55,14 +55,13 @@ describe('TradeHistoryTable', () => {
     expect(screen.queryByTestId('history-row-held')).not.toBeInTheDocument();
   });
 
-  it('sums realized P&L across closed cycles', () => {
-    render(
-      <TradeHistoryTable
-        lots={[lot({ id: 'a', realized: 47.5 }), lot({ id: 'b', realized: 12.25 })]}
-      />,
-    );
+  // A lot's own (exit − fill) × qty is not what IB realizes, so it must not
+  // appear here as P&L at all.
+  it('shows no per-lot realized P&L', () => {
+    render(<TradeHistoryTable lots={[lot({ id: 'a', realized: 47.5 })]} />);
 
-    expect(screen.getByText('$59.75')).toBeInTheDocument();
+    expect(screen.queryByText('$47.50')).not.toBeInTheDocument();
+    expect(screen.queryByText(/realized/i)).not.toBeInTheDocument();
   });
 
   it('orders the most recently closed trade first', () => {

@@ -61,6 +61,7 @@ function executionData(overrides: Partial<ExecutionData> = {}): ExecutionData {
     riskEvents: [],
     strategies: [{ id: 'dip-ladder:TQQQ', enabled: true, symbols: ['TQQQ'], initialized: true }],
     gridLots: [],
+    realized: null,
     error: null,
     ...overrides,
   };

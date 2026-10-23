@@ -4,9 +4,14 @@
  * Trade history — completed lot cycles, split out of `LotTable` so that table
  * can show currently held lots only.
  *
- * Each row is a lot that has fully exited: its own fill price, its own exit
- * price, and the realized P&L those two produced — never a blended figure,
- * for the same reason `LotTable` never shows one (`PRD.md:129`).
+ * Each row is a lot that has fully exited: its own fill price and its own exit
+ * price — a record of what the grid did.
+ *
+ * **No realized P&L here.** `(exit − fill) × qty` for one lot is not what the
+ * account realized: IB books a sell against the position's *average* cost, so
+ * a sell at the average realizes $0 whichever lot it closed. That figure lives
+ * in `RealizedSellsTable` and the Overview, computed by the backend the way IB
+ * computes it.
  *
  * **Paginated, `PAGE_SIZE` rows at a time.** A soaking account accumulates
  * closed cycles without bound, and rendering all of them turns this into the
@@ -29,8 +34,8 @@ export function TradeHistoryTable({
   /**
    * Closed lots from **either** strategy. `LotLike` carries no rung, so the
    * dip ladder's and the grid strategy's closed cycles can be merged into one
-   * shared history table — each row still shows its own fill/exit price and
-   * realized P&L regardless of which strategy produced it.
+   * shared history table — each row still shows its own fill/exit price
+   * regardless of which strategy produced it.
    */
   lots: LotLike[];
   /**
@@ -49,7 +54,6 @@ export function TradeHistoryTable({
   showHeader?: boolean;
 }) {
   const closed = lots.filter((lot) => lot.status === 'CLOSED');
-  const totalRealized = closed.reduce((sum, lot) => sum + (lot.realized ?? 0), 0);
   const unverified = closed.some((lot) => lot.unverified);
 
   // Most recently closed first — the trade an operator just watched exit is
@@ -103,7 +107,7 @@ export function TradeHistoryTable({
       ) : (
         <>
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[48rem] text-sm">
+            <table className="w-full min-w-[40rem] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase tracking-wide text-slate-500">
                   <th scope="col" className="px-4 py-2 font-medium">
@@ -120,9 +124,6 @@ export function TradeHistoryTable({
                   </th>
                   <th scope="col" className="px-4 py-2 font-medium">
                     Held for
-                  </th>
-                  <th scope="col" className="px-4 py-2 font-medium">
-                    Realized
                   </th>
                 </tr>
               </thead>
@@ -151,12 +152,6 @@ export function TradeHistoryTable({
                       </td>
                       <td data-testid="cell-held-for" className="px-4 py-2 text-slate-400">
                         {formatDuration(heldMs)}
-                      </td>
-                      <td
-                        data-testid="cell-realized"
-                        className="px-4 py-2 font-mono text-emerald-400"
-                      >
-                        {lot.realized === null ? '—' : formatCurrency(lot.realized)}
                       </td>
                     </tr>
                   );
@@ -194,19 +189,10 @@ export function TradeHistoryTable({
         </>
       )}
 
-      <footer className="grid gap-3 border-t border-slate-800 px-4 py-3 text-sm sm:grid-cols-2">
-        <Metric label="Closed cycles" value={String(closed.length)} />
-        <Metric label="Realized P&L" value={formatCurrency(totalRealized)} accent />
+      <footer className="border-t border-slate-800 px-4 py-3 text-sm">
+        <p className="text-xs uppercase tracking-wide text-slate-500">Closed cycles</p>
+        <p className="font-mono text-slate-300">{closed.length}</p>
       </footer>
     </section>
-  );
-}
-
-function Metric({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
-  return (
-    <div>
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p className={`font-mono ${accent ? 'text-emerald-400' : 'text-slate-300'}`}>{value}</p>
-    </div>
   );
 }

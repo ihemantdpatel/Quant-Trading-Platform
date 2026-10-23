@@ -9,22 +9,28 @@
  * space during every session. Same split as `OrdersFillsHistory`: one tab
  * shown at a time, switching is the only way to move between them.
  *
- * A Client Component only for the tab state — `LotTable` and
- * `TradeHistoryTable` stay pure presentation over props.
+ * A third tab, **Sells today**, lists realized P&L the way IB computes it —
+ * against the position's average cost — which the lot-cycle history cannot.
+ *
+ * A Client Component only for the tab state — the tables stay pure
+ * presentation over props.
  */
 
 import { useState } from 'react';
 import { LotTable } from './LotTable';
+import { RealizedSellsTable } from './RealizedSellsTable';
 import { TradeHistoryTable } from './TradeHistoryTable';
-import type { LotLike } from '../lib/api';
+import type { LotLike, RealizedPnl } from '../lib/api';
 
-type Tab = 'holdings' | 'history';
+type Tab = 'holdings' | 'history' | 'sells';
 
 export function HoldingsPanel({
   holdings,
   allLots,
   mark,
   unavailable = false,
+  realized = null,
+  realizedUnavailable = false,
 }: {
   /** Lots to show in the Holdings tab — filtered to `HELD` by `LotTable`. */
   holdings: LotLike[];
@@ -37,6 +43,9 @@ export function HoldingsPanel({
   allLots: LotLike[];
   mark: number | null;
   unavailable?: boolean;
+  /** Today's average-cost sells — the realized P&L, as opposed to lot cycles. */
+  realized?: RealizedPnl | null;
+  realizedUnavailable?: boolean;
 }) {
   const [tab, setTab] = useState<Tab>('holdings');
   const held = holdings.filter((lot) => lot.status === 'HELD');
@@ -53,14 +62,27 @@ export function HoldingsPanel({
           <TabButton active={tab === 'history'} onClick={() => setTab('history')}>
             Trade history ({closed.length})
           </TabButton>
+          <TabButton active={tab === 'sells'} onClick={() => setTab('sells')}>
+            Sells today ({realized?.sells.length ?? 0})
+          </TabButton>
         </div>
       </div>
 
       <div role="tabpanel">
-        {tab === 'holdings' ? (
-          <LotTable lots={holdings} mark={mark} unavailable={unavailable} showHeader={false} />
-        ) : (
+        {tab === 'holdings' && (
+          <LotTable
+            lots={holdings}
+            mark={mark}
+            unavailable={unavailable}
+            showHeader={false}
+            position={realizedUnavailable || realized === null ? null : realized.held}
+          />
+        )}
+        {tab === 'history' && (
           <TradeHistoryTable lots={allLots} unavailable={unavailable} showHeader={false} />
+        )}
+        {tab === 'sells' && (
+          <RealizedSellsTable realized={realized} unavailable={realizedUnavailable} />
         )}
       </div>
     </section>

@@ -41,7 +41,7 @@ All backend commands run from `backend/`.
 
 | Command | Purpose |
 |---|---|
-| `npm test` | Full suite (2070 tests), no database required |
+| `npm test` | Full suite (2117 tests), no database required |
 | `npm run test:cov` | Suite + coverage thresholds — what CI gates on |
 | `npm run test:db` | The Prisma suites; needs `DATABASE_URL` |
 | `npm run test:watch` | Watch mode |
@@ -1236,40 +1236,65 @@ than left disagreeing with a position the broker already holds; and it has **its
 failed write is not reported as a failed bar and does not stall the queue behind it. The engine keeps
 running on in-memory state, and reconciliation catches a persistent divergence on the next restart.
 
-### P&L emails — daily after the close, monthly on the 1st
+### Realized P&L — IB's average-cost basis (emails and dashboard)
 
 `PnlEmailService` / `PnlEmailScheduler` (`src/observability/`) email each account's **realized** P&L:
 daily at **16:30 ET on weekdays** (after the 16:15 post-close reconcile), and monthly at **08:00 ET on
 the 1st** for the previous month. Each daemon sends its own account's email; subjects name the
 account, mode, and the exact dates covered (`Daily P&L · Fri, Sep 25, 2026 (session close)`).
+`GET /reports/pnl/realized?date=` serves the dashboard the **same** `DailyPnl` object the daily email
+renders, so the two cannot disagree.
 
-- **Grid only.** A trade is one closed `GridLot` — its own buy paired with its own sell, gain
-  `(exit − fill) × quantity`. The dip ladder is retired and its `Lot` rows are not read.
-  `GridLotRepository.findStrategyIds()` exists for this: `findAll()` returns lots with no strategy.
-- **Gross per trade; commissions cash-basis.** A lot carries no commission, so commissions are every
-  `Fill` in the period (entries for held lots included) and net = gross − that. **Known gap:**
-  nothing persists IB's late commission reports (`IBBrokerAdapter.onCommission` has no subscriber),
-  so every `Fill.commission` is 0 and net currently equals gross.
+- **Average cost, the way IB computes it** (`average-cost-pnl.ts`), not per lot. A trade is one SELL
+  fill: `(sell − position average) × qty − sell commission`; a buy re-averages and folds its commission
+  into the average. Buy 100 @ 80, 79.5, 79 then sell 100 @ 79.5 realizes **$0** — pairing the sell with
+  the grid lot it closed (bought @ 79) would claim +$50. **The grid still trades per lot** (own fill,
+  own target); only reporting changed. A lot's `(exit − fill) × qty` (`realized` on `GET /lots` /
+  `/grid/lots`) is no longer displayed anywhere as P&L.
+- **Per symbol, across every strategy** — IB keeps one average per position, so the retired ladder's
+  leftover shares and the grid's share one basis. There is no per-strategy split.
+- **Our own count, opened once from IB.** `Fill` has no record of shares predating it, so the first
+  `PositionSnapshot` — IB's `(quantity, averageCost)` — is the **opening balance**, and from there only
+  recorded fills move the average. `PositionSnapshotService` still writes IB's position (append-only,
+  one `takenAt` per batch) at **16:20 ET weekdays and on every `CONNECTED`**, but later snapshots are a
+  **check, never a reset**. Re-anchoring at each one made the figure IB's rather than ours and quietly
+  absorbed missed fills. IB's own `averageCost` also moves on sells and overnight (it appears to follow
+  its tax-lot matching rather than a pure average), so ours runs a few cents from it by design. Every
+  known symbol is written, flat ones as quantity 0, so an omitted symbol is IB saying flat. **A broker
+  that cannot be asked writes nothing.** Fills before the first snapshot are untracked and reported as
+  `not tracked`, never $0; a period that began before it is labelled partial.
+- **A missed fill is reported and stays wrong until recorded.** A snapshot whose quantity disagrees
+  with our count is a `BasisMismatch` (both quantities and both averages; shown in the email and as
+  "fills missing" on the dashboard). Nothing corrects the count automatically.
+- **The dashboard's Holdings footer shows this position average** (`DailyPnl.held`) beside the held
+  lots' own blended cost, which is reference only — it forgets every sold lot's buy.
+- **Commissions are now captured.** `CommissionRecorderService` subscribes to the IB adapter's
+  `onCommission` and writes `FillRepository.updateCommission` — the commission column only, retrying a
+  few times when the report beats its fill to the database. It is a separate listener from the fill
+  router and touches nothing routing or reconciliation reads.
+- Both services reach the broker only through `BROKER_POSITION_READER` (`getPositions`,
+  `isConnected`, two subscriptions) — observability still cannot submit, cancel, or route anything.
+  Gated on IB being bound.
 - Days are **ET** dates; stored timestamps mix `Z` and `-04:00`, so everything is normalized before
   bucketing (`pnl-summary.ts`).
-- **Gated like the post-close job**: the scheduler starts only when IB is bound *and*
+- **The email is gated like the post-close job**: the scheduler starts only when IB is bound *and*
   `SMTP_USER`/`SMTP_PASS`/`EMAIL_TO` are set (setting some but not all is refused at boot). A failed
   send is logged and dropped — never retried, never rethrown into a timer. No catch-up on a missed
   run; `POST /reports/email/daily?date=` and `/reports/email/monthly?month=` are the manual resend.
-- **A 60s ticker compared against the wall clock, not long one-shot timers.** Node timers run on the
-  monotonic clock, which stops while Docker Desktop's host sleeps — a 24h `setTimeout` armed before a
-  night of laptop sleep fired ~16h late. A run slept through goes out on the first tick after waking
-  (logged as late); each job holds one pending run, so a long sleep sends one email, never a backlog.
-  Floored at the last run so a wall clock stepped backwards cannot send twice.
-  `PostCloseReconcileService` still uses a one-shot timer and drifts the same way.
+- **A 60s ticker compared against the wall clock, not long one-shot timers** (the email scheduler and
+  the snapshot service alike). Node timers run on the monotonic clock, which stops while Docker
+  Desktop's host sleeps — a 24h `setTimeout` armed before a night of laptop sleep fired ~16h late. A
+  run slept through goes out on the first tick after waking (logged as late); each job holds one
+  pending run, so a long sleep sends one email, never a backlog. Floored at the last run so a wall
+  clock stepped backwards cannot send twice. `PostCloseReconcileService` still uses a one-shot timer
+  and drifts the same way.
 - `mailer.ts` is the only file importing `nodemailer`. `SMTP_PASS` is a Gmail **App Password**.
   `docker run --env-file` keeps quotes literally where compose strips them — leave the value unquoted.
-- Read-only over persisted rows; nothing here can reach a broker.
 
 ### HTTP API
 
 Read: `GET /health` `/status` `/intents` `/orders` `/fills` `/lots` `/rungs` `/positions`
-`/risk-events` `/strategies` `/halts` `/reports/daily` `/orders/diagnosis`
+`/risk-events` `/strategies` `/halts` `/reports/daily` `/reports/pnl/realized` `/orders/diagnosis`
 
 `GET /status` gains `broker.pacing`, `broker.dataStale`, `broker.lastBarAt`, and `broker.dataErrors`
 when IB is bound. Pacing is reported because breaching IB's limits produces no error of its own — a
@@ -1333,7 +1358,7 @@ curl localhost:3000/lots
 
 ## Testing
 
-2070 backend tests across 108 suites, plus database tests (`npm run test:db`, needs MySQL) and 266 UI
+2117 backend tests across 110 suites, plus database tests (`npm run test:db`, needs MySQL) and 274 UI
 component tests. Coverage thresholds are enforced in CI: **80% global, 95% on
 `src/strategies/**` and `src/risk/**`** — those are pure functions where a bug costs real money.
 

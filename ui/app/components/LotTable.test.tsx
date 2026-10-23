@@ -92,7 +92,7 @@ describe('LotTable', () => {
 
     expect(screen.getByText(/reference only/i)).toBeInTheDocument();
     // And it is attached to the blended-average figure, not floating elsewhere.
-    expect(screen.getByText(/blended average/i)).toHaveTextContent(/reference only/i);
+    expect(screen.getByText(/held lots' own cost/i)).toHaveTextContent(/reference only/i);
   });
 
   it('computes the blended average quantity-weighted across held lots', () => {
@@ -135,6 +135,27 @@ describe('LotTable', () => {
     expect(screen.getByTestId('lot-row-held')).toBeInTheDocument();
     // Blended reflects only the held lot, not the closed one at 100.
     expect(screen.getByTestId('blended-average')).toHaveTextContent('$90.00');
+  });
+
+  it('shows the position average from the ledger, which may hold shares no lot explains', () => {
+    render(
+      <LotTable
+        lots={[lot({ id: 'a', fillPrice: 84.94, quantity: 100 })]}
+        mark={80}
+        now={NOW}
+        position={[{ symbol: 'TQQQ', quantity: 292, averageCost: 82.0672 }]}
+      />,
+    );
+
+    expect(screen.getByTestId('position-average')).toHaveTextContent('TQQQ 292 sh @ $82.07');
+    // The held lot's own cost stays separate — it forgets every sold lot.
+    expect(screen.getByTestId('blended-average')).toHaveTextContent('$84.94');
+  });
+
+  it('says the position average is unavailable when its read failed', () => {
+    render(<LotTable lots={[lot()]} mark={95} now={NOW} position={null} />);
+
+    expect(screen.getByTestId('position-average')).toHaveTextContent('unavailable');
   });
 
   it('shows a dash for distance when no mark price is available', () => {

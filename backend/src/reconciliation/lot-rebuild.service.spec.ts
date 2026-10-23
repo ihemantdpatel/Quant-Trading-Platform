@@ -68,6 +68,7 @@ function fillsRepo(records: Fill[] = []): FillRepository {
         Promise.resolve(records.filter((fill) => fill.clientOrderId === clientOrderId)),
       ),
     findByFillId: jest.fn(),
+    updateCommission: jest.fn(),
     clear: jest.fn(),
   };
 }

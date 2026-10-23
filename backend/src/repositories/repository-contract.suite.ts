@@ -48,6 +48,7 @@ import {
   ParameterChangeRepository,
   PerSymbolLimitChange,
   PerSymbolLimitChangeRepository,
+  PositionSnapshotRepository,
   RiskEventRepository,
   RungRepository,
   StrategyStateSnapshotRecord,
@@ -859,8 +860,87 @@ export function runFillRepositoryContract(create: RepositoryFactory<FillReposito
       expect((await repo.findByFillId('f1'))?.price).toBe(74.5);
     });
 
+    // IB reports commission after the execution, so a fill is saved at 0 and
+    // corrected — and the correction must not disturb what routing reads.
+    it('updates only the commission of a recorded fill', async () => {
+      await repo.save(fillFixture('co-1', 'f1'));
+
+      expect(await repo.updateCommission('f1', 1.02)).toBe(true);
+
+      const found = await repo.findByFillId('f1');
+      expect(found?.commission).toBe(1.02);
+      expect(found?.price).toBe(95);
+      expect(found?.quantity).toBe(fillFixture('co-1', 'f1').quantity);
+    });
+
+    it('reports an unknown fill rather than creating one', async () => {
+      expect(await repo.updateCommission('never-seen', 1)).toBe(false);
+      expect(await repo.findAll()).toEqual([]);
+    });
+
     it('clear empties the store', async () => {
       await repo.save(fillFixture('co-1', 'f1'));
+      await repo.clear();
+
+      expect(await repo.findAll()).toEqual([]);
+    });
+  });
+}
+
+export function runPositionSnapshotRepositoryContract(
+  create: RepositoryFactory<PositionSnapshotRepository>,
+): void {
+  describe('PositionSnapshotRepository contract', () => {
+    let repo: PositionSnapshotRepository;
+
+    beforeEach(async () => {
+      repo = await create();
+    });
+
+    it('keeps every batch, ordered by time then symbol', async () => {
+      await repo.saveBatch([
+        {
+          takenAt: '2026-10-05T16:20:00.000-04:00',
+          symbol: 'TQQQ',
+          quantity: 100,
+          averageCost: 79.5,
+        },
+      ]);
+      await repo.saveBatch([
+        { takenAt: '2026-10-02T16:20:00.000-04:00', symbol: 'TQQQ', quantity: 0, averageCost: 0 },
+        {
+          takenAt: '2026-10-02T16:20:00.000-04:00',
+          symbol: 'SQQQ',
+          quantity: 5,
+          averageCost: 12.123456,
+        },
+      ]);
+
+      expect(await repo.findAll()).toEqual([
+        {
+          takenAt: '2026-10-02T16:20:00.000-04:00',
+          symbol: 'SQQQ',
+          quantity: 5,
+          averageCost: 12.123456,
+        },
+        { takenAt: '2026-10-02T16:20:00.000-04:00', symbol: 'TQQQ', quantity: 0, averageCost: 0 },
+        {
+          takenAt: '2026-10-05T16:20:00.000-04:00',
+          symbol: 'TQQQ',
+          quantity: 100,
+          averageCost: 79.5,
+        },
+      ]);
+    });
+
+    it('accepts an empty batch as a no-op', async () => {
+      await repo.saveBatch([]);
+
+      expect(await repo.findAll()).toEqual([]);
+    });
+
+    it('clear empties the store', async () => {
+      await repo.saveBatch([{ takenAt: 't', symbol: 'TQQQ', quantity: 1, averageCost: 1 }]);
       await repo.clear();
 
       expect(await repo.findAll()).toEqual([]);

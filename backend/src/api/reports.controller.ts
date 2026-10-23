@@ -22,7 +22,7 @@ import { ET_ZONE } from '../market-data/types';
 import { DailyReport, DailyReportService } from '../observability/daily-report.service';
 import { EmailNotConfiguredError, PnlEmailService } from '../observability/pnl-email.service';
 import { RenderedEmail } from '../observability/pnl-email.renderer';
-import { isIsoDate, isIsoMonth } from '../observability/pnl-summary';
+import { DailyPnl, isIsoDate, isIsoMonth } from '../observability/pnl-summary';
 import { sessionDateOf } from '../strategies/dip-ladder/session-window';
 
 /** `yyyy-MM-dd`, the ET session key `sessionDateOf` produces. */
@@ -54,6 +54,22 @@ export class ReportsController {
     }
 
     return this.reports.build(sessionDate, now);
+  }
+
+  /**
+   * One ET day's realized P&L on IB's average-cost basis, with month to date —
+   * the dashboard's figures. Built by the same function as the daily email, so
+   * the two cannot disagree.
+   */
+  @Get('reports/pnl/realized')
+  async realized(@Query('date') date?: string): Promise<DailyPnl> {
+    const day = date ?? DateTime.now().setZone(ET_ZONE).toISODate()!;
+
+    if (!isIsoDate(day)) {
+      throw new UnprocessableEntityException(`date must be formatted yyyy-MM-dd, got "${day}"`);
+    }
+
+    return this.emails.daily(day);
   }
 
   /**

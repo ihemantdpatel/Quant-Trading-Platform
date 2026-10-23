@@ -53,6 +53,8 @@ import {
   ParameterChangeRepository,
   PerSymbolLimitChange,
   PerSymbolLimitChangeRepository,
+  PositionSnapshotRecord,
+  PositionSnapshotRepository,
   RiskEventRepository,
   RungRepository,
   StrategyStateSnapshotRecord,
@@ -317,8 +319,63 @@ export class PrismaFillRepository implements FillRepository {
     return row ? toFill(row) : null;
   }
 
+  async updateCommission(fillId: string, commission: number): Promise<boolean> {
+    // `updateMany` rather than `update`: an unknown id is an expected outcome
+    // (the commission report can beat its fill to the database), not an error.
+    const { count } = await this.prisma.fill.updateMany({
+      where: { accountId: this.accountId, fillId },
+      data: { commission: toDecimal(commission) },
+    });
+
+    return count > 0;
+  }
+
   async clear(): Promise<void> {
     await this.prisma.fill.deleteMany({ where: { accountId: this.accountId } });
+  }
+}
+
+@Injectable()
+export class PrismaPositionSnapshotRepository implements PositionSnapshotRepository {
+  constructor(
+    private readonly prisma: PrismaService,
+    // Defaulted so a test can construct a repository directly; Nest always
+    // supplies the token, and resolution fails loudly if it is ever absent.
+    @Inject(ACCOUNT_ID) private readonly accountId: string = DEFAULT_ACCOUNT_ALIAS,
+  ) {}
+
+  async saveBatch(rows: PositionSnapshotRecord[]): Promise<void> {
+    if (rows.length === 0) {
+      return;
+    }
+
+    await this.prisma.positionSnapshot.createMany({
+      data: rows.map((row) => ({
+        accountId: this.accountId,
+        takenAt: row.takenAt,
+        symbol: row.symbol,
+        quantity: row.quantity,
+        averageCost: toDecimal(row.averageCost),
+      })),
+    });
+  }
+
+  async findAll(): Promise<PositionSnapshotRecord[]> {
+    const rows = await this.prisma.positionSnapshot.findMany({
+      where: { accountId: this.accountId },
+      orderBy: [{ takenAt: 'asc' }, { symbol: 'asc' }],
+    });
+
+    return rows.map((row) => ({
+      takenAt: row.takenAt,
+      symbol: row.symbol,
+      quantity: row.quantity,
+      averageCost: toNumber(row.averageCost),
+    }));
+  }
+
+  async clear(): Promise<void> {
+    await this.prisma.positionSnapshot.deleteMany({ where: { accountId: this.accountId } });
   }
 }
 

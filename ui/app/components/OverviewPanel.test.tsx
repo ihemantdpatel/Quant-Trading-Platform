@@ -11,7 +11,7 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { OverviewPanel } from './OverviewPanel';
-import type { Position, Status } from '../lib/api';
+import type { Position, RealizedPnl, Status } from '../lib/api';
 
 jest.mock('../actions', () => ({
   setMode: jest.fn().mockResolvedValue({ ok: true, message: 'ok' }),
@@ -43,13 +43,30 @@ function position(overrides: Partial<Position> = {}): Position {
   return { symbol: 'TQQQ', quantity: 10, averageCost: 95, ...overrides };
 }
 
+const tracked = { trackedSince: '2026-10-01T16:20:00.000-04:00', tracked: true, partial: false };
+const zero = { trades: 0, gross: 0, commissions: 0, net: 0 };
+
+function realized(overrides: Partial<RealizedPnl> = {}): RealizedPnl {
+  return {
+    date: '2026-10-05',
+    sells: [],
+    totals: zero,
+    held: [],
+    monthToDate: zero,
+    coverage: tracked,
+    monthCoverage: tracked,
+    mismatches: [],
+    ...overrides,
+  };
+}
+
 function renderPanel(props: Partial<React.ComponentProps<typeof OverviewPanel>> = {}) {
   render(
     <OverviewPanel
       status={status()}
       positions={[]}
       deployed={0}
-      realized={0}
+      realized={realized()}
       mode="PAPER"
       strategies={[{ id: 'dip-ladder:TQQQ', enabled: true, symbols: ['TQQQ'], initialized: true }]}
       {...props}
@@ -65,13 +82,57 @@ describe('OverviewPanel', () => {
   });
 
   it('shows all five status figures together on the Status tab', () => {
-    renderPanel({ positions: [position()], deployed: 1234.5, realized: -50 });
+    renderPanel({
+      positions: [position()],
+      deployed: 1234.5,
+      realized: realized({ totals: { ...zero, net: -50 }, monthToDate: { ...zero, net: 75 } }),
+    });
 
     expect(screen.getByText('ib · CONNECTED')).toBeInTheDocument();
     expect(screen.getByText('10 TQQQ')).toBeInTheDocument();
     expect(screen.getByText('$1,234.50')).toBeInTheDocument();
-    expect(screen.getByText('-$50.00')).toBeInTheDocument();
+    expect(screen.getByTestId('realized-today')).toHaveTextContent('Today -$50.00');
+    expect(screen.getByTestId('realized-mtd')).toHaveTextContent('MTD $75.00');
     expect(screen.getByText('not set')).toBeInTheDocument();
+  });
+
+  it('labels a month that began before tracking, and an untracked day', () => {
+    renderPanel({
+      realized: realized({
+        coverage: { trackedSince: null, tracked: false, partial: false },
+        monthCoverage: { ...tracked, partial: true },
+      }),
+    });
+
+    expect(screen.getByTestId('realized-today')).toHaveTextContent('Today not tracked');
+    expect(screen.getByTestId('realized-mtd')).toHaveTextContent('MTD $0.00 since Oct 1');
+  });
+
+  // A failed read must not render as a flat $0 day.
+  it('says unavailable when the realized read failed', () => {
+    renderPanel({ realized: null, realizedUnavailable: true });
+
+    expect(screen.getByText('unavailable')).toBeInTheDocument();
+    expect(screen.queryByTestId('realized-today')).not.toBeInTheDocument();
+  });
+
+  it('warns when IB’s position disagreed with the recorded fills', () => {
+    renderPanel({
+      realized: realized({
+        mismatches: [
+          {
+            symbol: 'TQQQ',
+            takenAt: 't',
+            replayedQuantity: 100,
+            brokerQuantity: 200,
+            replayedAverageCost: 80,
+            brokerAverageCost: 79.5,
+          },
+        ],
+      }),
+    });
+
+    expect(screen.getByText('fills missing — see email')).toBeInTheDocument();
   });
 
   it('shows only one tab’s content at a time', async () => {

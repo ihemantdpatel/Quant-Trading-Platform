@@ -44,7 +44,13 @@ import {
   TimeInForce,
 } from '../types';
 import { GridConfig } from './config';
-import { computeGridIntents, GridEntryIntent, GridExitIntent, GridIntent } from './levels';
+import {
+  computeGridIntents,
+  GridEntryIntent,
+  GridExitIntent,
+  GridIntent,
+  rebuyCandidate,
+} from './levels';
 import {
   closeGridLot,
   GridLot,
@@ -166,6 +172,7 @@ export class GridStrategy implements Strategy {
       heldLots: heldGridLots(data.lots),
       config: this.config,
       buyPricing: alreadyEnteredToday ? 'GRID_STEPS' : 'DAILY_AVERAGE',
+      rebuyLot: rebuyCandidate(data.lots, bar.timestamp),
     });
 
     return intents.map((intent) => this.toOrderIntent(intent));
@@ -202,6 +209,7 @@ export class GridStrategy implements Strategy {
       // self-sustaining buying loop live. See the doc comment on
       // `GridBuyPricing` in `levels.ts`.
       buyPricing: 'GRID_STEPS',
+      rebuyLot: rebuyCandidate(data.lots, bar.timestamp),
     });
 
     return intents.map((intent) => this.toOrderIntent(intent));

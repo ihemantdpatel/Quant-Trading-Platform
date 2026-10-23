@@ -631,6 +631,63 @@ export interface Unavailable {
   riskEvents: boolean;
   strategies: boolean;
   gridLots: boolean;
+  realized: boolean;
+}
+
+/** One SELL fill realized against the position's average cost (`GET /reports/pnl/realized`). */
+export interface RealizedSell {
+  fillId: string;
+  symbol: string;
+  timestamp: string;
+  quantity: number;
+  price: number;
+  averageCost: number;
+  commission: number;
+  gross: number;
+  realized: number;
+  uncovered: number;
+}
+
+export interface RealizedTotals {
+  trades: number;
+  gross: number;
+  commissions: number;
+  net: number;
+}
+
+/**
+ * How much of a period the backend's average-cost replay covers. Nothing before
+ * its first IB position snapshot is tracked — shown as "not tracked", never $0.
+ */
+export interface RealizedCoverage {
+  trackedSince: string | null;
+  tracked: boolean;
+  partial: boolean;
+}
+
+/**
+ * Realized P&L on an **average-cost** basis, counted by the backend from our
+ * own fills (IB's positions only check it) — the same object the daily
+ * email is rendered from, so the dashboard and the email cannot disagree. A
+ * grid lot's own `(exit − fill) × qty` is not realized P&L by IB's arithmetic
+ * and is not shown as such anywhere on the dashboard.
+ */
+export interface RealizedPnl {
+  date: string;
+  sells: RealizedSell[];
+  totals: RealizedTotals;
+  held: Array<{ symbol: string; quantity: number; averageCost: number }>;
+  monthToDate: RealizedTotals;
+  coverage: RealizedCoverage;
+  monthCoverage: RealizedCoverage;
+  mismatches: Array<{
+    symbol: string;
+    takenAt: string;
+    replayedQuantity: number;
+    brokerQuantity: number;
+    replayedAverageCost: number;
+    brokerAverageCost: number;
+  }>;
 }
 
 /** What the Execution tab renders: current engine state, no configuration. */
@@ -645,6 +702,8 @@ export interface ExecutionData {
   strategies: StrategySummary[];
   /** The grid strategy's own lots (`GET /grid/lots`) — see `Lot` vs. `GridLot`. */
   gridLots: GridLot[];
+  /** Today's average-cost realized P&L, or null when the read failed. */
+  realized: RealizedPnl | null;
   /** Set only when **every** read failed — a total backend outage. */
   error: string | null;
   /** Per-endpoint failure flags; absent on loaders that fetch as one unit. */
@@ -930,20 +989,44 @@ export async function loadExecution(account: string): Promise<ExecutionData> {
   const base = baseUrlFor(account);
   const read = async <T>(path: string): Promise<T> => get<T>(await base, path);
 
-  const [status, lots, rungs, positions, orders, fills, riskEvents, strategies, gridLots] =
-    await Promise.allSettled([
-      read<Status>('/status'),
-      read<Lot[]>('/lots'),
-      read<Rung[]>('/rungs'),
-      read<Position[]>('/positions'),
-      read<Order[]>('/orders'),
-      read<Fill[]>('/fills'),
-      read<RiskEvent[]>('/risk-events'),
-      read<StrategySummary[]>('/strategies'),
-      read<GridLot[]>('/grid/lots'),
-    ]);
+  const [
+    status,
+    lots,
+    rungs,
+    positions,
+    orders,
+    fills,
+    riskEvents,
+    strategies,
+    gridLots,
+    realized,
+  ] = await Promise.allSettled([
+    read<Status>('/status'),
+    read<Lot[]>('/lots'),
+    read<Rung[]>('/rungs'),
+    read<Position[]>('/positions'),
+    read<Order[]>('/orders'),
+    read<Fill[]>('/fills'),
+    read<RiskEvent[]>('/risk-events'),
+    read<StrategySummary[]>('/strategies'),
+    read<GridLot[]>('/grid/lots'),
+    // No date: the backend defaults to today's ET session, which is the
+    // calendar this figure is defined on — the browser's own zone is not.
+    read<RealizedPnl>('/reports/pnl/realized'),
+  ]);
 
-  const settled = [status, lots, rungs, positions, orders, fills, riskEvents, strategies, gridLots];
+  const settled = [
+    status,
+    lots,
+    rungs,
+    positions,
+    orders,
+    fills,
+    riskEvents,
+    strategies,
+    gridLots,
+    realized,
+  ];
   const allFailed = settled.every((result) => result.status === 'rejected');
 
   return {
@@ -956,6 +1039,7 @@ export async function loadExecution(account: string): Promise<ExecutionData> {
     riskEvents: valueOr(riskEvents, []),
     strategies: valueOr(strategies, []),
     gridLots: valueOr(gridLots, []),
+    realized: valueOr(realized, null),
     // Only when nothing at all answered. A single failed endpoint is reported
     // by its own panel, not as "the backend is unreachable" — that banner
     // would be wrong, and a wrong banner on a control surface is worse than a
@@ -973,6 +1057,7 @@ export async function loadExecution(account: string): Promise<ExecutionData> {
       fills: fills.status === 'rejected',
       riskEvents: riskEvents.status === 'rejected',
       strategies: strategies.status === 'rejected',
+      realized: realized.status === 'rejected',
     },
   };
 }
@@ -1081,10 +1166,6 @@ export function distanceToTarget(lot: LotLike, mark: number | null): number | nu
 }
 
 /** Realized P&L across completed lot cycles. */
-export function totalRealized(lots: LotLike[]): number {
-  return round(lots.reduce((sum, lot) => sum + (lot.realized ?? 0), 0));
-}
-
 export function totalHeldQuantity(lots: LotLike[]): number {
   return lots.filter((lot) => lot.status === 'HELD').reduce((sum, lot) => sum + lot.quantity, 0);
 }

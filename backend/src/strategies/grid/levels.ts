@@ -18,7 +18,8 @@
  */
 
 import { GridConfig } from './config';
-import { GridLot, sellPriorityQueue } from './lot';
+import { GridLot, GridLotStatus, sellPriorityQueue } from './lot';
+import { sessionDateOf } from './session';
 
 export interface GridEntryIntent {
   symbol: string;
@@ -110,6 +111,57 @@ export interface ComputeGridIntentsParams {
    * `DAILY_AVERAGE` — see `grid.strategy.ts`.
    */
   buyPricing: GridBuyPricing;
+  /**
+   * The lot whose sale left the grid stranded, if any — see `rebuyCandidate`.
+   * Consulted only by `GRID_STEPS`, and only when none of its stepped levels
+   * is restable.
+   */
+  rebuyLot?: GridLot | null;
+}
+
+/**
+ * The most recently closed lot, when its sale is still the latest thing the
+ * grid did today — the lot a re-buy would cycle.
+ *
+ * Why this exists: `GRID_STEPS` steps below the *lowest held* lot, so selling
+ * the lowest lot moves every buy level up to the next one held. When that lot
+ * was the day's pegged `DAILY_AVERAGE` buy, the next held lot can sit well
+ * above the market, every stepped level is marketable and skipped, and the
+ * grid rests no buy for the rest of the session. Seen live on 2026-10-07: a
+ * pegged buy at 82.32 sold at 82.82, the lowest held lot became 84.44, and
+ * nothing rested below a market at 83.22.
+ *
+ * Derived from lots rather than passed in by the fill router, because every
+ * recompute cancels resting buys it does not re-emit
+ * (`EngineService.cancelSupersededGridBuys`) — a re-buy known only to the
+ * recompute its sell triggered would be cancelled by the next one.
+ *
+ * - **Today only**: orders are DAY, so yesterday's sale says nothing about
+ *   where today's grid should rest.
+ * - **No lot opened since**: an open after the sale means the re-buy filled
+ *   (or a later entry superseded it), and stepping resumes from held lots.
+ */
+export function rebuyCandidate(lots: readonly GridLot[], timestamp: string): GridLot | null {
+  const today = sessionDateOf(timestamp);
+  let latest: GridLot | null = null;
+
+  for (const lot of lots) {
+    if (lot.status !== GridLotStatus.CLOSED || !lot.closedAt) {
+      continue;
+    }
+
+    if (!latest || Date.parse(lot.closedAt) > Date.parse(latest.closedAt!)) {
+      latest = lot;
+    }
+  }
+
+  if (!latest || sessionDateOf(latest.closedAt!) !== today) {
+    return null;
+  }
+
+  const closedAt = Date.parse(latest.closedAt!);
+
+  return lots.some((lot) => Date.parse(lot.openedAt) > closedAt) ? null : latest;
 }
 
 /** The quantity-weighted average fill price across a set of held lots. */
@@ -133,10 +185,11 @@ export function averageFillPrice(heldLots: GridLot[]): number {
  * - **1+ held lots, `buyPricing: 'GRID_STEPS'`**: up to `maxBuyLevels`
  *   stepped BUYs below the *lowest* held lot, `gap` apart — the original
  *   grid rule — skipping outright (never pegging) any level the market has
- *   already gapped through, so this rule alone can leave the grid with no
- *   resting buy for a while if price moves fast; that is what
- *   `DAILY_AVERAGE`'s one-shot catch-up exists to bound to once per session
- *   rather than never.
+ *   already gapped through. When every stepped level is skipped, `rebuyLot`
+ *   (if given) rests one buy at that sold lot's own fill price instead — see
+ *   `rebuyCandidate` — and when that is through the market too, up to
+ *   `maxBuyLevels` BUYs step down from the close, `gap` apart, so a grid
+ *   holding lots always has a buy resting below the market.
  * - **Sells**: one per held lot, lowest-fill-price first (`sellPriorityQueue`),
  *   capped at `maxSellOrders`. A lot already covered by a resting sell is
  *   skipped. A lot whose frozen target has already been passed by a gap up
@@ -177,6 +230,7 @@ export function computeGridIntents(params: ComputeGridIntentsParams): GridIntent
     }
   } else {
     const lowestFill = Math.min(...heldLots.map((lot) => lot.fillPrice));
+    const buysBefore = intents.length;
 
     for (let n = 1; n <= config.maxBuyLevels; n += 1) {
       const level = roundToCents(lowestFill - n * config.gap);
@@ -197,6 +251,50 @@ export function computeGridIntents(params: ComputeGridIntentsParams): GridIntent
           timestamp,
           reason: `dip buy ${n}: ${n}×gap below lowest held lot ${lowestFill.toFixed(2)}`,
         });
+      }
+    }
+
+    // Stranded: rest one buy where the sold lot was bought — its sell price
+    // less the gap, the grid's own cycle. Still never pegged: it must rest
+    // below the market, or it is skipped like any stepped level.
+    const rebuy = params.rebuyLot;
+
+    if (intents.length === buysBefore && rebuy && isRestable(rebuy.fillPrice, close)) {
+      intents.push({
+        symbol,
+        side: 'BUY',
+        quantity: config.quantity,
+        limitPrice: roundToCents(rebuy.fillPrice),
+        timestamp,
+        reason:
+          `re-buy at sold lot ${rebuy.id}'s own fill ${rebuy.fillPrice.toFixed(2)} — ` +
+          `every step below lowest held lot ${lowestFill.toFixed(2)} is already through the market`,
+      });
+    }
+
+    // Still stranded: step down from the market instead. This rule runs only
+    // at a fill or the session open, so without it a market that falls
+    // straight through every level rests no buy until the next session — seen
+    // live on 2026-10-08 with price at 79.42 under a lowest held lot of 84.44.
+    // Stepping from the close keeps each level a full gap below the market,
+    // so nothing here is marketable; it is not re-priced per bar, which would
+    // drag the buy down with a falling market and never let it fill.
+    if (intents.length === buysBefore) {
+      for (let n = 1; n <= config.maxBuyLevels; n += 1) {
+        const level = roundToCents(close - n * config.gap);
+
+        if (level > 0 && isRestable(level, close)) {
+          intents.push({
+            symbol,
+            side: 'BUY',
+            quantity: config.quantity,
+            limitPrice: level,
+            timestamp,
+            reason:
+              `market dip buy ${n}: ${n}×gap below close ${close.toFixed(2)} — ` +
+              `every step below lowest held lot ${lowestFill.toFixed(2)} is already through the market`,
+          });
+        }
       }
     }
   }

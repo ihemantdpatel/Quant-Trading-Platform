@@ -1,7 +1,6 @@
 import { Fill } from '../broker/broker-adapter.interface';
-import { GridLot, GridLotStatus } from '../strategies/grid/lot';
+import { PositionSnapshotRecord } from '../repositories/repository.interfaces';
 import {
-  AttributedGridLot,
   buildDailyPnl,
   buildPeriodPnl,
   cents,
@@ -9,39 +8,58 @@ import {
   isIsoDate,
   isIsoMonth,
   monthRange,
-  tradesBetween,
+  PnlInputs,
 } from './pnl-summary';
 
-function lot(overrides: Partial<GridLot> = {}): GridLot {
+let sequence = 0;
+
+function fill(
+  side: 'BUY' | 'SELL',
+  quantity: number,
+  price: number,
+  timestamp: string,
+  commission = 0,
+  symbol = 'TQQQ',
+): Fill {
+  sequence += 1;
   return {
-    id: 'g1',
-    fillPrice: 70,
-    quantity: 50,
-    openedAt: '2026-09-25T10:00:00.000-04:00',
-    sellTarget: 70.5,
-    status: GridLotStatus.CLOSED,
-    closedAt: '2026-09-25T11:00:00.000-04:00',
-    exitPrice: 70.5,
-    workingOrderId: null,
-    ...overrides,
+    clientOrderId: `co-${sequence}`,
+    brokerOrderId: String(sequence),
+    fillId: `f${sequence}`,
+    symbol,
+    side,
+    quantity,
+    price,
+    commission,
+    timestamp,
   };
 }
 
-function grid(l: GridLot, strategyId = 'grid:TQQQ'): AttributedGridLot {
-  return { strategyId, symbol: strategyId.slice('grid:'.length), lot: l };
+function snapshot(
+  takenAt: string,
+  quantity: number,
+  averageCost: number,
+  symbol = 'TQQQ',
+): PositionSnapshotRecord {
+  return { takenAt, symbol, quantity, averageCost };
 }
 
-function fill(timestamp: string, commission: number): Fill {
+/**
+ * Tracking begins at the Sep 24 close holding 100 @ 70. Sep 25 buys 100 @ 69
+ * (average 69.5) and sells twice; Sep 28 sells once more. A Sep 1 sell predates
+ * tracking.
+ */
+function inputs(): PnlInputs {
   return {
-    clientOrderId: 'co-1',
-    brokerOrderId: '1',
-    fillId: `f-${timestamp}-${commission}`,
-    symbol: 'TQQQ',
-    side: 'BUY',
-    quantity: 50,
-    price: 70,
-    commission,
-    timestamp,
+    snapshots: [snapshot('2026-09-24T16:20:00.000-04:00', 100, 70)],
+    fills: [
+      fill('SELL', 10, 75, '2026-09-01T10:00:00.000-04:00'),
+      fill('BUY', 100, 69, '2026-09-25T10:00:00.000-04:00', 1),
+      fill('SELL', 50, 70.5, '2026-09-25T11:00:00.000-04:00', 1),
+      // 19:30 ET on the 25th, stored in UTC.
+      fill('SELL', 50, 69, '2026-09-25T23:30:00.000Z', 1),
+      fill('SELL', 50, 71, '2026-09-28T10:00:00.000-04:00', 1),
+    ],
   };
 }
 
@@ -79,120 +97,90 @@ describe('pnl-summary', () => {
     expect(cents(-2.345)).toBe(-2.34);
   });
 
-  describe('tradesBetween', () => {
-    it('lists only closed lots in range, sorted by close time across offsets', () => {
-      const trades = tradesBetween(
-        [
-          grid(lot({ id: 'late', closedAt: '2026-09-25T19:00:00.000Z' })), // 15:00 ET
-          grid(lot({ id: 'early', closedAt: '2026-09-25T10:00:00.000-04:00' })),
-          grid(lot({ id: 'held', status: GridLotStatus.HELD, closedAt: null, exitPrice: null })),
-          grid(lot({ id: 'other-day', closedAt: '2026-09-24T10:00:00.000-04:00' })),
-        ],
-        '2026-09-25',
-        '2026-09-25',
-      );
-
-      expect(trades.map((t) => t.lotId)).toEqual(['early', 'late']);
-    });
-
-    it('computes gain per lot from its own buy and sell', () => {
-      const [trade] = tradesBetween(
-        [grid(lot({ fillPrice: 72.3456, exitPrice: 72.8456, quantity: 50 }))],
-        '2026-09-25',
-        '2026-09-25',
-      );
-
-      expect(trade).toMatchObject({ buyPrice: 72.3456, sellPrice: 72.8456, gain: 25 });
-    });
-
-    it('reports a loss as negative', () => {
-      const [trade] = tradesBetween(
-        [grid(lot({ fillPrice: 71, exitPrice: 70.5, quantity: 10 }))],
-        '2026-09-25',
-        '2026-09-25',
-      );
-
-      expect(trade.gain).toBe(-5);
-    });
-  });
-
   describe('buildDailyPnl', () => {
-    const inputs = {
-      lots: [
-        grid(lot({ id: 'a', fillPrice: 70, exitPrice: 70.5, quantity: 50 })), // +25
-        grid(lot({ id: 'b', fillPrice: 69.5, exitPrice: 70, quantity: 50 })), // +25
-        grid(lot({ id: 's', fillPrice: 30, exitPrice: 29.9, quantity: 10 }), 'grid:SOXL'), // -1
-        grid(lot({ id: 'h1', status: GridLotStatus.HELD, closedAt: null, exitPrice: null })),
-        grid(lot({ id: 'h2', status: GridLotStatus.HELD, closedAt: null, exitPrice: null })),
-        grid(lot({ id: 'earlier', closedAt: '2026-09-02T11:00:00.000-04:00', exitPrice: 71 })), // +50, same month
-        grid(lot({ id: 'last-month', closedAt: '2026-08-31T11:00:00.000-04:00' })),
-      ],
-      fills: [
-        fill('2026-09-25T10:00:00.000-04:00', 1),
-        fill('2026-09-25T15:00:00.000Z', 1.5),
-        fill('2026-09-24T10:00:00.000-04:00', 9),
-        fill('2026-09-02T10:00:00.000-04:00', 2),
-      ],
-    };
+    it('realizes each sell against the average, after its commission', () => {
+      const day = buildDailyPnl(inputs(), '2026-09-25');
 
-    it('totals the day: gross from trades, commissions from every fill that day', () => {
-      const daily = buildDailyPnl(inputs, '2026-09-25');
-
-      expect(daily.trades.map((t) => t.lotId).sort()).toEqual(['a', 'b', 's']);
-      expect(daily.totals).toEqual({ trades: 3, gross: 49, commissions: 2.5, net: 46.5 });
+      // Average after the buy: (70×100 + 69×100 + 1) / 200 = 69.505.
+      expect(day.sells.map((s) => [s.averageCost, s.realized])).toEqual([
+        [69.505, 48.75],
+        [69.505, -26.25],
+      ]);
+      expect(day.totals).toEqual({ trades: 2, gross: 24.5, commissions: 2, net: 22.5 });
     });
 
-    it('lists held lots per strategy', () => {
-      expect(buildDailyPnl(inputs, '2026-09-25').held).toEqual([
-        { symbol: 'TQQQ', strategyId: 'grid:TQQQ', lots: 2, quantity: 100 },
+    it('reports the position at the end of that day, not today', () => {
+      expect(buildDailyPnl(inputs(), '2026-09-25').held).toEqual([
+        { symbol: 'TQQQ', quantity: 100, averageCost: 69.505 },
+      ]);
+      expect(buildDailyPnl(inputs(), '2026-09-28').held).toEqual([
+        { symbol: 'TQQQ', quantity: 50, averageCost: 69.505 },
       ]);
     });
 
     it('carries month to date from the 1st through the day', () => {
-      expect(buildDailyPnl(inputs, '2026-09-25').monthToDate).toEqual({
-        trades: 4,
-        gross: 99,
-        commissions: 13.5,
-        net: 85.5,
-      });
+      const day = buildDailyPnl(inputs(), '2026-09-28');
+
+      expect(day.totals.net).toBe(cents((71 - 69.505) * 50 - 1));
+      expect(day.monthToDate).toEqual({ trades: 3, gross: 99.25, commissions: 3, net: 96.25 });
     });
 
-    it('reports an empty day as zeroes, not as missing', () => {
-      const daily = buildDailyPnl(inputs, '2026-09-26');
+    it('marks a month that began before tracking as partial', () => {
+      const day = buildDailyPnl(inputs(), '2026-09-28');
 
-      expect(daily.trades).toEqual([]);
-      expect(daily.totals).toEqual({ trades: 0, gross: 0, commissions: 0, net: 0 });
+      expect(day.coverage).toEqual({
+        trackedSince: '2026-09-24T16:20:00.000-04:00',
+        tracked: true,
+        partial: false,
+      });
+      expect(day.monthCoverage.partial).toBe(true);
+    });
+
+    it('reports a day before tracking as untracked, never as a quiet zero', () => {
+      const day = buildDailyPnl(inputs(), '2026-09-01');
+
+      expect(day.coverage.tracked).toBe(false);
+      expect(day.sells).toEqual([]);
+    });
+
+    it('reports a quiet tracked day as zeroes', () => {
+      const day = buildDailyPnl(inputs(), '2026-09-26');
+
+      expect(day.totals).toEqual({ trades: 0, gross: 0, commissions: 0, net: 0 });
+      expect(day.coverage.tracked).toBe(true);
+    });
+
+    it('surfaces that day’s snapshot mismatches', () => {
+      const withMismatch = inputs();
+      // Agrees with the replay at 16:20 on the 25th (200 − 50); disagrees on the 28th.
+      withMismatch.snapshots.push(snapshot('2026-09-25T16:20:00.000-04:00', 150, 69.505));
+      withMismatch.snapshots.push(snapshot('2026-09-28T16:20:00.000-04:00', 999, 69.505));
+
+      expect(buildDailyPnl(withMismatch, '2026-09-25').mismatches).toEqual([]);
+      expect(buildDailyPnl(withMismatch, '2026-09-28').mismatches).toEqual([
+        expect.objectContaining({ replayedQuantity: 50, brokerQuantity: 999 }),
+      ]);
     });
   });
 
   describe('buildPeriodPnl', () => {
-    it('buckets by day and by strategy, including commission-only days', () => {
-      const period = buildPeriodPnl(
-        {
-          lots: [
-            grid(lot({ id: 'a', closedAt: '2026-09-24T11:00:00.000-04:00' })), // +25
-            grid(lot({ id: 'b' })), // +25 on the 25th
-            grid(lot({ id: 's', exitPrice: 69 }), 'grid:SOXL'), // -50 on the 25th
-          ],
-          fills: [
-            fill('2026-09-23T10:00:00.000-04:00', 1),
-            fill('2026-09-25T10:00:00.000-04:00', 2),
-          ],
-        },
-        '2026-09-21',
-        '2026-09-27',
-      );
+    it('buckets by day and by symbol', () => {
+      const period = buildPeriodPnl(inputs(), '2026-09-01', '2026-09-30');
 
-      expect(period.days).toEqual([
-        { date: '2026-09-23', trades: 0, gross: 0, commissions: 1, net: -1 },
-        { date: '2026-09-24', trades: 1, gross: 25, commissions: 0, net: 25 },
-        { date: '2026-09-25', trades: 2, gross: -25, commissions: 2, net: -27 },
+      expect(period.days.map((d) => [d.date, d.trades, d.net])).toEqual([
+        ['2026-09-25', 2, 22.5],
+        ['2026-09-28', 1, 73.75],
       ]);
-      expect(period.byStrategy).toEqual([
-        { symbol: 'SOXL', strategyId: 'grid:SOXL', trades: 1, gross: -50 },
-        { symbol: 'TQQQ', strategyId: 'grid:TQQQ', trades: 2, gross: 50 },
-      ]);
-      expect(period.totals).toEqual({ trades: 3, gross: 0, commissions: 3, net: -3 });
+      expect(period.bySymbol).toEqual([{ symbol: 'TQQQ', trades: 3, net: 96.25 }]);
+      expect(period.totals.net).toBe(96.25);
+      expect(period.coverage.partial).toBe(true);
+    });
+
+    it('is untracked over a range ending before the first snapshot', () => {
+      const period = buildPeriodPnl(inputs(), '2026-08-01', '2026-08-31');
+
+      expect(period.coverage.tracked).toBe(false);
+      expect(period.days).toEqual([]);
     });
   });
 });

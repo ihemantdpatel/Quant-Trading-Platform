@@ -90,10 +90,10 @@ describe('GridStrategy', () => {
 
       // Gapped through every GRID_STEPS level (99.5, 99) as well as the
       // DAILY_AVERAGE target (99.5) — so DAILY_AVERAGE would peg to 98 while
-      // GRID_STEPS correctly emits nothing.
+      // GRID_STEPS steps down from the close instead, never at it.
       const intents = strategy.onBar(flatBar('TQQQ', '2025-01-02T09:35:00.000-05:00', 98), state);
 
-      expect(intents.filter((i) => i.side === 'BUY')).toEqual([]);
+      expect(intents.filter((i) => i.side === 'BUY').map((b) => b.limitPrice)).toEqual([97.5, 97]);
     });
 
     it('uses DAILY_AVERAGE (may peg to market) on a genuine first bar of the day with nothing opened yet today', async () => {

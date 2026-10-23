@@ -45,6 +45,8 @@ import {
   ParameterChangeRepository,
   PerSymbolLimitChange,
   PerSymbolLimitChangeRepository,
+  PositionSnapshotRecord,
+  PositionSnapshotRepository,
   RiskEventRepository,
   RungRepository,
   StrategyStateSnapshotRecord,
@@ -154,8 +156,40 @@ export class InMemoryFillRepository implements FillRepository {
     return found ? copy(found) : null;
   }
 
+  async updateCommission(fillId: string, commission: number): Promise<boolean> {
+    const found = this.fills.find((fill) => fill.fillId === fillId);
+
+    if (!found) {
+      return false;
+    }
+
+    found.commission = commission;
+    return true;
+  }
+
   async clear(): Promise<void> {
     this.fills.length = 0;
+  }
+}
+
+@Injectable()
+export class InMemoryPositionSnapshotRepository implements PositionSnapshotRepository {
+  private readonly rows: PositionSnapshotRecord[] = [];
+
+  async saveBatch(rows: PositionSnapshotRecord[]): Promise<void> {
+    this.rows.push(...copy(rows));
+  }
+
+  async findAll(): Promise<PositionSnapshotRecord[]> {
+    return copy(
+      [...this.rows].sort(
+        (a, b) => a.takenAt.localeCompare(b.takenAt) || a.symbol.localeCompare(b.symbol),
+      ),
+    );
+  }
+
+  async clear(): Promise<void> {
+    this.rows.length = 0;
   }
 }
 

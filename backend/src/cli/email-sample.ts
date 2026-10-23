@@ -4,8 +4,8 @@
  * **Renders the P&L emails from real recent trades, for reviewing the format.**
  * Produces two messages over the last `--days` ET days:
  *
- * 1. the **daily** email for the most recent day in the window that closed a
- *    trade — so the per-trade table is not empty on a quiet day — and
+ * 1. the **daily** email for the most recent day in the window with a tracked
+ *    sell — so the per-trade table is not empty on a quiet day — and
  * 2. the **period** email (the monthly layout) over the whole window.
  *
  * Both are written to `--out` as `.html` for a local look, and sent with a
@@ -21,10 +21,11 @@ import { AppConfig, validateConfig } from '../config/config.schema';
 import { ET_ZONE } from '../market-data/types';
 import { NodemailerMailer } from '../observability/mailer';
 import { PnlEmailService } from '../observability/pnl-email.service';
-import { etDateOf, tradesBetween } from '../observability/pnl-summary';
+import { etDateOf } from '../observability/pnl-summary';
+import { buildLedger } from '../observability/average-cost-pnl';
 import {
   PrismaFillRepository,
-  PrismaGridLotRepository,
+  PrismaPositionSnapshotRepository,
 } from '../repositories/prisma/prisma.repositories';
 import { PrismaService } from '../repositories/prisma/prisma.service';
 
@@ -106,7 +107,7 @@ export async function runEmailSample(
   try {
     const alias = appConfig.accountAlias;
     const emails = new PnlEmailService(
-      new PrismaGridLotRepository(prisma, alias),
+      new PrismaPositionSnapshotRepository(prisma, alias),
       new PrismaFillRepository(prisma, alias),
       appConfig,
       email === null ? null : new NodemailerMailer(email),
@@ -114,8 +115,11 @@ export async function runEmailSample(
 
     const { from, to } = sampleWindow(DateTime.now(), args.days);
     const inputs = await emails.loadInputs();
-    const trades = tradesBetween(inputs.lots, from, to);
-    const dailyDate = trades.length > 0 ? etDateOf(trades[trades.length - 1].closedAt) : to;
+    const trades = buildLedger(inputs.snapshots, inputs.fills).sells.filter((sell) => {
+      const date = etDateOf(sell.timestamp);
+      return date >= from && date <= to;
+    });
+    const dailyDate = trades.length > 0 ? etDateOf(trades[trades.length - 1].timestamp) : to;
 
     const options = { subjectPrefix: '[SAMPLE]' };
     const daily = await emails.renderDaily(dailyDate, options);
@@ -131,7 +135,7 @@ export async function runEmailSample(
     writeFileSync(dailyPath, daily.html);
     writeFileSync(periodPath, period.html);
 
-    out.write(`account ${alias}: ${trades.length} closed trade(s) between ${from} and ${to}\n`);
+    out.write(`account ${alias}: ${trades.length} sell(s) tracked between ${from} and ${to}\n`);
     out.write(`  ${daily.subject}\n    → ${dailyPath}\n`);
     out.write(`  ${period.subject}\n    → ${periodPath}\n`);
 

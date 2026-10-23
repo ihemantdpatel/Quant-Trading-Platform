@@ -64,6 +64,7 @@ model Account {
   lotRebuildEvents      LotRebuildEvent[]
   parameterChanges      ParameterChange[]
   perSymbolLimitChanges PerSymbolLimitChange[]
+  positionSnapshots     PositionSnapshot[]
 }
 
 /// An account created from the dashboard rather than written into
@@ -251,6 +252,26 @@ model Position {
   account Account @relation(fields: [accountId], references: [id])
 
   @@id([accountId, symbol])
+}
+
+/// IB's own `(quantity, averageCost)` for one symbol at one instant — the
+/// anchor realized P&L is computed from (`average-cost-pnl.ts`).
+///
+/// **Append-only history, unlike `Position`**, which holds only the latest
+/// value. Realized P&L is replayed from the most recent snapshot forward, so
+/// every past anchor must survive. One `takenAt` is one batch: every symbol the
+/// account had seen is written, a flat one with quantity 0, so a missing row is
+/// never read as "flat" by accident.
+model PositionSnapshot {
+  accountId   String  @db.VarChar(64)
+  takenAt     String  @db.VarChar(32)
+  symbol      String  @db.VarChar(32)
+  quantity    Int
+  averageCost Decimal @db.Decimal(18, 6)
+
+  account Account @relation(fields: [accountId], references: [id])
+
+  @@id([accountId, takenAt, symbol])
 }
 
 /// `Lot` — the durable unit of the ladder (`lot.ts:1`).

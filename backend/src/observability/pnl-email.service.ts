@@ -1,5 +1,5 @@
 /**
- * Daily and monthly realized-P&L emails.
+ * Daily and monthly realized-P&L emails, on IB's average-cost basis.
  *
  * Read-only over persisted rows, like the daily soak report: it holds no broker
  * and no strategy, so nothing here can place or cancel an order. Each daemon
@@ -20,10 +20,9 @@ import { ET_ZONE } from '../market-data/types';
 import {
   FILL_REPOSITORY,
   FillRepository,
-  GRID_LOT_REPOSITORY,
-  GridLotRepository,
+  POSITION_SNAPSHOT_REPOSITORY,
+  PositionSnapshotRepository,
 } from '../repositories/repository.interfaces';
-import { GRID_ID_PREFIX } from '../strategies/grid/grid.strategy';
 import { MAILER, Mailer } from './mailer';
 import {
   EmailAccount,
@@ -32,7 +31,7 @@ import {
   renderDaily,
   renderPeriod,
 } from './pnl-email.renderer';
-import { buildDailyPnl, buildPeriodPnl, monthRange, PnlInputs } from './pnl-summary';
+import { buildDailyPnl, buildPeriodPnl, DailyPnl, monthRange, PnlInputs } from './pnl-summary';
 
 /** Raised when a send is requested but SMTP is not configured. */
 export class EmailNotConfiguredError extends Error {
@@ -44,7 +43,7 @@ export class EmailNotConfiguredError extends Error {
 @Injectable()
 export class PnlEmailService {
   constructor(
-    @Inject(GRID_LOT_REPOSITORY) private readonly gridLots: GridLotRepository,
+    @Inject(POSITION_SNAPSHOT_REPOSITORY) private readonly snapshots: PositionSnapshotRepository,
     @Inject(FILL_REPOSITORY) private readonly fills: FillRepository,
     private readonly appConfig: AppConfigService,
     @Optional() @Inject(MAILER) private readonly mailer: Mailer | null = null,
@@ -54,27 +53,18 @@ export class PnlEmailService {
     return this.mailer !== null;
   }
 
-  /** Grid lots with the strategy and symbol their rows carry, plus every fill. */
+  /**
+   * IB's position snapshots plus every recorded fill — the average-cost
+   * replay's whole input. Grid lots are deliberately not read: realized P&L
+   * follows the position's average, not the lot a sell happened to close.
+   */
   async loadInputs(): Promise<PnlInputs> {
-    const strategyIds = (await this.gridLots.findStrategyIds()).filter((id) =>
-      id.startsWith(GRID_ID_PREFIX),
-    );
+    const [snapshots, fills] = await Promise.all([this.snapshots.findAll(), this.fills.findAll()]);
+    return { snapshots, fills };
+  }
 
-    const lots = (
-      await Promise.all(
-        strategyIds.map(async (strategyId) =>
-          (await this.gridLots.findByStrategy(strategyId)).map((lot) => ({
-            strategyId,
-            // One grid instance trades one symbol, named in its id — the same
-            // reconstruction `EngineController.fallbackGridLots` uses.
-            symbol: strategyId.slice(GRID_ID_PREFIX.length),
-            lot,
-          })),
-        ),
-      )
-    ).flat();
-
-    return { lots, fills: await this.fills.findAll() };
+  async daily(date: string): Promise<DailyPnl> {
+    return buildDailyPnl(await this.loadInputs(), date);
   }
 
   private account(): EmailAccount {
@@ -82,7 +72,7 @@ export class PnlEmailService {
   }
 
   async renderDaily(date: string, options?: RenderOptions): Promise<RenderedEmail> {
-    return renderDaily(buildDailyPnl(await this.loadInputs(), date), this.account(), options);
+    return renderDaily(await this.daily(date), this.account(), options);
   }
 
   async renderPeriod(from: string, to: string, options?: RenderOptions): Promise<RenderedEmail> {

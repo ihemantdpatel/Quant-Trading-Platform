@@ -4,9 +4,8 @@ import { ExecutionMode } from '../config/execution-mode';
 import { ET_ZONE } from '../market-data/types';
 import {
   InMemoryFillRepository,
-  InMemoryGridLotRepository,
+  InMemoryPositionSnapshotRepository,
 } from '../repositories/in-memory/in-memory.repositories';
-import { GridLotStatus } from '../strategies/grid/lot';
 import { RecordingMailer } from './mailer';
 import {
   EmailNotConfiguredError,
@@ -28,51 +27,33 @@ function appConfig(usesIbBroker = true): AppConfigService {
 }
 
 async function service(mailer: RecordingMailer | null = new RecordingMailer()) {
-  const gridLots = new InMemoryGridLotRepository();
+  const snapshots = new InMemoryPositionSnapshotRepository();
   const fills = new InMemoryFillRepository();
-  await gridLots.save(
-    {
-      id: 'g1',
-      fillPrice: 70,
-      quantity: 50,
-      openedAt: '2026-09-25T10:00:00.000-04:00',
-      sellTarget: 70.5,
-      status: GridLotStatus.CLOSED,
-      closedAt: '2026-09-25T11:00:00.000-04:00',
-      exitPrice: 70.5,
-      workingOrderId: null,
-    },
-    'grid:TQQQ',
-    'TQQQ',
-  );
-  // A non-grid strategy id is not a grid lot and is not read as one.
-  await gridLots.save(
-    {
-      id: 'x',
-      fillPrice: 1,
-      quantity: 1,
-      openedAt: '2026-09-25T10:00:00.000-04:00',
-      sellTarget: 2,
-      status: GridLotStatus.CLOSED,
-      closedAt: '2026-09-25T11:00:00.000-04:00',
-      exitPrice: 2,
-      workingOrderId: null,
-    },
-    'dip-ladder:TQQQ',
-    'TQQQ',
-  );
-  return { emails: new PnlEmailService(gridLots, fills, appConfig(), mailer), mailer };
+  await snapshots.saveBatch([
+    { takenAt: '2026-09-24T16:20:00.000-04:00', symbol: 'TQQQ', quantity: 50, averageCost: 70 },
+  ]);
+  await fills.save({
+    clientOrderId: 'co-1',
+    brokerOrderId: '1',
+    fillId: 'f1',
+    symbol: 'TQQQ',
+    side: 'SELL',
+    quantity: 50,
+    price: 70.5,
+    commission: 0,
+    timestamp: '2026-09-25T11:00:00.000-04:00',
+  });
+  return { emails: new PnlEmailService(snapshots, fills, appConfig(), mailer), mailer, fills };
 }
 
 describe('PnlEmailService', () => {
-  it('attributes each grid lot to its strategy and symbol', async () => {
+  it('reads IB snapshots and every fill', async () => {
     const { emails } = await service();
 
     const inputs = await emails.loadInputs();
 
-    expect(inputs.lots.map((l) => [l.strategyId, l.symbol, l.lot.id])).toEqual([
-      ['grid:TQQQ', 'TQQQ', 'g1'],
-    ]);
+    expect(inputs.snapshots).toHaveLength(1);
+    expect(inputs.fills.map((f) => f.fillId)).toEqual(['f1']);
   });
 
   it('sends the daily email', async () => {
@@ -82,8 +63,37 @@ describe('PnlEmailService', () => {
 
     expect(mailer!.sent).toHaveLength(1);
     expect(sent.subject).toBe(
-      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 trade)',
+      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 sell)',
     );
+  });
+
+  // The operator's example end to end: a sell at the position's average
+  // realizes nothing, whichever grid lot it closed.
+  it('reports a sell at the average cost as $0', async () => {
+    const { emails, fills } = await service();
+    const at = (time: string): string => `2026-09-28T${time}:00.000-04:00`;
+    const add = (fillId: string, side: 'BUY' | 'SELL', price: number, time: string) =>
+      fills.save({
+        clientOrderId: fillId,
+        brokerOrderId: fillId,
+        fillId,
+        symbol: 'TQQQ',
+        side,
+        quantity: 100,
+        price,
+        commission: 0,
+        timestamp: at(time),
+      });
+    // Flat entering the 28th: the 25th's sell closed the 50 shares.
+    await add('b1', 'BUY', 80, '10:00');
+    await add('b2', 'BUY', 79.5, '10:30');
+    await add('b3', 'BUY', 79, '11:00');
+    await add('s1', 'SELL', 79.5, '11:30');
+
+    const day = await emails.daily('2026-09-28');
+
+    expect(day.totals.net).toBe(0);
+    expect(day.held).toEqual([{ symbol: 'TQQQ', quantity: 200, averageCost: 79.5 }]);
   });
 
   it('sends the monthly email over the whole calendar month', async () => {
@@ -92,7 +102,7 @@ describe('PnlEmailService', () => {
     await emails.sendMonthly('2026-09');
 
     expect(mailer!.sent[0].subject).toContain(
-      'Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$25.00 (1 trade)',
+      'Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$25.00 (1 sell)',
     );
     expect(mailer!.sent[0].text).toContain('(Sep 1 – Sep 30, 2026)');
   });
@@ -193,7 +203,7 @@ describe('PnlEmailScheduler', () => {
     await advance(30 * 60 * 1000);
 
     expect(mailer!.sent.map((m) => m.subject)).toEqual([
-      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 trade)',
+      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 sell)',
     ]);
 
     // Nothing more until Monday 16:30.
@@ -211,7 +221,7 @@ describe('PnlEmailScheduler', () => {
     // Asleep from 16:00 to 16:50: only one tick's worth of timer time passes.
     await sleepThenWake(50 * 60 * 1000);
     expect(mailer!.sent.map((m) => m.subject)).toEqual([
-      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 trade)',
+      '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 sell)',
     ]);
 
     await advance(10 * TICK_MS);
@@ -285,7 +295,7 @@ describe('PnlEmailScheduler', () => {
     await advance(60 * 1000);
 
     expect(mailer!.sent.map((m) => m.subject)).toEqual([
-      '[IB nuuixl118 · PAPER] Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$25.00 (1 trade)',
+      '[IB nuuixl118 · PAPER] Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$25.00 (1 sell)',
     ]);
     scheduler.stop();
   });
@@ -302,9 +312,7 @@ describe('PnlEmailScheduler', () => {
 
     await advance(TICK_MS);
     expect(mailer!.sent.filter((m) => m.subject.includes('Monthly')).map((m) => m.subject)).toEqual(
-      [
-        '[IB nuuixl118 · PAPER] Monthly P&L · October 2026 (Oct 1 – Oct 31, 2026): $0.00 (0 trades)',
-      ],
+      ['[IB nuuixl118 · PAPER] Monthly P&L · October 2026 (Oct 1 – Oct 31, 2026): $0.00 (0 sells)'],
     );
     scheduler.stop();
   });
