@@ -112,6 +112,18 @@ describe('isHeld / heldGridLots', () => {
 });
 
 describe('fifoQueue', () => {
+  it('preserves the order of lots with equal timestamp and id without mutating the input', () => {
+    const first = lot({ quantity: 10 });
+    const second = lot({ quantity: 20 });
+    const lots = [first, second];
+
+    const queue = fifoQueue(lots);
+
+    expect(queue).toEqual([first, second]);
+    expect(queue).not.toBe(lots);
+    expect(lots).toEqual([first, second]);
+  });
+
   it('orders lots oldest first', () => {
     const later = lot({ id: 'later', openedAt: '2025-01-02T12:00:00.000-05:00' });
     const earlier = lot({ id: 'earlier', openedAt: '2025-01-02T10:00:00.000-05:00' });
@@ -176,5 +188,13 @@ describe('allocateSell', () => {
 
   it('refuses a sale larger than what is held rather than closing lots it does not cover', () => {
     expect(allocateSell([dear, cheap, sold], 201)).toBeNull();
+  });
+
+  it('stops once the sale is covered, leaving more expensive held lots unallocated', () => {
+    expect(allocateSell([dear, cheap, sold], 100)).toEqual([{ lot: cheap, quantity: 100 }]);
+  });
+
+  it('allocates no lots when there are no shares to sell', () => {
+    expect(allocateSell([dear, cheap], 0)).toEqual([]);
   });
 });
