@@ -37,9 +37,14 @@ import {
   OrderStatus,
 } from '../broker/broker-adapter.interface';
 import { ExecutionMode } from '../config/execution-mode';
-import { clientOrderSequenceOf, formatClientOrderId } from '../domain/client-order-id';
+import {
+  clientOrderSequenceOf,
+  formatClientOrderId,
+  isManualFillClientOrderId,
+} from '../domain/client-order-id';
 import { Contract, equityContract } from '../domain/contract';
 import { ReplayService } from '../market-data/mock/replay.service';
+import { isRegularSession } from '../market-data/session';
 import { Bar, BarSize } from '../market-data/types';
 import { AccountSnapshot, RiskManagerService } from '../risk/risk-manager.service';
 import { RiskIntent, RiskOutcome } from '../risk/types';
@@ -55,7 +60,7 @@ import { Lot } from '../strategies/dip-ladder/lot';
 import { Rung } from '../strategies/dip-ladder/rung';
 import { GridConfig } from '../strategies/grid/config';
 import { GRID_ID_PREFIX, GRID_STATE_VERSION, GridStrategy } from '../strategies/grid/grid.strategy';
-import { GridLot } from '../strategies/grid/lot';
+import { allocateSell, GridLot } from '../strategies/grid/lot';
 import {
   JsonValue,
   OrderIntent,
@@ -241,6 +246,9 @@ type RestingOrderSnapshot =
  */
 const MAX_ALERT_HISTORY = 200;
 
+/** The one `fillQueues` key every manual fill shares — see `routeFill`. */
+const MANUAL_FILL_QUEUE = 'manual-fills';
+
 /**
  * Rounds to cents, so a price from the broker and one from the ladder compare
  * equal. Both are cent-denominated already; this only removes the float noise
@@ -348,6 +356,24 @@ export class EngineService {
    * blocking unrelated orders.
    */
   private readonly fillQueues = new Map<string, Promise<void>>();
+
+  /** Manual sales already alerted on, so each replay does not alert again. */
+  private readonly unadoptableManualFills = new Set<string>();
+
+  /**
+   * Grid strategies owed a recompute because one skipped an intent it could
+   * not safely place.
+   *
+   * The resting-order duplicate guard skips an intent when IB cannot list open
+   * orders, trusting the next bar to retry. That holds for the ladder, which
+   * evaluates every bar — but the grid decides only at its session-open bar
+   * and after a fill. A skip on either left the grid with nothing resting and
+   * so nothing to fill: on 2026-10-05 a socket drop in the same second as a
+   * sell fill skipped the recompute's buy, and the flat grid sat idle for the
+   * rest of the session. `processBar` drains this on the next regular-session
+   * bar via `recomputeGrid`, which re-adds the id if it skips again.
+   */
+  private readonly gridRecomputePending = new Set<string>();
 
   constructor(
     private readonly replay: ReplayService,
@@ -522,6 +548,25 @@ export class EngineService {
     const intents = this.coordinator.dispatchBar(bar);
     outcome.intentsGenerated = intents.length;
 
+    await this.retryPendingGridRecomputes(bar, intents);
+
+    // A grid that decided on this bar replaces its buy levels exactly as the
+    // fill-triggered recompute does. Without this, a restart mid-session left
+    // the previous process's buys resting beside the new ones — four orders
+    // against `maxBuyLevels: 2` on 2026-10-08. At a genuine session open last
+    // session's DAY buys have expired, so there is nothing to cancel.
+    for (const strategyId of new Set(intents.map((intent) => intent.strategyId))) {
+      const strategy = this.coordinator.getStrategy(strategyId);
+
+      if (strategy instanceof GridStrategy) {
+        await this.cancelSupersededGridBuys(
+          strategyId,
+          strategy.symbol,
+          intents.filter((intent) => intent.strategyId === strategyId),
+        );
+      }
+    }
+
     if (intents.length === 0) {
       return outcome;
     }
@@ -631,10 +676,12 @@ export class EngineService {
           // reconciliation releasing every WORKING rung when `getOpenOrders`
           // throws. Skipping costs one rung this bar; assuming the level is
           // clear risks a duplicate order at a price that already has one. The
-          // next bar retries, so a transient hiccup self-heals.
+          // next bar retries, so a transient hiccup self-heals — for the grid
+          // only because the skip is recorded; see `gridRecomputePending`.
           this.logger.warn(
             `skipping entry at ${intent.limitPrice.toFixed(2)} — cannot read open orders: ${resting.reason}`,
           );
+          this.markGridRecomputePending(intent.strategyId);
           continue;
         }
 
@@ -664,6 +711,7 @@ export class EngineService {
             `skipping exit for lot ${String(intent.metadata?.lotId)} — cannot read open orders: ` +
               resting.reason,
           );
+          this.markGridRecomputePending(intent.strategyId);
           continue;
         }
 
@@ -1088,7 +1136,9 @@ export class EngineService {
    * `WORKING` rung for, and read from **live** state. A rung is bar-driven
    * bookkeeping with no meaning for a strategy nothing is running, so a
    * disabled strategy correctly recovers no entry here — there is no
-   * legitimate way for one to have placed a BUY to begin with.
+   * legitimate way for one to have placed a BUY to begin with. A grid BUY
+   * has no rung, so it recovers from the `Order` row instead — see
+   * `recoverGridEntryWorkingOrder`.
    *
    * A SELL is the exit-side counterpart, and is read from the **persisted**
    * `Lot`/`GridLot` row rather than live state, which is what makes it work
@@ -1115,13 +1165,8 @@ export class EngineService {
       );
     }
 
-    // Deliberately narrow to the ladder — see this method's own header. The
-    // grid strategy keeps no rung-like persisted "pending" ledger a dropped
-    // BUY fill could be recovered from (an accepted v1 limitation), and
-    // `DipLadderStrategy.rungsOf` below would crash reading `.rungs` off a
-    // `GridStateData`, which does not have that field.
     if (order.strategyId.startsWith(GRID_ID_PREFIX)) {
-      return null;
+      return this.recoverGridEntryWorkingOrder(order);
     }
 
     const state = this.coordinator.getState(order.strategyId);
@@ -1154,6 +1199,65 @@ export class EngineService {
       `recovered working order ${clientOrderId} for rung ${rung.price.toFixed(2)} from persisted ` +
         'state — the fill arrived with no in-memory record, which happens when an order fills ' +
         'while the daemon is down and IB replays the execution on reconnect',
+    );
+
+    return recovered;
+  }
+
+  /**
+   * The grid's counterpart to the ladder's BUY recovery above, keyed on the
+   * `Order` row alone.
+   *
+   * **Why the grid needs this.** IB splits one order's fill across several
+   * execution reports. The first one smaller than the order reads as a
+   * partial, so `dispatchFill` cancels the remainder, which has often already
+   * filled. The remainder's report then arrives after `routeOrderStatus` has
+   * removed the entry (or after a restart). Dropping it left real shares with
+   * no `GridLot` (84 shares on 2026-09-29, 8 on 2026-10-01), and they surfaced
+   * only as lot-sum mismatches. The grid keeps no buy-level ledger, but the
+   * fill proves the order executed and the `Order` row proves this grid
+   * placed it, which is enough to open a lot at the real fill price.
+   *
+   * Outstanding is the order size less fills **already recorded**. Using the
+   * original size would read an 8-share remainder of a 100-share order as a
+   * fresh partial and cancel again. Order status is deliberately ignored: a
+   * row already marked `CANCELLED` by that same race is the case this is for.
+   *
+   * Live state is required, as for the ladder. A disabled grid places no
+   * BUYs, so it has no legitimate entry fill to recover.
+   */
+  private async recoverGridEntryWorkingOrder(order: {
+    clientOrderId: string;
+    strategyId: string;
+    symbol: string;
+    quantity: number;
+    limitPrice: number;
+  }): Promise<WorkingOrder | null> {
+    if (!this.coordinator.getState(order.strategyId)) {
+      return null;
+    }
+
+    const recorded = await this.fills.findByClientOrderId(order.clientOrderId);
+    const outstanding = order.quantity - recorded.reduce((sum, fill) => sum + fill.quantity, 0);
+
+    if (outstanding <= 0) {
+      return null;
+    }
+
+    const recovered: WorkingOrder = {
+      kind: 'ENTRY',
+      strategyId: order.strategyId,
+      rungPrice: order.limitPrice,
+      quantity: outstanding,
+      symbol: order.symbol,
+    };
+
+    this.workingOrders.set(order.clientOrderId, recovered);
+
+    this.logger.warn(
+      `recovered grid working order ${order.clientOrderId} (${outstanding} of ${order.quantity} ` +
+        'outstanding) from its Order row — the fill arrived with no in-memory record, as when IB ' +
+        'splits a fill across reports and the remainder lands after the cancel',
     );
 
     return recovered;
@@ -1424,11 +1528,18 @@ export class EngineService {
     // as `void this.routeFill(fill)`): queuing onto the previous promise for
     // this id, rather than blocking the emitter, is what lets unrelated
     // orders' fills keep processing concurrently while same-order fills queue.
-    const previous = this.fillQueues.get(fill.clientOrderId) ?? Promise.resolve();
-    const next = previous.then(() => this.dispatchFill(fill));
+    // Manual fills each carry their own id, but they all mutate the same
+    // grid state, so they share one queue rather than racing each other.
+    const key = isManualFillClientOrderId(fill.clientOrderId)
+      ? MANUAL_FILL_QUEUE
+      : fill.clientOrderId;
+    const previous = this.fillQueues.get(key) ?? Promise.resolve();
+    const next = previous.then(() =>
+      key === MANUAL_FILL_QUEUE ? this.adoptManualFill(fill) : this.dispatchFill(fill),
+    );
 
     this.fillQueues.set(
-      fill.clientOrderId,
+      key,
       next.catch(() => undefined),
     );
 
@@ -1583,6 +1694,140 @@ export class EngineService {
     );
 
     await this.persistAllStrategyState();
+  }
+
+  /**
+   * Adopts a trade placed by hand in TWS into the grid trading its symbol.
+   *
+   * IB is the source of truth on what the account holds. Before this, such a
+   * fill was discarded and the next reconciliation halted the symbol on a
+   * lot-sum mismatch that only a hand edit could clear (2026-10-08). The real
+   * execution price is used, never an average cost.
+   *
+   * - **BUY** opens a lot at the fill price; the recompute rests its sell.
+   * - **SELL** closes held lots cheapest first (`allocateSell`), splitting the
+   *   last. Each closed lot's resting sell is cancelled first — left working,
+   *   it would sell shares the account no longer holds.
+   *
+   * **Deferred, not dropped**, when it cannot apply yet: no bar has been
+   * processed (startup reconciliation has not opened the live path), the
+   * symbol is halted, or a sale exceeds what the grid holds. The fill is not
+   * saved in those cases, so IB's 60-second execution replay offers it again.
+   */
+  private async adoptManualFill(fill: Fill): Promise<void> {
+    const strategyId = this.gridStrategyIdFor(fill.symbol);
+    const state = strategyId ? this.coordinator.getState(strategyId) : null;
+    const config = strategyId ? this.gridConfigFor(strategyId) : null;
+
+    if (!strategyId || !state || !config) {
+      return;
+    }
+
+    if (this.lastBarTimestamp === null || this.symbolHalts.isHalted(fill.symbol)) {
+      return;
+    }
+
+    if (await this.fills.findByFillId(fill.fillId)) {
+      return;
+    }
+
+    if (fill.side === 'BUY') {
+      await this.fills.save(fill);
+
+      const lot = GridStrategy.openLotFromFill(state, config, {
+        price: fill.price,
+        quantity: fill.quantity,
+        at: fill.timestamp,
+      });
+
+      this.logger.log(
+        `manual buy ${fill.quantity} @ ${fill.price.toFixed(2)} adopted into ${strategyId} — ` +
+          `lot ${lot.id} sells at ${lot.sellTarget.toFixed(2)}`,
+      );
+
+      await this.persistAllStrategyState();
+      await this.recomputeGrid(strategyId);
+      return;
+    }
+
+    const allocations = allocateSell(GridStrategy.lotsOf(state), fill.quantity);
+
+    if (!allocations) {
+      if (!this.unadoptableManualFills.has(fill.fillId)) {
+        this.unadoptableManualFills.add(fill.fillId);
+        this.raiseAlert(
+          'WARNING',
+          'MANUAL_SELL_UNADOPTED',
+          `manual sell of ${fill.quantity} ${fill.symbol} exceeds what ${strategyId} holds — ` +
+            'left for reconciliation',
+          fill.timestamp,
+        );
+      }
+
+      return;
+    }
+
+    // Cancel only what is still resting: an order already gone would make
+    // `cancel` throw on every replay of this fill.
+    const resting = await this.broker.getOpenOrders().catch(() => null);
+
+    if (resting === null) {
+      return;
+    }
+
+    const restingIds = new Set(resting.map((order) => order.clientOrderId));
+
+    for (const { lot } of allocations) {
+      const orderId = lot.workingOrderId;
+
+      if (!orderId) {
+        continue;
+      }
+
+      if (restingIds.has(orderId)) {
+        try {
+          await this.broker.cancel(orderId);
+        } catch (error) {
+          this.haltEntries(
+            `failed to cancel ${orderId}, the resting sell of ${lot.id}, before adopting a ` +
+              `manual sale: ${error instanceof Error ? error.message : String(error)}`,
+            EntryHaltCode.ORDER_FAULT,
+          );
+          return;
+        }
+      }
+
+      // Removed from the registry before the broker's CANCELLED status lands,
+      // so `routeOrderStatus` does not act on a lot this sale already closed.
+      this.workingOrders.delete(orderId);
+      await this.orders.updateStatus(orderId, OrderStatus.CANCELLED);
+    }
+
+    await this.fills.save(fill);
+
+    for (const allocation of allocations) {
+      GridStrategy.closeLotFromFill(state, {
+        lotId: allocation.lot.id,
+        price: fill.price,
+        quantity: allocation.quantity,
+        at: fill.timestamp,
+      });
+    }
+
+    this.logger.log(
+      `manual sell ${fill.quantity} @ ${fill.price.toFixed(2)} adopted into ${strategyId} — ` +
+        `closed ${allocations.map((a) => `${a.quantity} of ${a.lot.id}`).join(', ')}`,
+    );
+
+    await this.persistAllStrategyState();
+    await this.recomputeGrid(strategyId);
+  }
+
+  /** The grid instance trading `symbol`, or null when none is registered. */
+  private gridStrategyIdFor(symbol: string): string | null {
+    const strategy = this.coordinator.getStrategy(`${GRID_ID_PREFIX}${symbol}`);
+
+    return strategy instanceof GridStrategy ? strategy.id : null;
   }
 
   /**
@@ -2092,6 +2337,10 @@ export class EngineService {
       return;
     }
 
+    // Cleared only once the recompute will actually run, so the early returns
+    // above keep an owed retry owed. A skip below re-marks it.
+    this.gridRecomputePending.delete(strategyId);
+
     const bar: Bar = {
       symbol: strategy.symbol,
       barSize: BarSize.ONE_MIN,
@@ -2113,11 +2362,131 @@ export class EngineService {
 
     const intents = strategy.evaluate(ctx, state);
 
+    await this.cancelSupersededGridBuys(strategyId, strategy.symbol, intents);
+
     if (intents.length === 0) {
       return;
     }
 
     await this.submitIntents(intents, this.lastBarTimestamp, 'grid-intent');
+  }
+
+  private markGridRecomputePending(strategyId: string): void {
+    if (strategyId.startsWith(GRID_ID_PREFIX)) {
+      this.gridRecomputePending.add(strategyId);
+    }
+  }
+
+  /**
+   * Re-runs `recomputeGrid` for each grid owed one on `bar`'s symbol.
+   *
+   * - **Regular session only.** Orders are DAY; one placed from an
+   *   after-hours bar would rest into the next session at a stale price.
+   * - **Not when `onBar` decided this bar.** That is the session-open
+   *   recompute, which supersedes the owed one — and running `GRID_STEPS`
+   *   after it would cancel the `DAILY_AVERAGE` buy it just placed as
+   *   superseded.
+   */
+  private async retryPendingGridRecomputes(bar: Bar, intents: OrderIntent[]): Promise<void> {
+    if (this.gridRecomputePending.size === 0 || !isRegularSession(bar.timestamp)) {
+      return;
+    }
+
+    for (const strategyId of [...this.gridRecomputePending]) {
+      const strategy = this.coordinator.getStrategy(strategyId);
+
+      if (!(strategy instanceof GridStrategy) || strategy.symbol !== bar.symbol) {
+        continue;
+      }
+
+      if (intents.some((intent) => intent.strategyId === strategyId)) {
+        this.gridRecomputePending.delete(strategyId);
+        continue;
+      }
+
+      this.logger.log(`${strategyId}: retrying the grid recompute a skipped order left owed`);
+      await this.recomputeGrid(strategyId);
+    }
+  }
+
+  /**
+   * Cancels this grid's resting BUYs at levels the recompute no longer wants.
+   *
+   * The grid's buy levels hang off its lowest held lot, so every fill moves
+   * them, and the duplicate guard only stops a *second* order at a price. It
+   * never removed the old ones. Superseded levels accumulated until the
+   * close: on 2026-10-01 six 100-share BUYs rested against `maxBuyLevels: 2`,
+   * three times the exposure the configuration allows.
+   *
+   * `intents` is the full desired set (`evaluate` always uses `GRID_STEPS`),
+   * so any other resting BUY of ours is superseded. Deliberately narrow:
+   * - **Ours only**: the order's `Order` row must name this strategy. An
+   *   adopted BUY placed by hand in TWS has no row and is left alone, the
+   *   same rule that stops reconciliation cancelling what it cannot explain.
+   * - **Unfilled only**: a partially filled order is skipped so a fill is
+   *   never stranded mid-flight.
+   * - **"Cannot ask" cancels nothing**, and a failed cancel is logged, not
+   *   halted on. A stale BUY left resting is the old behaviour and expires
+   *   at the close; it is no fault worth stopping entries for.
+   *
+   * A cancel that races a fill is safe: the fill routes through
+   * `recoverGridEntryWorkingOrder` even once the cancel ack has removed the
+   * in-memory entry.
+   */
+  private async cancelSupersededGridBuys(
+    strategyId: string,
+    symbol: string,
+    intents: OrderIntent[],
+  ): Promise<void> {
+    const wanted = new Set(
+      intents
+        .filter((intent) => intent.side === 'BUY' && intent.limitPrice !== undefined)
+        .map((intent) => roundPrice(intent.limitPrice!)),
+    );
+
+    let open: OpenOrder[];
+
+    try {
+      open = await this.broker.getOpenOrders();
+    } catch (error) {
+      this.logger.warn(
+        `not cancelling superseded grid buys — cannot read open orders: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+
+    for (const order of open) {
+      if (
+        order.symbol !== symbol ||
+        order.side !== 'BUY' ||
+        order.filledQuantity > 0 ||
+        wanted.has(roundPrice(order.limitPrice))
+      ) {
+        continue;
+      }
+
+      const record = await this.orders.findByClientOrderId(order.clientOrderId);
+
+      if (record?.strategyId !== strategyId) {
+        continue;
+      }
+
+      try {
+        await this.broker.cancel(order.clientOrderId);
+        this.logger.log(
+          `cancelled superseded grid buy ${order.clientOrderId} at ${order.limitPrice.toFixed(2)} — ` +
+            "no longer one of the grid's levels",
+        );
+      } catch (error) {
+        this.logger.warn(
+          `could not cancel superseded grid buy ${order.clientOrderId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   }
 
   /**

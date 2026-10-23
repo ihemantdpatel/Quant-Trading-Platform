@@ -69,3 +69,20 @@ export function ownsClientOrderId(id: string, accountAlias: string): boolean {
 
   return scoped ? scoped[1] === accountAlias : true;
 }
+
+/**
+ * Executions that no order of this engine's claims — a trade an operator
+ * placed by hand in TWS — travel as `manual-<execId>`. The execution id is
+ * unique per fill and stable across IB's replays, so the fill router's
+ * `fillId` dedupe still holds, and the prefix cannot collide with an id this
+ * generator issues (`co-…`).
+ */
+const MANUAL_FILL_PREFIX = 'manual-';
+
+export function manualFillClientOrderId(execId: string): string {
+  return `${MANUAL_FILL_PREFIX}${execId}`;
+}
+
+export function isManualFillClientOrderId(id: string): boolean {
+  return id.startsWith(MANUAL_FILL_PREFIX);
+}

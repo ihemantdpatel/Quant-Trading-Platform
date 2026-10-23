@@ -19,6 +19,7 @@ import { LotStatus } from '../strategies/dip-ladder/lot';
 import { RungStatus } from '../strategies/dip-ladder/rung';
 import { SymbolHaltService } from '../reconciliation/symbol-halt.service';
 import { CoordinatorService } from '../strategies/coordinator.service';
+import { registerRetiredLadderForTest } from './testing/retired-ladder';
 
 /**
  * Replaying a full fixture is ~936 bars through the whole path, and under
@@ -43,14 +44,11 @@ describe('Story 6: engine HTTP API', () => {
     broker = app.get<MockBrokerAdapter>(BROKER_ADAPTER);
     engine = app.get(EngineService);
 
-    // This whole suite is about the dip ladder's own behaviour, but the
-    // current operator default boots the grid strategy enabled on TQQQ and
-    // the ladder disabled (`EngineModule.ladderEnabled`/`gridEnabled`).
-    // `coordinator.enable` initializes on demand, so this is deterministic
-    // regardless of whether the app's own (unawaited) startup chain has
-    // reached the ladder yet.
+    // The dip ladder is retired and production never registers it
+    // (`EngineModule`). This suite covers the ladder's own behaviour, so it
+    // registers it explicitly and turns the grid off on the shared symbol.
     const coordinator = app.get(CoordinatorService);
-    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    await registerRetiredLadderForTest(app);
     coordinator.disable('grid:TQQQ');
   });
 

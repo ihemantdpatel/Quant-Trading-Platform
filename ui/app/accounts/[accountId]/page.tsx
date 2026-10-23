@@ -27,7 +27,6 @@ import {
   lastMarkPrice,
   loadExecution,
   totalDeployedCost,
-  totalRealized,
 } from '../../lib/api';
 
 /** Always rendered fresh — this reports live engine state. */
@@ -44,8 +43,8 @@ export default async function ExecutionPage({
   const lotsUnavailable = data.unavailable?.lots ?? false;
   const gridLotsUnavailable = data.unavailable?.gridLots ?? false;
   const rungsUnavailable = data.unavailable?.rungs ?? false;
-  // Deployed cost and realized P&L are account-wide totals in the top header,
-  // so they must reflect whichever strategy actually holds a position —
+  // Deployed cost is an account-wide total in the top header, so it must
+  // reflect whichever strategy actually holds a position —
   // combining both keeps the header correct once the operator switches which
   // strategy trades a symbol, rather than only ever describing the ladder.
   const allLots = [...data.lots, ...data.gridLots];
@@ -118,7 +117,10 @@ export default async function ExecutionPage({
           status={data.status}
           positions={data.positions}
           deployed={totalDeployedCost(allLots)}
-          realized={totalRealized(allLots)}
+          // Average cost, from the backend — the same figure the daily email
+          // reports. Summing lots' own gains is not what IB realizes.
+          realized={data.realized}
+          realizedUnavailable={data.unavailable?.realized ?? false}
           positionsUnavailable={data.unavailable?.positions ?? false}
           mode={data.status?.mode ?? 'SHADOW'}
           strategies={data.strategies}
@@ -150,6 +152,8 @@ export default async function ExecutionPage({
               allLots={allLots}
               mark={mark}
               unavailable={lotsUnavailable || gridLotsUnavailable}
+              realized={data.realized}
+              realizedUnavailable={data.unavailable?.realized ?? false}
             />
           )}
         </div>

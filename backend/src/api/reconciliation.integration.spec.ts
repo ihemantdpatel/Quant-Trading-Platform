@@ -30,6 +30,7 @@ import {
   OrderRepository,
 } from '../repositories/repository.interfaces';
 import { LotStatus } from '../strategies/dip-ladder/lot';
+import { registerRetiredLadderForTest } from './testing/retired-ladder';
 
 jest.setTimeout(120_000);
 
@@ -51,12 +52,10 @@ describe('Story 9: reconciliation over HTTP', () => {
     lots = app.get(LOT_REPOSITORY);
     coordinator = app.get(CoordinatorService);
 
-    // This suite is about the dip ladder's own reconciliation behaviour, but
-    // the current operator default boots the grid strategy enabled on TQQQ
-    // and the ladder disabled. `coordinator.enable` initializes on demand,
-    // so this is deterministic regardless of the app's own (unawaited)
-    // startup chain.
-    await coordinator.enable('dip-ladder:TQQQ', new Date().toISOString());
+    // The dip ladder is retired and production never registers it
+    // (`EngineModule`). This suite covers the ladder's own behaviour, so it
+    // registers it explicitly and turns the grid off on the shared symbol.
+    await registerRetiredLadderForTest(app);
     coordinator.disable('grid:TQQQ');
   });
 

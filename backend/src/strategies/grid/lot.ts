@@ -163,3 +163,34 @@ export function sellPriorityQueue(lots: GridLot[]): GridLot[] {
 export function heldGridLots(lots: GridLot[]): GridLot[] {
   return lots.filter(isHeld);
 }
+
+export interface SellAllocation {
+  lot: GridLot;
+  quantity: number;
+}
+
+/**
+ * Which held lots a sale of `quantity` shares disposes of — the grid's own
+ * sell priority (`sellPriorityQueue`), cheapest first, the last one taken in
+ * part. Used for a sale placed by hand, which names no lot.
+ *
+ * `null` when the held lots do not cover the sale: the shares sold then
+ * include ones the grid does not own, and attributing the sale anyway would
+ * close lots for shares that were never theirs.
+ */
+export function allocateSell(lots: GridLot[], quantity: number): SellAllocation[] | null {
+  const allocations: SellAllocation[] = [];
+  let remaining = quantity;
+
+  for (const lot of sellPriorityQueue(heldGridLots(lots))) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    const taken = Math.min(lot.quantity, remaining);
+    allocations.push({ lot, quantity: taken });
+    remaining -= taken;
+  }
+
+  return remaining > 0 ? null : allocations;
+}

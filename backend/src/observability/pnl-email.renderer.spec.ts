@@ -1,38 +1,49 @@
 import { ExecutionMode } from '../config/execution-mode';
 import { price, renderDaily, renderPeriod, signedUsd } from './pnl-email.renderer';
-import { DailyPnl, PeriodPnl } from './pnl-summary';
+import { Coverage, DailyPnl, PeriodPnl } from './pnl-summary';
 
 const account = { alias: 'nuuixl118', mode: ExecutionMode.PAPER };
 
+const full: Coverage = {
+  trackedSince: '2026-09-01T16:20:00.000-04:00',
+  tracked: true,
+  partial: false,
+};
+
 const daily: DailyPnl = {
   date: '2026-09-25',
-  trades: [
+  sells: [
     {
-      lotId: 'g1',
+      fillId: 'f1',
       symbol: 'TQQQ',
-      strategyId: 'grid:TQQQ',
+      timestamp: '2026-09-25T11:05:00.000-04:00',
       quantity: 50,
-      buyPrice: 70,
-      sellPrice: 70.5,
-      openedAt: '2026-09-24T15:00:00.000-04:00',
-      closedAt: '2026-09-25T11:05:00.000-04:00',
-      gain: 25,
+      price: 70.5,
+      averageCost: 70,
+      commission: 1,
+      gross: 25,
+      realized: 24,
+      uncovered: 0,
     },
     {
-      lotId: 'g2',
+      fillId: 'f2',
       symbol: 'TQQQ',
-      strategyId: 'grid:TQQQ',
+      timestamp: '2026-09-25T14:00:00.000Z',
       quantity: 10,
-      buyPrice: 71.1234,
-      sellPrice: 70.5,
-      openedAt: '2026-09-25T10:00:00.000-04:00',
-      closedAt: '2026-09-25T14:00:00.000Z',
-      gain: -6.23,
+      price: 70.5,
+      averageCost: 71.1234,
+      commission: 1.5,
+      gross: -6.23,
+      realized: -7.73,
+      uncovered: 0,
     },
   ],
   totals: { trades: 2, gross: 18.77, commissions: 2.5, net: 16.27 },
-  held: [{ symbol: 'TQQQ', strategyId: 'grid:TQQQ', lots: 3, quantity: 150 }],
+  held: [{ symbol: 'TQQQ', quantity: 150, averageCost: 70.25 }],
   monthToDate: { trades: 40, gross: 1000, commissions: 50, net: 950 },
+  coverage: full,
+  monthCoverage: full,
+  mismatches: [],
 };
 
 describe('pnl-email.renderer', () => {
@@ -47,9 +58,9 @@ describe('pnl-email.renderer', () => {
   describe('renderDaily', () => {
     const email = renderDaily(daily, account);
 
-    it('puts account, mode, net, and trade count in the subject', () => {
+    it('puts account, mode, realized P&L, and sell count in the subject', () => {
       expect(email.subject).toBe(
-        '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$16.27 (2 trades)',
+        '[IB nuuixl118 · PAPER] Daily P&L · Fri, Sep 25, 2026 (session close): +$16.27 (2 sells)',
       );
     });
 
@@ -59,45 +70,88 @@ describe('pnl-email.renderer', () => {
       );
     });
 
-    it('lists each trade with buy, sell, and gain in both parts', () => {
+    it('lists each sell with its price, average cost, commission, and realized P&L', () => {
       for (const body of [email.html, email.text]) {
-        expect(body).toContain('70.00');
         expect(body).toContain('70.50');
-        expect(body).toContain('+$25.00');
-        expect(body).toContain('-$6.23');
+        expect(body).toContain('71.1234');
+        expect(body).toContain('+$24.00');
+        expect(body).toContain('-$7.73');
         expect(body).toContain('+$16.27');
-        expect(body).toContain('$2.50');
+        expect(body).toContain('$1.50');
       }
-    });
-
-    it('shows the buy date when the lot was bought on an earlier day', () => {
-      expect(email.html).toContain('Sep 24 15:00');
+      expect(email.html).toContain('Avg cost');
       expect(email.html).toContain('>10:00<');
     });
 
+    it('explains the average-cost basis', () => {
+      expect(email.html).toContain('average-cost method');
+      expect(email.text).toContain('average-cost method');
+    });
+
     it('colors a loss red', () => {
-      expect(email.html).toMatch(/color:#b91c1c[^>]*>-\$6\.23/);
+      expect(email.html).toMatch(/color:#b91c1c[^>]*>-\$7\.73/);
     });
 
-    it('includes month to date and held lots', () => {
-      expect(email.text).toContain('Month to date: 40 trades, gross +$1,000.00');
-      expect(email.text).toContain('TQQQ (grid:TQQQ): 3 lots, 150 sh');
+    it('includes month to date and the closing position', () => {
+      expect(email.text).toContain('Month to date: 40 sells · gross +$1,000.00');
+      expect(email.text).toContain('TQQQ: 150 sh @ avg 70.25');
     });
 
-    it('says so on a day with no trades rather than rendering an empty table', () => {
+    it('says so on a day with no sells rather than rendering an empty table', () => {
       const empty = renderDaily(
-        { ...daily, trades: [], totals: { trades: 0, gross: 0, commissions: 0, net: 0 }, held: [] },
+        { ...daily, sells: [], totals: { trades: 0, gross: 0, commissions: 0, net: 0 }, held: [] },
         account,
       );
 
-      expect(empty.subject).toContain('$0.00 (0 trades)');
-      expect(empty.html).toContain('No trades closed today.');
-      expect(empty.text).toContain('No lots held.');
+      expect(empty.subject).toContain('$0.00 (0 sells)');
+      expect(empty.html).toContain('No sells today.');
+      expect(empty.text).toContain('No position held.');
+    });
+
+    it('says "not tracked" rather than $0 for a day before tracking began', () => {
+      const untracked = renderDaily(
+        {
+          ...daily,
+          sells: [],
+          totals: { trades: 0, gross: 0, commissions: 0, net: 0 },
+          coverage: { trackedSince: null, tracked: false, partial: false },
+        },
+        account,
+      );
+
+      expect(untracked.subject).toMatch(/: not tracked$/);
+      expect(untracked.text).toContain('! Not tracked');
+    });
+
+    it('flags a partial month and a snapshot mismatch', () => {
+      const flagged = renderDaily(
+        {
+          ...daily,
+          monthCoverage: { ...full, partial: true, trackedSince: '2026-09-24T16:20:00.000-04:00' },
+          mismatches: [
+            {
+              symbol: 'TQQQ',
+              takenAt: '2026-09-25T16:20:00.000-04:00',
+              replayedQuantity: 100,
+              brokerQuantity: 200,
+              replayedAverageCost: 80,
+              brokerAverageCost: 79.5,
+            },
+          ],
+        },
+        account,
+      );
+
+      expect(flagged.text).toContain('Partial: average-cost tracking began Sep 24 16:20 ET');
+      expect(flagged.text).toContain(
+        'IB held 200 sh @ 79.5000, recorded fills explain 100 sh @ 80.0000',
+      );
+      expect(flagged.html).toContain('a fill is missing');
     });
 
     it('escapes interpolated strings', () => {
       const hostile = renderDaily(
-        { ...daily, held: [{ symbol: '<b>X</b>', strategyId: 'grid:X', lots: 1, quantity: 1 }] },
+        { ...daily, held: [{ symbol: '<b>X</b>', quantity: 1, averageCost: 1 }] },
         account,
       );
 
@@ -111,40 +165,51 @@ describe('pnl-email.renderer', () => {
       from: '2026-09-01',
       to: '2026-09-30',
       days: [{ date: '2026-09-25', trades: 2, gross: 18.77, commissions: 2.5, net: 16.27 }],
-      byStrategy: [{ symbol: 'TQQQ', strategyId: 'grid:TQQQ', trades: 2, gross: 18.77 }],
+      bySymbol: [{ symbol: 'TQQQ', trades: 2, net: 16.27 }],
       totals: { trades: 2, gross: 18.77, commissions: 2.5, net: 16.27 },
+      coverage: full,
+      mismatches: [],
     };
 
     it('titles a month by default', () => {
       const email = renderPeriod(period, account);
 
       expect(email.subject).toBe(
-        '[IB nuuixl118 · PAPER] Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$16.27 (2 trades)',
+        '[IB nuuixl118 · PAPER] Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$16.27 (2 sells)',
       );
       expect(email.html).toContain('Fri, Sep 25');
-      expect(email.text).toContain('2026-09-25  2 trades, gross +$18.77');
-      expect(email.text).toContain('TQQQ (grid:TQQQ): 2 trades');
+      expect(email.text).toContain('2026-09-25  2 sells, gross +$18.77');
+      expect(email.text).toContain('TQQQ: 2 sells, realized +$16.27');
     });
 
     it('uses a custom label for a non-month window', () => {
       expect(renderPeriod(period, account, { periodLabel: 'last 7 days' }).subject).toBe(
-        '[IB nuuixl118 · PAPER] P&L · last 7 days (Sep 1 – Sep 30, 2026): +$16.27 (2 trades)',
+        '[IB nuuixl118 · PAPER] P&L · last 7 days (Sep 1 – Sep 30, 2026): +$16.27 (2 sells)',
       );
     });
 
-    it('says so when the period has no trades', () => {
+    it('says so when the period has no sells', () => {
       const empty = renderPeriod(
         {
           ...period,
           days: [],
-          byStrategy: [],
+          bySymbol: [],
           totals: { trades: 0, gross: 0, commissions: 0, net: 0 },
         },
         account,
       );
 
-      expect(empty.html).toContain('No trades closed in this period.');
-      expect(empty.subject).toContain('(0 trades)');
+      expect(empty.html).toContain('No sells in this period.');
+      expect(empty.subject).toContain('(0 sells)');
+    });
+
+    it('says "not tracked" for a period before tracking began', () => {
+      const untracked = renderPeriod(
+        { ...period, coverage: { trackedSince: null, tracked: false, partial: false } },
+        account,
+      );
+
+      expect(untracked.subject).toMatch(/: not tracked$/);
     });
   });
 });

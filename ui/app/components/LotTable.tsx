@@ -8,8 +8,12 @@
  * its own fill price and nothing else (`PRD.md:129`), and rendering a blended
  * target beside it would imply an exit rule the system does not have.
  *
- * Blended average cost appears **once**, below the table, labelled "reference
- * only" (`PRD.md:378`).
+ * The footer's **average cost** is the position's running average, counted by
+ * the backend from our own fills (`position`) — buys re-average it and sells
+ * leave it unchanged, so it still reflects the cheaper buys of lots already
+ * sold. The held lots' own blended cost appears beside it, labelled "reference
+ * only" (`PRD.md:378`): it forgets every sold lot, so it is not the position's
+ * cost basis.
  *
  * **Held lots only.** A closed lot has nothing left to watch — no target
  * distance, no age relative to an open position — so it belongs in
@@ -41,8 +45,16 @@ export function LotTable({
   emptyMessage = 'No lots held. Replay a fixture to drive the strategy.',
   showRungColumn = true,
   showHeader = true,
+  position,
 }: {
   lots: LotLike[];
+  /**
+   * The position by symbol — quantity and running average cost — from the
+   * realized-P&L ledger, or null when that read failed. It can hold shares no
+   * displayed lot explains, which is exactly why it is shown separately.
+   * Omitted entirely by a caller with no ledger to offer.
+   */
+  position?: Array<{ symbol: string; quantity: number; averageCost: number }> | null;
   /** Last traded price, or null when the engine has seen no fills. */
   mark: number | null;
   /** Injectable clock so age rendering is deterministic under test. */
@@ -190,11 +202,30 @@ export function LotTable({
       )}
 
       <footer className="grid gap-3 border-t border-slate-800 px-4 py-3 text-sm sm:grid-cols-3">
-        <Metric label="Shares held" value={String(totalHeldQuantity(held))} />
-        <Metric label="Deployed at cost" value={formatCurrency(totalDeployedCost(held))} />
+        {position !== undefined && (
+          <div>
+            <p className="text-xs uppercase tracking-wide text-slate-500">Position average cost</p>
+            <p data-testid="position-average" className="font-mono text-slate-300">
+              {position === null
+                ? 'unavailable'
+                : position.length === 0
+                  ? '—'
+                  : position
+                      .map(
+                        (row) =>
+                          `${row.symbol} ${row.quantity} sh @ ${formatCurrency(row.averageCost)}`,
+                      )
+                      .join(' · ')}
+            </p>
+          </div>
+        )}
+        <Metric
+          label="Lots held · deployed at cost"
+          value={`${totalHeldQuantity(held)} sh · ${formatCurrency(totalDeployedCost(held))}`}
+        />
         <div>
           <p className="text-xs uppercase tracking-wide text-slate-500">
-            Blended average{' '}
+            Held lots&apos; own cost{' '}
             {/*
               The label is not decoration. Per `PRD.md:378` this figure is
               display-only and no exit decision reads it — showing it unlabelled

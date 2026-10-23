@@ -3,8 +3,9 @@
  *
  * The summary arithmetic and rendering are proven in `observability/`; what
  * only the assembled app shows is the wiring — the routes reach the account's
- * grid lots through the real repository binding, and answer 503 rather than
- * pretending to send when SMTP is not configured.
+ * position snapshots and fills through the real repository binding, the
+ * dashboard's realized-P&L route agrees with the email, and the email routes
+ * answer 503 rather than pretending to send when SMTP is not configured.
  */
 
 import { INestApplication } from '@nestjs/common';
@@ -12,8 +13,12 @@ import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { AppModule } from '../app.module';
 import { MAILER, RecordingMailer } from '../observability/mailer';
-import { GRID_LOT_REPOSITORY, GridLotRepository } from '../repositories/repository.interfaces';
-import { GridLotStatus } from '../strategies/grid/lot';
+import {
+  FILL_REPOSITORY,
+  FillRepository,
+  POSITION_SNAPSHOT_REPOSITORY,
+  PositionSnapshotRepository,
+} from '../repositories/repository.interfaces';
 
 jest.setTimeout(60_000);
 
@@ -40,21 +45,38 @@ describe('P&L email routes', () => {
     beforeEach(async () => {
       mailer = new RecordingMailer();
       app = await boot(mailer);
-      await app.get<GridLotRepository>(GRID_LOT_REPOSITORY).save(
+      await app.get<PositionSnapshotRepository>(POSITION_SNAPSHOT_REPOSITORY).saveBatch([
         {
-          id: 'g1',
-          fillPrice: 70,
+          takenAt: '2026-09-24T16:20:00.000-04:00',
+          symbol: 'TQQQ',
           quantity: 50,
-          openedAt: '2026-09-25T10:00:00.000-04:00',
-          sellTarget: 70.5,
-          status: GridLotStatus.CLOSED,
-          closedAt: '2026-09-25T11:00:00.000-04:00',
-          exitPrice: 70.5,
-          workingOrderId: null,
+          averageCost: 70,
         },
-        'grid:TQQQ',
-        'TQQQ',
-      );
+      ]);
+      await app.get<FillRepository>(FILL_REPOSITORY).save({
+        clientOrderId: 'co-1',
+        brokerOrderId: '1',
+        fillId: 'f1',
+        symbol: 'TQQQ',
+        side: 'SELL',
+        quantity: 50,
+        price: 70.5,
+        commission: 0,
+        timestamp: '2026-09-25T11:00:00.000-04:00',
+      });
+    });
+
+    it('serves the dashboard the same realized P&L the email reports', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/reports/pnl/realized?date=2026-09-25')
+        .expect(200);
+
+      expect(response.body.totals).toEqual({ trades: 1, gross: 25, commissions: 0, net: 25 });
+      expect(response.body.sells[0]).toMatchObject({ averageCost: 70, realized: 25 });
+      expect(response.body.monthToDate.net).toBe(25);
+      expect(response.body.coverage.tracked).toBe(true);
+
+      await request(app.getHttpServer()).get('/reports/pnl/realized?date=2026-9-25').expect(422);
     });
 
     it('sends a day', async () => {
@@ -63,7 +85,7 @@ describe('P&L email routes', () => {
         .expect(200);
 
       expect(response.body.sent).toContain(
-        'Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 trade)',
+        'Daily P&L · Fri, Sep 25, 2026 (session close): +$25.00 (1 sell)',
       );
       expect(mailer.sent).toHaveLength(1);
     });
@@ -74,7 +96,7 @@ describe('P&L email routes', () => {
         .expect(200);
 
       expect(response.body.sent).toContain(
-        'Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$25.00 (1 trade)',
+        'Monthly P&L · September 2026 (Sep 1 – Sep 30, 2026): +$25.00 (1 sell)',
       );
     });
 

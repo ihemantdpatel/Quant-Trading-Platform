@@ -1,4 +1,5 @@
 import {
+  allocateSell,
   closeGridLot,
   fifoQueue,
   GridLot,
@@ -158,5 +159,22 @@ describe('sellPriorityQueue', () => {
     const a = lot({ id: 'a', fillPrice: 98, openedAt: '2025-01-02T10:00:00.000-05:00' });
 
     expect(sellPriorityQueue([b, a]).map((l) => l.id)).toEqual(['a', 'b']);
+  });
+});
+
+describe('allocateSell', () => {
+  const cheap = lot({ id: 'cheap', fillPrice: 79.73, quantity: 100 });
+  const dear = lot({ id: 'dear', fillPrice: 84.44, quantity: 100 });
+  const sold = lot({ id: 'sold', fillPrice: 70, quantity: 100, status: GridLotStatus.CLOSED });
+
+  it('takes held lots cheapest first, the last one in part', () => {
+    expect(allocateSell([dear, cheap, sold], 150)).toEqual([
+      { lot: cheap, quantity: 100 },
+      { lot: dear, quantity: 50 },
+    ]);
+  });
+
+  it('refuses a sale larger than what is held rather than closing lots it does not cover', () => {
+    expect(allocateSell([dear, cheap, sold], 201)).toBeNull();
   });
 });

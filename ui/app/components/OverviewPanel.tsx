@@ -29,6 +29,8 @@ import {
   formatCurrency,
   type ExecutionMode,
   type Position,
+  type RealizedCoverage,
+  type RealizedPnl,
   type Status,
   type StrategySummary,
 } from '../lib/api';
@@ -48,6 +50,7 @@ export function OverviewPanel({
   positions,
   deployed,
   realized,
+  realizedUnavailable = false,
   positionsUnavailable = false,
   mode,
   strategies,
@@ -55,7 +58,14 @@ export function OverviewPanel({
   status: Status | null;
   positions: Position[];
   deployed: number;
-  realized: number;
+  /**
+   * Today's and month-to-date realized P&L on an average-cost basis
+   * (`GET /reports/pnl/realized`). Not a sum of grid lots' own gains — that
+   * pairing reports profit IB does not, e.g. +$50 for a sell at the average.
+   */
+  realized: RealizedPnl | null;
+  /** True when that read failed — shown as "unavailable", never as $0. */
+  realizedUnavailable?: boolean;
   /**
    * True when the `/positions` read failed.
    *
@@ -108,10 +118,8 @@ export function OverviewPanel({
 
             <Item label="Deployed at cost">{formatCurrency(deployed)}</Item>
 
-            <Item label="Realized P&L">
-              <span className={realized >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                {formatCurrency(realized)}
-              </span>
+            <Item label="Realized P&L (avg cost)">
+              <RealizedFigures realized={realized} unavailable={realizedUnavailable} />
             </Item>
 
             <Item label="Account equity">
@@ -131,6 +139,84 @@ export function OverviewPanel({
       </div>
     </section>
   );
+}
+
+function RealizedFigures({
+  realized,
+  unavailable,
+}: {
+  realized: RealizedPnl | null;
+  unavailable: boolean;
+}) {
+  if (unavailable || realized === null) {
+    return (
+      <span className="text-amber-400" title="The realized P&L read failed">
+        unavailable
+      </span>
+    );
+  }
+
+  return (
+    <>
+      <Figure
+        label="Today"
+        value={realized.totals.net}
+        coverage={realized.coverage}
+        testId="realized-today"
+      />
+      <Figure
+        label="MTD"
+        value={realized.monthToDate.net}
+        coverage={realized.monthCoverage}
+        testId="realized-mtd"
+      />
+      {realized.mismatches.length > 0 && (
+        <span
+          className="block text-xs text-amber-400"
+          title="IB's position disagreed with the recorded fills — a fill is missing, and our average stays off until it is recorded"
+        >
+          fills missing — see email
+        </span>
+      )}
+    </>
+  );
+}
+
+/** One figure, or why there is none: an untracked period must not read as $0. */
+function Figure({
+  label,
+  value,
+  coverage,
+  testId,
+}: {
+  label: string;
+  value: number;
+  coverage: RealizedCoverage;
+  testId: string;
+}) {
+  return (
+    <span className="block" data-testid={testId}>
+      <span className="text-slate-500">{label} </span>
+      {coverage.tracked ? (
+        <span className={value >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+          {formatCurrency(value)}
+        </span>
+      ) : (
+        <span className="text-slate-500">not tracked</span>
+      )}
+      {coverage.tracked && coverage.partial && coverage.trackedSince !== null && (
+        <span className="text-xs text-slate-500"> since {shortDate(coverage.trackedSince)}</span>
+      )}
+    </span>
+  );
+}
+
+function shortDate(timestamp: string): string {
+  return new Date(timestamp).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'America/New_York',
+  });
 }
 
 function Item({ label, children }: { label: string; children: React.ReactNode }) {

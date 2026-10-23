@@ -20,6 +20,7 @@ import {
   checkManagedAccount,
   durationString,
   entriesForAccount,
+  executionClientOrderId,
   parseIbTime,
   resolveClientOrderId,
   toDomainBar,
@@ -322,6 +323,26 @@ describe('toOrderStatus', () => {
   it('returns null for an unknown or absent status', () => {
     expect(toOrderStatus('SomethingIBAddedLater')).toBeNull();
     expect(toOrderStatus(undefined)).toBeNull();
+  });
+});
+
+describe('executionClientOrderId', () => {
+  it("routes an execution one of this engine's orders claims under that order's id", () => {
+    expect(executionClientOrderId('co-nuuixl118-7', 'STK', 'exec-1')).toBe('co-nuuixl118-7');
+  });
+
+  it('forwards an unclaimed stock execution as a manual fill keyed by its execution id', () => {
+    expect(executionClientOrderId(null, 'STK', '00025b46.6ac775ab.01.01')).toBe(
+      'manual-00025b46.6ac775ab.01.01',
+    );
+  });
+
+  it('discards an unclaimed option execution — it is not shares of the underlying', () => {
+    expect(executionClientOrderId(null, 'OPT', 'exec-2')).toBeNull();
+  });
+
+  it('discards an unclaimed execution with no execution id to dedupe replays on', () => {
+    expect(executionClientOrderId(null, 'STK', undefined)).toBeNull();
   });
 });
 

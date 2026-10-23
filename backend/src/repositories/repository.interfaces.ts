@@ -88,6 +88,35 @@ export interface FillRepository {
    * for one execution would double a position the broker holds once.
    */
   findByFillId(fillId: string): Promise<Fill | null>;
+  /**
+   * Sets the commission on an already-recorded fill; false when no fill has
+   * that id.
+   *
+   * IB reports commission on its own event, after the execution, so every fill
+   * is saved with 0 and corrected here. Touches only the commission — a fill's
+   * quantity and price are what routing and reconciliation read, and nothing
+   * on this path may change them.
+   */
+  updateCommission(fillId: string, commission: number): Promise<boolean>;
+  clear(): Promise<void>;
+}
+
+/** IB's reported position for one symbol at one instant. */
+export interface PositionSnapshotRecord {
+  takenAt: string;
+  symbol: string;
+  quantity: number;
+  averageCost: number;
+}
+
+/**
+ * Append-only history of IB's `(quantity, averageCost)` per symbol — the
+ * anchors realized P&L is replayed from. One `takenAt` is one batch.
+ */
+export interface PositionSnapshotRepository {
+  saveBatch(rows: PositionSnapshotRecord[]): Promise<void>;
+  /** Every row, ordered by `takenAt` then symbol. */
+  findAll(): Promise<PositionSnapshotRecord[]>;
   clear(): Promise<void>;
 }
 
@@ -386,6 +415,7 @@ export const BAR_REPOSITORY = Symbol('BAR_REPOSITORY');
 export const ORDER_INTENT_REPOSITORY = Symbol('ORDER_INTENT_REPOSITORY');
 export const ORDER_REPOSITORY = Symbol('ORDER_REPOSITORY');
 export const FILL_REPOSITORY = Symbol('FILL_REPOSITORY');
+export const POSITION_SNAPSHOT_REPOSITORY = Symbol('POSITION_SNAPSHOT_REPOSITORY');
 export const LOT_REPOSITORY = Symbol('LOT_REPOSITORY');
 export const RUNG_REPOSITORY = Symbol('RUNG_REPOSITORY');
 export const GRID_LOT_REPOSITORY = Symbol('GRID_LOT_REPOSITORY');

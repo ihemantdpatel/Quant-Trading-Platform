@@ -28,6 +28,7 @@ const ENDPOINTS = [
   '/fills',
   '/risk-events',
   '/strategies',
+  '/reports/pnl/realized',
 ];
 
 /**
@@ -50,8 +51,13 @@ function mockFetch(failing: string[] = []): jest.Mock {
       return { ok: false, status: 503, json: async () => ({ message: 'broker unavailable' }) };
     }
 
-    // `/status` is the only non-array body among these reads.
-    const body = path === '/status' ? { mode: 'PAPER', broker: {}, halts: {} } : [{ path }];
+    // `/status` and the realized P&L report are the non-array bodies here.
+    const body =
+      path === '/status'
+        ? { mode: 'PAPER', broker: {}, halts: {} }
+        : path === '/reports/pnl/realized'
+          ? { date: '2026-10-05', sells: [] }
+          : [{ path }];
 
     return { ok: true, status: 200, json: async () => body };
   });
@@ -116,6 +122,18 @@ describe('loadExecution', () => {
         status: false,
       }),
     );
+  });
+
+  // The realized figure must not read as $0 when its read failed — the panel
+  // needs to know it is unknown, not quiet.
+  it('flags a failed realized P&L read and leaves it null', async () => {
+    global.fetch = mockFetch(['/reports/pnl/realized']) as unknown as typeof fetch;
+
+    const data = await loadExecution('nuuixl118');
+
+    expect(data.realized).toBeNull();
+    expect(data.unavailable?.realized).toBe(true);
+    expect(data.unavailable?.lots).toBe(false);
   });
 
   it('reports nothing unavailable on a healthy load', async () => {

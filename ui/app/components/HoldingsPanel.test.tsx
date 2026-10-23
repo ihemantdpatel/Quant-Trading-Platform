@@ -58,6 +58,38 @@ describe('HoldingsPanel', () => {
     expect(screen.queryByTestId('lot-row-TQQQ-lot-1')).not.toBeInTheDocument();
   });
 
+  it('shows today’s average-cost sells on their own tab', async () => {
+    const user = userEvent.setup();
+    const zero = { trades: 0, gross: 0, commissions: 0, net: 0 };
+    const coverage = {
+      trackedSince: '2026-10-01T16:20:00.000-04:00',
+      tracked: true,
+      partial: false,
+    };
+    render(
+      <HoldingsPanel
+        holdings={[lot()]}
+        allLots={[lot()]}
+        mark={100}
+        realized={{
+          date: '2026-10-05',
+          sells: [],
+          totals: zero,
+          held: [],
+          monthToDate: zero,
+          coverage,
+          monthCoverage: coverage,
+          mismatches: [],
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole('tab', { name: 'Sells today (0)' }));
+
+    expect(screen.getByText('No sells today.')).toBeInTheDocument();
+    expect(screen.queryByTestId('lot-row-TQQQ-lot-1')).not.toBeInTheDocument();
+  });
+
   it('reports the counts of each view in its tab label', () => {
     const held = lot();
     const closed = lot({

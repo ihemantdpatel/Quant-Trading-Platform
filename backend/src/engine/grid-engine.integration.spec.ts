@@ -16,6 +16,7 @@
 
 import { FillMode, MockBrokerAdapter } from '../broker/mock/mock-broker.adapter';
 import { ExecutionMode } from '../config/execution-mode';
+import { manualFillClientOrderId } from '../domain/client-order-id';
 import { equityContract } from '../domain/contract';
 import { ReplayService } from '../market-data/mock/replay.service';
 import { Bar, BarSize } from '../market-data/types';
@@ -82,6 +83,7 @@ async function buildEngine(options: { fillMode?: FillMode } = {}) {
   );
 
   const gridLots = new InMemoryGridLotRepository();
+  const halts = new SymbolHaltService();
   const engine = new EngineService(
     new ReplayService(),
     coordinator,
@@ -93,14 +95,14 @@ async function buildEngine(options: { fillMode?: FillMode } = {}) {
     new InMemoryLotRepository(),
     new InMemoryRungRepository(),
     ExecutionMode.PAPER,
-    new SymbolHaltService(),
+    halts,
     null,
     gridLots,
   );
 
   await coordinator.initializeAll('2026-08-14T09:30:00.000-04:00');
 
-  return { engine, broker, coordinator, grid, gridLots, config };
+  return { engine, broker, coordinator, grid, gridLots, config, halts };
 }
 
 function gridLotsOf(coordinator: CoordinatorService, grid: GridStrategy) {
@@ -370,5 +372,387 @@ describe('grid strategy — engine integration', () => {
     expect(lots[0].fillPrice).toBe(95);
     expect(lots[0].quantity).toBe(10);
     expect(lots[0].sellTarget).toBe(96);
+  });
+
+  it('opens a lot for the remainder of a split fill that arrives after the partial-fill cancel', async () => {
+    const { engine, coordinator, grid, broker } = await buildEngine({
+      fillMode: FillMode.RESTING,
+    });
+
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    const [entry] = await broker.getOpenOrders();
+    expect(entry).toMatchObject({ side: 'BUY', quantity: 10 });
+
+    // IB reports one 10-share execution as 9 + 1. The first reads as a
+    // partial, so the engine cancels the remainder — but at IB it already
+    // filled, and its report arrives once the order is gone from the book.
+    broker.fillResting(entry.clientOrderId, 9, 100.05, '2026-08-14T09:30:01.000-04:00');
+    await flush();
+    expect(await broker.getOpenOrders()).toEqual(
+      expect.not.arrayContaining([expect.objectContaining({ clientOrderId: entry.clientOrderId })]),
+    );
+
+    broker.deliverFill({
+      fillId: 'exec-remainder',
+      clientOrderId: entry.clientOrderId,
+      brokerOrderId: 'ib-remainder',
+      symbol: SYMBOL,
+      side: 'BUY',
+      quantity: 1,
+      price: 100.05,
+      commission: 0,
+      timestamp: '2026-08-14T09:30:01.000-04:00',
+    });
+    await flush();
+
+    const held = gridLotsOf(coordinator, grid).filter((lot) => lot.status === GridLotStatus.HELD);
+    expect(held.map((lot) => lot.quantity).sort((a, b) => a - b)).toEqual([1, 9]);
+  });
+
+  it('cancels its own resting buys at levels a fill has superseded, leaving at most maxBuyLevels', async () => {
+    const { engine, broker } = await buildEngine();
+
+    const restingBuys = async () =>
+      (await broker.getOpenOrders())
+        .filter((o) => o.side === 'BUY')
+        .map((o) => o.limitPrice)
+        .sort((a, b) => a - b);
+
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+    expect(await restingBuys()).toEqual([98, 99]);
+
+    // The 99 dip-buy fills; levels move down to 97/98.
+    await engine.processBar(bar(99, '2026-08-14T09:31:00.000-04:00'));
+    await flush();
+    expect(await restingBuys()).toEqual([97, 98]);
+
+    // That lot's sell at 100 fills; the lowest held lot is back at 100, so
+    // 97 is no longer a level and must not keep resting.
+    await engine.processBar(bar(100.5, '2026-08-14T09:32:00.000-04:00'));
+    await flush();
+    expect(await restingBuys()).toEqual([98, 99]);
+  });
+
+  it("re-buys at a sold lot's own fill when selling it strands every stepped level above the market", async () => {
+    // The 2026-10-07 shape: the day's pegged buy sells, the lowest held lot
+    // is now far above the market, and without the re-buy nothing rests.
+    const { engine, coordinator, grid, broker } = await buildEngine();
+
+    const restingBuys = async () =>
+      (await broker.getOpenOrders())
+        .filter((o) => o.side === 'BUY')
+        .map((o) => o.limitPrice)
+        .sort((a, b) => a - b);
+
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    // DAY expiry of the first session's buys.
+    for (const order of await broker.getOpenOrders()) {
+      if (order.side === 'BUY') {
+        await broker.cancel(order.clientOrderId);
+      }
+    }
+    await flush();
+
+    // Gap down: 99 (avg 100 − gap) is through the market, so the day's first
+    // buy pegs to 95; its fill then steps 94/93 below it.
+    await engine.processBar(bar(95, '2026-08-17T09:30:00.000-04:00'));
+    await flush();
+    expect(await restingBuys()).toEqual([93, 94]);
+
+    // The 95 lot sells at 96. Lowest held is 100 again, so 99/98 are both
+    // above a 96.5 market and skipped — the re-buy at 95 is what rests.
+    await engine.processBar(bar(96.5, '2026-08-17T09:31:00.000-04:00'));
+    await flush();
+    expect(await restingBuys()).toEqual([95]);
+
+    // It fills on the next dip and stepping resumes from the new lowest lot.
+    await engine.processBar(bar(95, '2026-08-17T09:32:00.000-04:00'));
+    await flush();
+
+    const held = gridLotsOf(coordinator, grid).filter((l) => l.status === GridLotStatus.HELD);
+    expect(held.map((l) => l.fillPrice).sort((a, b) => a - b)).toEqual([95, 100]);
+    expect(await restingBuys()).toEqual([93, 94]);
+  });
+
+  describe('a recompute skipped because open orders could not be read', () => {
+    // The 2026-10-05 incident: a sell fill and a socket drop in the same
+    // second. The fill's recompute skipped its buy, the grid was flat with
+    // nothing resting — so no fill could ever trigger another recompute — and
+    // `onBar` had already used its once-per-session decision.
+    function failOpenOrdersWhile(broker: MockBrokerAdapter) {
+      const real = broker.getOpenOrders.bind(broker);
+      const control = { failing: false };
+
+      jest.spyOn(broker, 'getOpenOrders').mockImplementation(async () => {
+        if (control.failing) {
+          throw new Error('IB not connected — cannot list open orders');
+        }
+        return real();
+      });
+
+      return control;
+    }
+
+    it('retries on the next regular-session bar, re-entering the flat grid', async () => {
+      const { engine, broker, coordinator, grid } = await buildEngine();
+      const ib = failOpenOrdersWhile(broker);
+
+      await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+      await flush();
+
+      // The only lot's sell fills while IB cannot answer; the recompute's
+      // flat-entry buy is skipped.
+      ib.failing = true;
+      await engine.processBar(bar(101, '2026-08-14T09:31:00.000-04:00'));
+      await flush();
+
+      expect(gridLotsOf(coordinator, grid).filter((l) => l.status === GridLotStatus.HELD)).toEqual(
+        [],
+      );
+
+      ib.failing = false;
+      await engine.processBar(bar(101.2, '2026-08-14T09:32:00.000-04:00'));
+      await flush();
+
+      const held = gridLotsOf(coordinator, grid).filter((l) => l.status === GridLotStatus.HELD);
+      expect(held).toHaveLength(1);
+      expect(held[0].workingOrderId).not.toBeNull();
+
+      // The retry ran the full recompute, so the stale dip-buys the failed
+      // cancel left behind are gone too.
+      expect(
+        (await broker.getOpenOrders())
+          .filter((o) => o.side === 'BUY')
+          .map((o) => o.limitPrice)
+          .sort((a, b) => a - b),
+      ).toEqual([held[0].fillPrice - 2, held[0].fillPrice - 1]);
+    });
+
+    it('keeps retrying while open orders stay unreadable', async () => {
+      const { engine, broker, coordinator, grid } = await buildEngine();
+      const ib = failOpenOrdersWhile(broker);
+
+      await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+      await flush();
+
+      ib.failing = true;
+      await engine.processBar(bar(101, '2026-08-14T09:31:00.000-04:00'));
+      await flush();
+      await engine.processBar(bar(101, '2026-08-14T09:32:00.000-04:00'));
+      await flush();
+
+      ib.failing = false;
+      await engine.processBar(bar(101, '2026-08-14T09:33:00.000-04:00'));
+      await flush();
+
+      expect(
+        gridLotsOf(coordinator, grid).filter((l) => l.status === GridLotStatus.HELD),
+      ).toHaveLength(1);
+    });
+
+    it('does not retry from an after-hours bar, where a DAY order would rest at a stale price', async () => {
+      const { engine, broker, coordinator, grid } = await buildEngine();
+      const ib = failOpenOrdersWhile(broker);
+
+      await engine.processBar(bar(100, '2026-08-14T15:58:00.000-04:00'));
+      await flush();
+
+      ib.failing = true;
+      await engine.processBar(bar(101, '2026-08-14T15:59:00.000-04:00'));
+      await flush();
+
+      ib.failing = false;
+      await engine.processBar(bar(101, '2026-08-14T16:30:00.000-04:00'));
+      await flush();
+
+      expect(gridLotsOf(coordinator, grid).filter((l) => l.status === GridLotStatus.HELD)).toEqual(
+        [],
+      );
+      // Only the dip-buys the failed cancel left behind — no re-entry buy.
+      expect(
+        (await broker.getOpenOrders())
+          .filter((o) => o.side === 'BUY')
+          .map((o) => o.limitPrice)
+          .sort((a, b) => a - b),
+      ).toEqual([98, 99]);
+    });
+  });
+
+  it('never cancels a resting buy it did not place', async () => {
+    const { engine, broker } = await buildEngine();
+
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    // Placed by hand in TWS: resting at the broker, no Order row.
+    await broker.submit({
+      clientOrderId: 'manual-tws',
+      contract: equityContract(SYMBOL),
+      side: 'BUY',
+      quantity: 10,
+      orderType: 'LMT',
+      limitPrice: 90,
+      timeInForce: 'DAY',
+      timestamp: '2026-08-14T09:30:30.000-04:00',
+    });
+
+    await engine.processBar(bar(99, '2026-08-14T09:31:00.000-04:00'));
+    await flush();
+
+    expect((await broker.getOpenOrders()).map((o) => o.clientOrderId)).toContain('manual-tws');
+  });
+});
+
+describe('grid strategy — trades placed by hand in TWS', () => {
+  // The 2026-10-08 incident: a manual 100-share buy was discarded as "not
+  // ours", and the next reconciliation halted TQQQ on a lot-sum mismatch.
+  function manualFill(
+    side: 'BUY' | 'SELL',
+    quantity: number,
+    price: number,
+    execId: string,
+    timestamp = '2026-08-14T10:00:00.000-04:00',
+  ) {
+    return {
+      fillId: execId,
+      clientOrderId: manualFillClientOrderId(execId),
+      brokerOrderId: '0',
+      symbol: SYMBOL,
+      side,
+      quantity,
+      price,
+      commission: 0,
+      timestamp,
+    };
+  }
+
+  function held(coordinator: CoordinatorService, grid: GridStrategy) {
+    return gridLotsOf(coordinator, grid).filter((lot) => lot.status === GridLotStatus.HELD);
+  }
+
+  /** Total SELL quantity resting must never exceed the shares the grid holds. */
+  async function restingSellQuantity(broker: MockBrokerAdapter): Promise<number> {
+    return (await broker.getOpenOrders())
+      .filter((o) => o.side === 'SELL')
+      .reduce((sum, o) => sum + o.quantity - o.filledQuantity, 0);
+  }
+
+  // Manual prices sit at or above the mock's market (100) so the adopted
+  // lot's sell rests rather than filling on arrival in `MARKET_AWARE` mode.
+  it('adopts a manual buy as a lot at its real fill price and rests its sell', async () => {
+    const { engine, broker, coordinator, grid } = await buildEngine();
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    broker.deliverFill(manualFill('BUY', 10, 100.2, 'exec-manual-buy'));
+    await flush();
+
+    const lots = held(coordinator, grid);
+    expect(lots.map((lot) => lot.fillPrice).sort((a, b) => a - b)).toEqual([100, 100.2]);
+
+    const adopted = lots.find((lot) => lot.fillPrice === 100.2)!;
+    expect(adopted.sellTarget).toBe(101.2);
+    expect(adopted.workingOrderId).not.toBeNull();
+  });
+
+  it('does not adopt the same execution twice when IB replays it', async () => {
+    const { engine, broker, coordinator, grid } = await buildEngine();
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    broker.deliverFill(manualFill('BUY', 10, 100.2, 'exec-replayed'));
+    await flush();
+    broker.replayFill(manualFillClientOrderId('exec-replayed'));
+    await flush();
+
+    expect(held(coordinator, grid)).toHaveLength(2);
+  });
+
+  it('closes held lots cheapest first on a manual sell, cancelling their resting sells', async () => {
+    const { engine, broker, coordinator, grid } = await buildEngine();
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+    broker.deliverFill(manualFill('BUY', 10, 100.2, 'exec-buy'));
+    await flush();
+
+    broker.deliverFill(manualFill('SELL', 15, 100, 'exec-sell'));
+    await flush();
+
+    // 10 of the 100.00 lot, then 5 of the 100.20 lot; 5 remain, with a
+    // fresh sell for exactly those 5.
+    const lots = held(coordinator, grid);
+    expect(lots).toEqual([expect.objectContaining({ fillPrice: 100.2, quantity: 5 })]);
+    expect(await restingSellQuantity(broker)).toBe(5);
+  });
+
+  it('leaves a manual sell larger than the grid holds for reconciliation, with one alert', async () => {
+    const { engine, broker, coordinator, grid } = await buildEngine();
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    broker.deliverFill(manualFill('SELL', 50, 99, 'exec-too-big'));
+    await flush();
+    broker.replayFill(manualFillClientOrderId('exec-too-big'));
+    await flush();
+
+    expect(held(coordinator, grid)).toEqual([expect.objectContaining({ quantity: 10 })]);
+    expect(engine.activeAlerts().filter((a) => a.code === 'MANUAL_SELL_UNADOPTED')).toHaveLength(1);
+  });
+
+  it('defers a manual fill that arrives before the live path has started, adopting it on replay', async () => {
+    const { engine, broker, coordinator, grid } = await buildEngine();
+
+    broker.deliverFill(manualFill('BUY', 10, 100.2, 'exec-early', '2026-08-14T09:29:00.000-04:00'));
+    await flush();
+    expect(held(coordinator, grid)).toEqual([]);
+
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+    broker.replayFill(manualFillClientOrderId('exec-early'));
+    await flush();
+
+    expect(held(coordinator, grid).map((lot) => lot.fillPrice)).toContain(100.2);
+  });
+
+  it('defers a manual fill while the symbol is halted', async () => {
+    const { engine, broker, coordinator, grid, halts } = await buildEngine();
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+
+    halts.halt(SYMBOL, 'GRID_LOT_SUM_MISMATCH', 'test', '2026-08-14T09:45:00.000-04:00');
+    broker.deliverFill(manualFill('BUY', 10, 100.2, 'exec-halted'));
+    await flush();
+
+    expect(held(coordinator, grid)).toHaveLength(1);
+  });
+});
+
+describe('grid strategy — restart mid-session', () => {
+  it("cancels the previous process's buys that the first bar's levels no longer include", async () => {
+    const { engine, broker, coordinator, grid } = await buildEngine();
+    await engine.processBar(bar(100, '2026-08-14T09:30:00.000-04:00'));
+    await flush();
+    const before = (await broker.getOpenOrders()).filter((o) => o.side === 'BUY');
+    expect(before.map((o) => o.limitPrice).sort((a, b) => a - b)).toEqual([98, 99]);
+
+    // A restart forgets `sessionDate`, so the next bar decides again — here
+    // from a lowest held lot that has moved to 99.50 since.
+    coordinator.getState(grid.id)!.data.sessionDate = null;
+    GridStrategy.openLotFromFill(coordinator.getState(grid.id)!, grid.parameters, {
+      price: 99.5,
+      quantity: 10,
+      at: '2026-08-14T09:40:00.000-04:00',
+    });
+
+    await engine.processBar(bar(100, '2026-08-14T09:45:00.000-04:00'));
+    await flush();
+
+    const after = (await broker.getOpenOrders()).filter((o) => o.side === 'BUY');
+    expect(after.map((o) => o.limitPrice).sort((a, b) => a - b)).toEqual([97.5, 98.5]);
   });
 });

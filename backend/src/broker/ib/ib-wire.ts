@@ -25,6 +25,7 @@ import {
 } from '@stoqey/ib';
 import { DateTime } from 'luxon';
 import { maskAccountId } from '../../config/account-registration';
+import { manualFillClientOrderId } from '../../domain/client-order-id';
 import { Contract, SecurityType } from '../../domain/contract';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
@@ -109,8 +110,8 @@ export function toIbOrder(order: BrokerOrder, account?: string): IbOrder {
  * alike. The map stays as a fallback for orders placed before this was set.
  *
  * An execution with neither is not ours — a manual TWS order on the same
- * account — and is still discarded, deliberately: adopting it would attach a
- * lot to a position the ladder does not own.
+ * account. This function still returns null for it; whether such an execution
+ * is forwarded at all is `executionClientOrderId`'s decision.
  *
  * Lives here rather than in the socket for the same reason `LiveBarGate` does.
  * The socket body is excluded from coverage as Gateway-dependent, and a
@@ -137,6 +138,32 @@ export function resolveClientOrderId(
   }
 
   return null;
+}
+
+/**
+ * The `clientOrderId` an execution is routed under, or null to discard it.
+ *
+ * An execution none of this engine's orders claims is a trade placed by hand
+ * in TWS. It is forwarded as a manual fill rather than discarded: IB is the
+ * source of truth on what the account holds, and dropping it guaranteed a
+ * lot-sum halt at the next reconciliation (2026-10-08). The engine decides
+ * whether it can adopt it. **Stocks only** — a manual option on the same
+ * underlying reports the same symbol and must never read as shares.
+ */
+export function executionClientOrderId(
+  resolved: string | null,
+  secType: string | undefined,
+  execId: string | undefined,
+): string | null {
+  if (resolved) {
+    return resolved;
+  }
+
+  if (secType !== SecurityType.STOCK || !execId) {
+    return null;
+  }
+
+  return manualFillClientOrderId(execId);
 }
 
 /**

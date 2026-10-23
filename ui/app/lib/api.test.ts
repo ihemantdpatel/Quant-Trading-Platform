@@ -18,7 +18,6 @@ import {
   lotAge,
   totalDeployedCost,
   totalHeldQuantity,
-  totalRealized,
   formatCurrency,
   formatPercent,
   type Fill,
@@ -86,16 +85,6 @@ describe('distanceToTarget', () => {
 });
 
 describe('totals', () => {
-  it('sums realized P&L across completed cycles only', () => {
-    const lots = [
-      lot({ id: 'a', status: 'CLOSED', realized: 47.5 }),
-      lot({ id: 'b', status: 'CLOSED', realized: 22.25 }),
-      lot({ id: 'c' }),
-    ];
-
-    expect(totalRealized(lots)).toBe(69.75);
-  });
-
   it('counts only held shares and their cost', () => {
     const lots = [
       lot({ id: 'a', quantity: 10, fillPrice: 95 }),

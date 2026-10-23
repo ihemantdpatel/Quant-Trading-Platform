@@ -30,6 +30,7 @@ import {
   runOrderRepositoryContract,
   runParameterChangeRepositoryContract,
   runPerSymbolLimitChangeRepositoryContract,
+  runPositionSnapshotRepositoryContract,
   runRiskEventRepositoryContract,
   runRungRepositoryContract,
   runStrategyStateSnapshotRepositoryContract,
@@ -46,6 +47,7 @@ import {
   PrismaOrderRepository,
   PrismaParameterChangeRepository,
   PrismaPerSymbolLimitChangeRepository,
+  PrismaPositionSnapshotRepository,
   PrismaRiskEventRepository,
   PrismaRungRepository,
   PrismaStrategyStateSnapshotRepository,
@@ -109,6 +111,11 @@ describeWithDatabase('Prisma repositories', () => {
   runFillRepositoryContract(async () => {
     await resetDatabase(prisma);
     return new PrismaFillRepository(asService(prisma));
+  });
+
+  runPositionSnapshotRepositoryContract(async () => {
+    await resetDatabase(prisma);
+    return new PrismaPositionSnapshotRepository(asService(prisma));
   });
 
   runRiskEventRepositoryContract(async () => {

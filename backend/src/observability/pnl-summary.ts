@@ -1,17 +1,16 @@
 /**
- * Realized P&L summaries for the daily and monthly emails — pure, no I/O.
+ * Realized P&L summaries for the daily and monthly emails and the dashboard —
+ * pure, no I/O.
  *
- * **A trade is one closed grid lot**: its own buy fill paired with its own sell.
- * That is the unit the grid already records, and the only one where "gain" is
- * well-defined without guessing at a pairing. The dip ladder is retired and its
- * `Lot` rows are not read here.
+ * **Average cost, by IB's method from our own count** (`average-cost-pnl.ts`). A trade is
+ * one SELL fill, realizing `(sell − average cost) × quantity − commission`. It
+ * is not one closed grid lot: pairing a sell with the lot it closed reports a
+ * gain IB never shows. That makes the figure per **symbol**, across every
+ * strategy, since IB keeps one average per position — a per-strategy split of
+ * one average would be invented.
  *
- * **Gross per trade, commissions separately.** A `GridLot` carries no
- * commission, and joining each lot back to its entry and exit `Fill`s would need
- * order ids the lot does not keep. Commissions are therefore summed cash-basis —
- * every fill whose timestamp falls in the period, entries for still-held lots
- * included — and net is gross less that. Exact, if pessimistic on a day that
- * opens more than it closes.
+ * Buy commissions are inside the average, so `commissions` here are the sells'
+ * only; counting buys again would charge them twice.
  *
  * Days are ET calendar dates. Timestamps are stored in mixed offsets (`…Z` on
  * older rows, `…-04:00` on newer), so every one is normalized to ET before it is
@@ -22,36 +21,13 @@
 import { DateTime } from 'luxon';
 import { Fill } from '../broker/broker-adapter.interface';
 import { ET_ZONE } from '../market-data/types';
-import { GridLot, GridLotStatus } from '../strategies/grid/lot';
+import { PositionSnapshotRecord } from '../repositories/repository.interfaces';
+import { BasisMismatch, buildLedger, cents, Holding, SellRow } from './average-cost-pnl';
 
-/** A grid lot with the strategy and symbol its repository row carries. */
-export interface AttributedGridLot {
-  strategyId: string;
-  symbol: string;
-  lot: GridLot;
-}
-
-export interface TradeRow {
-  lotId: string;
-  symbol: string;
-  strategyId: string;
-  quantity: number;
-  buyPrice: number;
-  sellPrice: number;
-  openedAt: string;
-  closedAt: string;
-  /** `(sellPrice − buyPrice) × quantity`, rounded to cents. */
-  gain: number;
-}
-
-export interface HeldRow {
-  symbol: string;
-  strategyId: string;
-  lots: number;
-  quantity: number;
-}
+export { cents };
 
 export interface PnlTotals {
+  /** SELL fills realized. */
   trades: number;
   gross: number;
   commissions: number;
@@ -63,43 +39,56 @@ export interface DayTotals extends PnlTotals {
   date: string;
 }
 
-export interface StrategyTotals {
+export interface SymbolTotals {
   symbol: string;
-  strategyId: string;
   trades: number;
-  gross: number;
+  net: number;
+}
+
+/**
+ * How much of a period the average-cost replay can speak for. Nothing before
+ * the first IB snapshot is tracked, and an untracked day is reported as such —
+ * never as a quiet $0.
+ */
+export interface Coverage {
+  trackedSince: string | null;
+  /** False when the whole period ends before tracking began. */
+  tracked: boolean;
+  /** True when tracking began after the period started. */
+  partial: boolean;
 }
 
 export interface DailyPnl {
   date: string;
-  trades: TradeRow[];
+  sells: SellRow[];
   totals: PnlTotals;
-  held: HeldRow[];
+  /** Positions at the end of the day, by symbol. */
+  held: Holding[];
   monthToDate: PnlTotals;
+  coverage: Coverage;
+  monthCoverage: Coverage;
+  mismatches: BasisMismatch[];
 }
 
 export interface PeriodPnl {
   /** Inclusive ET dates, `yyyy-MM-dd`. */
   from: string;
   to: string;
-  /** Days with at least one closed trade or commission, ascending. */
+  /** Days with at least one sell, ascending. */
   days: DayTotals[];
-  byStrategy: StrategyTotals[];
+  bySymbol: SymbolTotals[];
   totals: PnlTotals;
+  coverage: Coverage;
+  mismatches: BasisMismatch[];
 }
 
 export interface PnlInputs {
-  lots: AttributedGridLot[];
+  snapshots: PositionSnapshotRecord[];
   fills: Fill[];
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_MONTH = /^\d{4}-\d{2}$/;
-
-/** Rounds to cents; `EPSILON` keeps `1.005` from rounding down. */
-export function cents(value: number): number {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
-}
 
 /** The ET calendar date of an ISO timestamp in any offset. */
 export function etDateOf(timestamp: string): string {
@@ -126,120 +115,80 @@ export function monthRange(month: string): { from: string; to: string } {
   return { from: start.toISODate()!, to: start.endOf('month').toISODate()! };
 }
 
-/** Closed trades whose ET close date lies in `[from, to]`, in close order. */
-export function tradesBetween(lots: AttributedGridLot[], from: string, to: string): TradeRow[] {
-  return lots
-    .filter(
-      ({ lot }) =>
-        lot.status === GridLotStatus.CLOSED && lot.closedAt !== null && lot.exitPrice !== null,
-    )
-    .map(({ strategyId, symbol, lot }) => ({
-      date: etDateOf(lot.closedAt!),
-      row: {
-        lotId: lot.id,
-        symbol,
-        strategyId,
-        quantity: lot.quantity,
-        buyPrice: lot.fillPrice,
-        sellPrice: lot.exitPrice!,
-        openedAt: lot.openedAt,
-        closedAt: lot.closedAt!,
-        gain: cents((lot.exitPrice! - lot.fillPrice) * lot.quantity),
-      },
-    }))
-    .filter(({ date }) => date >= from && date <= to)
-    .map(({ row }) => row)
-    .sort(
-      (a, b) =>
-        DateTime.fromISO(a.closedAt).toMillis() - DateTime.fromISO(b.closedAt).toMillis() ||
-        a.lotId.localeCompare(b.lotId),
-    );
+function endOfEtDay(date: string): string {
+  return DateTime.fromISO(date, { zone: ET_ZONE }).endOf('day').toISO()!;
 }
 
-function commissionsByDate(fills: Fill[], from: string, to: string): Map<string, number> {
-  const byDate = new Map<string, number>();
-
-  for (const fill of fills) {
-    const date = etDateOf(fill.timestamp);
-
-    if (date >= from && date <= to) {
-      byDate.set(date, (byDate.get(date) ?? 0) + fill.commission);
-    }
+function coverageOf(trackedSince: string | null, from: string, to: string): Coverage {
+  if (trackedSince === null) {
+    return { trackedSince, tracked: false, partial: false };
   }
 
-  return byDate;
+  const since = DateTime.fromISO(trackedSince, { setZone: true });
+  const start = DateTime.fromISO(from, { zone: ET_ZONE }).startOf('day');
+  const end = DateTime.fromISO(to, { zone: ET_ZONE }).endOf('day');
+
+  return { trackedSince, tracked: since <= end, partial: since > start && since <= end };
 }
 
-function totalsOf(trades: TradeRow[], commissions: number): PnlTotals {
-  // Summing the already-rounded per-trade gains keeps the total equal to the
+function totalsOf(sells: SellRow[]): PnlTotals {
+  // Summing the already-rounded per-sell figures keeps each total equal to the
   // column a reader adds up by eye.
-  const gross = cents(trades.reduce((sum, trade) => sum + trade.gain, 0));
-  const paid = cents(commissions);
-  return { trades: trades.length, gross, commissions: paid, net: cents(gross - paid) };
+  return {
+    trades: sells.length,
+    gross: cents(sells.reduce((sum, sell) => sum + sell.gross, 0)),
+    commissions: cents(sells.reduce((sum, sell) => sum + sell.commission, 0)),
+    net: cents(sells.reduce((sum, sell) => sum + sell.realized, 0)),
+  };
 }
 
-/** Realized P&L over an inclusive ET date range, bucketed by day. */
+function inRange(timestamp: string, from: string, to: string): boolean {
+  const date = etDateOf(timestamp);
+  return date >= from && date <= to;
+}
+
+/** Realized P&L over an inclusive ET date range, bucketed by day and symbol. */
 export function buildPeriodPnl(inputs: PnlInputs, from: string, to: string): PeriodPnl {
-  const trades = tradesBetween(inputs.lots, from, to);
-  const commissions = commissionsByDate(inputs.fills, from, to);
+  const ledger = buildLedger(inputs.snapshots, inputs.fills, endOfEtDay(to));
+  const sells = ledger.sells.filter((sell) => inRange(sell.timestamp, from, to));
 
-  const tradesByDate = new Map<string, TradeRow[]>();
-  for (const trade of trades) {
-    const date = etDateOf(trade.closedAt);
-    tradesByDate.set(date, [...(tradesByDate.get(date) ?? []), trade]);
+  const byDate = new Map<string, SellRow[]>();
+  const bySymbol = new Map<string, SellRow[]>();
+  for (const sell of sells) {
+    const date = etDateOf(sell.timestamp);
+    byDate.set(date, [...(byDate.get(date) ?? []), sell]);
+    bySymbol.set(sell.symbol, [...(bySymbol.get(sell.symbol) ?? []), sell]);
   }
-
-  const dates = [...new Set([...tradesByDate.keys(), ...commissions.keys()])].sort();
-  const days = dates.map((date) => ({
-    date,
-    ...totalsOf(tradesByDate.get(date) ?? [], commissions.get(date) ?? 0),
-  }));
-
-  const byKey = new Map<string, StrategyTotals>();
-  for (const trade of trades) {
-    const existing = byKey.get(trade.strategyId) ?? {
-      symbol: trade.symbol,
-      strategyId: trade.strategyId,
-      trades: 0,
-      gross: 0,
-    };
-    existing.trades += 1;
-    existing.gross = cents(existing.gross + trade.gain);
-    byKey.set(trade.strategyId, existing);
-  }
-
-  const commissionTotal = [...commissions.values()].reduce((sum, value) => sum + value, 0);
 
   return {
     from,
     to,
-    days,
-    byStrategy: [...byKey.values()].sort((a, b) => a.strategyId.localeCompare(b.strategyId)),
-    totals: totalsOf(trades, commissionTotal),
+    days: [...byDate.keys()].sort().map((date) => ({ date, ...totalsOf(byDate.get(date)!) })),
+    bySymbol: [...bySymbol.keys()].sort().map((symbol) => {
+      const totals = totalsOf(bySymbol.get(symbol)!);
+      return { symbol, trades: totals.trades, net: totals.net };
+    }),
+    totals: totalsOf(sells),
+    coverage: coverageOf(ledger.trackedSince, from, to),
+    mismatches: ledger.mismatches.filter((m) => inRange(m.takenAt, from, to)),
   };
 }
 
-/** One ET day's trades, its held positions, and the month to date. */
+/** One ET day's sells, its closing positions, and the month to date. */
 export function buildDailyPnl(inputs: PnlInputs, date: string): DailyPnl {
-  const day = buildPeriodPnl(inputs, date, date);
+  const ledger = buildLedger(inputs.snapshots, inputs.fills, endOfEtDay(date));
+  const sells = ledger.sells.filter((sell) => etDateOf(sell.timestamp) === date);
   const monthStart = DateTime.fromISO(date, { zone: ET_ZONE }).startOf('month').toISODate()!;
-
-  const heldByStrategy = new Map<string, HeldRow>();
-  for (const { strategyId, symbol, lot } of inputs.lots) {
-    if (lot.status !== GridLotStatus.HELD) {
-      continue;
-    }
-    const row = heldByStrategy.get(strategyId) ?? { symbol, strategyId, lots: 0, quantity: 0 };
-    row.lots += 1;
-    row.quantity += lot.quantity;
-    heldByStrategy.set(strategyId, row);
-  }
+  const month = ledger.sells.filter((sell) => inRange(sell.timestamp, monthStart, date));
 
   return {
     date,
-    trades: tradesBetween(inputs.lots, date, date),
-    totals: day.totals,
-    held: [...heldByStrategy.values()].sort((a, b) => a.strategyId.localeCompare(b.strategyId)),
-    monthToDate: buildPeriodPnl(inputs, monthStart, date).totals,
+    sells,
+    totals: totalsOf(sells),
+    held: ledger.holdings,
+    monthToDate: totalsOf(month),
+    coverage: coverageOf(ledger.trackedSince, date, date),
+    monthCoverage: coverageOf(ledger.trackedSince, monthStart, date),
+    mismatches: ledger.mismatches.filter((m) => etDateOf(m.takenAt) === date),
   };
 }
