@@ -41,10 +41,13 @@ import {
   IBApiNextError,
   OrderAction,
   WhatToShow,
+  SecType,
+  IBApiNextTickType,
 } from '@stoqey/ib';
 import { Observable } from 'rxjs';
 import { DateTime } from 'luxon';
-import { Contract } from '../../domain/contract';
+import { Contract, equityContract, optionContract, OptionRight } from '../../domain/contract';
+import { OptionScan, OptionQuote, liquidSessionOpen, scanStrikes } from '../../domain/options';
 import { LiveBarGate } from './live-bar-gate';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
@@ -71,6 +74,7 @@ import {
 // while this file — which cannot run without a Gateway — does not.
 import {
   durationString,
+  fromIbContract,
   parseIbTime,
   executionClientOrderId,
   resolveClientOrderId,
@@ -459,12 +463,17 @@ export class StoqeyIbSocket implements IbSocket {
    * a manual order in TWS, most likely — and adopting it would attach a rung to
    * something the ladder does not own.
    */
-  async getOpenOrders(): Promise<OpenOrder[]> {
+  async getAccountOpenOrders(): Promise<OpenOrder[]> {
+    return this.getOpenOrders(true);
+  }
+
+  async getOpenOrders(includeUntagged = false): Promise<OpenOrder[]> {
     const update = await withTimeout(this.api.getAllOpenOrders());
     const orders: OpenOrder[] = [];
 
     for (const open of update) {
-      const clientOrderId = open.order.orderRef;
+      const clientOrderId =
+        open.order.orderRef || (includeUntagged ? `external-${open.orderId}` : null);
 
       // Another account's order is not ours to adopt, even when a sibling
       // daemon's `orderRef` happens to parse — adopting it would attach this
@@ -480,6 +489,7 @@ export class StoqeyIbSocket implements IbSocket {
       this.orderIds.set(clientOrderId, open.orderId);
 
       orders.push({
+        contract: fromIbContract(open.contract),
         clientOrderId,
         brokerOrderId: String(open.orderId),
         symbol: open.contract.symbol ?? '',
@@ -556,6 +566,140 @@ export class StoqeyIbSocket implements IbSocket {
     );
   }
 
+  /** Bounded chain scan: one expiry, eight nearby strikes, four live subscriptions at a time. */
+  async scanOptions(request: Omit<OptionScan, 'quotes' | 'underlyingPrice'>): Promise<OptionScan> {
+    const stock = toIbContract(equityContract(request.symbol));
+    const details = await withTimeout(this.api.getContractDetails(stock));
+    if (details.length !== 1 || !details[0].contract?.conId)
+      throw new Error('ambiguous underlying');
+    if (!details[0].liquidHours || !details[0].timeZoneId)
+      throw new Error('exchange hours unavailable');
+    if (
+      !liquidSessionOpen(details[0].liquidHours, details[0].timeZoneId, new Date().toISOString())
+    ) {
+      return { ...request, underlyingPrice: 0, quotes: [] };
+    }
+    const stockData = await withTimeout(this.api.getMarketDataSnapshot(stock, '', false), 15000);
+    const bid = stockData.get(1)?.value;
+    const ask = stockData.get(2)?.value;
+    if (!(bid! > 0 && ask! >= bid!)) throw new Error('live underlying bid/ask unavailable');
+    const underlyingPrice = (bid! + ask!) / 2;
+    const chains = await withTimeout(
+      this.api.getSecDefOptParams(request.symbol, '', SecType.STK, details[0].contract.conId),
+    );
+    const chain = chains.find(
+      (c) => c.exchange === 'SMART' && c.multiplier === 100 && c.tradingClass === request.symbol,
+    );
+    if (!chain) throw new Error('standard SMART option chain unavailable');
+    const today = DateTime.now().setZone(ET_ZONE).startOf('day');
+    const expiry = chain.expirations
+      .slice()
+      .sort()
+      .find((e) => {
+        const dte = DateTime.fromFormat(e, 'yyyyMMdd', { zone: ET_ZONE }).diff(today, 'days').days;
+        return dte >= request.minDte && dte <= request.maxDte;
+      });
+    if (!expiry) return { ...request, underlyingPrice, quotes: [] };
+    const strikes = scanStrikes(chain.strikes, underlyingPrice, request.right, request.strikeLimit);
+    const quotes: OptionQuote[] = [];
+    for (let i = 0; i < strikes.length; i += 4) {
+      const batch = await Promise.all(
+        strikes.slice(i, i + 4).map(async (strike) => {
+          const contract = optionContract({
+            symbol: request.symbol,
+            strike,
+            expiry: DateTime.fromFormat(expiry, 'yyyyMMdd').toISODate()!,
+            right: request.right as OptionRight,
+          });
+          try {
+            return await this.optionQuote(contract);
+          } catch {
+            return null;
+          }
+        }),
+      );
+      quotes.push(...batch.filter((q): q is OptionQuote => q !== null));
+    }
+    return { ...request, underlyingPrice, quotes };
+  }
+
+  private async optionQuote(contract: Contract): Promise<OptionQuote> {
+    // OI is a generic tick: IB does not support it on snapshot requests.
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        subscription.unsubscribe();
+        reject(new Error('option quote timed out'));
+      }, 12000);
+      const subscription = this.api
+        .getMarketData(toIbContract(contract), '101', false, false)
+        .subscribe({
+          next: (update) => {
+            const ticks = [
+              update.all.get(1),
+              update.all.get(2),
+              update.all.get(IBApiNextTickType.MODEL_OPTION_DELTA),
+              update.all.get(contract.right === 'P' ? 28 : 27),
+            ];
+            if (ticks.some((t) => t?.value === undefined)) return;
+            clearTimeout(timer);
+            resolve({
+              contract,
+              bid: ticks[0]!.value!,
+              ask: ticks[1]!.value!,
+              delta: ticks[2]!.value!,
+              openInterest: ticks[3]!.value!,
+              receivedAt: new Date(Math.min(...ticks.map((t) => t!.ingressTm))).toISOString(),
+            });
+            // Unsubscribe after the synchronous notification returns as well.
+            queueMicrotask(() => subscription.unsubscribe());
+          },
+          error: (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        });
+    });
+  }
+
+  async getWheelFunds(): Promise<{ cashUsd: number; realized: number; unrealized: number }> {
+    const update = await firstValue(this.api.getAccountSummary('All', '$LEDGER:USD'));
+    let cashUsd: number | null = null;
+    for (const values of entriesForAccount(update.all, this.config.accountId)) {
+      const cash = values.get('CashBalance')?.get('USD');
+      if (cash && Number.isFinite(Number(cash.value))) cashUsd = Number(cash.value);
+    }
+    const pnl = await firstValue(this.api.getPnL(this.config.accountId));
+    if (
+      cashUsd === null ||
+      !Number.isFinite(pnl.realizedPnL) ||
+      !Number.isFinite(pnl.unrealizedPnL)
+    ) {
+      throw new Error('USD cash or daily P&L unavailable');
+    }
+    const account = await this.getAccountSummary();
+    let conversion = 1;
+    if (account.currency !== 'USD') {
+      if (account.currency !== 'CAD') throw new Error('wheel P&L currency is unsupported');
+      const fx = await withTimeout(
+        this.api.getMarketDataSnapshot(
+          { symbol: 'USD', secType: SecType.CASH, exchange: 'IDEALPRO', currency: 'CAD' },
+          '',
+          false,
+        ),
+        15000,
+      );
+      const bid = fx.get(1)?.value;
+      const ask = fx.get(2)?.value;
+      if (!(bid! > 0 && ask! >= bid!)) throw new Error('live USD.CAD quote unavailable');
+      conversion = (bid! + ask!) / 2;
+    }
+    return {
+      cashUsd,
+      realized: pnl.realizedPnL! / conversion,
+      unrealized: pnl.unrealizedPnL! / conversion,
+    };
+  }
+
   async getPositions(): Promise<BrokerPosition[]> {
     const update = await firstValue(this.api.getPositions());
     const positions: BrokerPosition[] = [];
@@ -571,6 +715,7 @@ export class StoqeyIbSocket implements IbSocket {
         }
 
         positions.push({
+          contract: fromIbContract(position.contract),
           symbol: position.contract.symbol,
           quantity: position.pos,
           averageCost: position.avgCost ?? 0,
@@ -687,6 +832,7 @@ export class StoqeyIbSocket implements IbSocket {
 
         this.fillHandlers.forEach((handler) =>
           handler({
+            contract: fromIbContract(contract),
             clientOrderId,
             brokerOrderId: String(execution.orderId),
             fillId: execution.execId ?? `${execution.orderId}-${execution.shares}`,

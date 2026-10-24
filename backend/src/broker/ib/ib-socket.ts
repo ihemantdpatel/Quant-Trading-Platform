@@ -93,6 +93,9 @@ export interface DisconnectEvent {
  * test.
  */
 export interface IbSocket {
+  getAccountOpenOrders?: import('../broker-adapter.interface').BrokerAdapter['getAccountOpenOrders'];
+  scanOptions?: import('../broker-adapter.interface').BrokerAdapter['scanOptions'];
+  getWheelFunds?: import('../broker-adapter.interface').BrokerAdapter['getWheelFunds'];
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;

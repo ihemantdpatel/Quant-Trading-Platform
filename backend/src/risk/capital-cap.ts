@@ -8,10 +8,10 @@
  * because correlation goes to 1 in a crisis — every per-symbol limit can be
  * satisfied while the account is fully committed.
  *
- * **Sells are never capped.** A capital control that can block an exit is a
+ * **Exposure-reducing exits are never capped.** A capital control that can block an exit is a
  * bug, not a safeguard: it would strand a lot that reached its target and turn
  * a risk limit into a reason to hold losing exposure. Every function here
- * short-circuits on `SELL`.
+ * short-circuits on exposure reduction. Option SELL OPEN consumes collateral.
  *
  * The three limits are independent. An intent must satisfy all of them, and the
  * binding one is the smallest — reported by name so a log line says which
@@ -19,7 +19,7 @@
  */
 
 import { globalCapitalCap, RiskConfig } from './risk.config';
-import { intentNotional, RiskIntent, RiskReason, roundToCents } from './types';
+import { intentNotional, reducesExposure, RiskIntent, RiskReason, roundToCents } from './types';
 
 /**
  * Capital currently committed, as the cap sees it.
@@ -153,7 +153,7 @@ export function applyCapitalCap(
 ): CapitalVerdict {
   // Exits are exempt. See the file comment — blocking a sell would strand a lot
   // that reached its target.
-  if (intent.side === 'SELL') {
+  if (reducesExposure(intent)) {
     return {
       approvedQuantity: intent.quantity,
       reason: RiskReason.EXIT_EXEMPT,
@@ -177,7 +177,9 @@ export function applyCapitalCap(
   // finite here: the global ceiling is unconditional, so there is always at
   // least one.
   const ceiling = binding!;
-  const affordable = Math.floor(headroom / intent.limitPrice);
+  const unitCost = intent.capitalPerUnit ?? intent.limitPrice;
+  const unit = intent.contract?.secType === 'OPT' ? 'contracts' : 'shares';
+  const affordable = Math.floor(headroom / unitCost);
 
   if (affordable <= 0) {
     return {
@@ -186,7 +188,7 @@ export function applyCapitalCap(
       detail:
         `${ceiling.label} exhausted: ${ceiling.used.toFixed(2)} of ` +
         `${ceiling.limit.toFixed(2)} deployed, no capacity for ` +
-        `${intent.quantity} shares at ${intent.limitPrice.toFixed(2)}`,
+        `${intent.quantity} ${unit} at ${unitCost.toFixed(2)}`,
     };
   }
 
@@ -194,8 +196,8 @@ export function applyCapitalCap(
     approvedQuantity: affordable,
     reason: ceiling.reason,
     detail:
-      `${ceiling.label} binds: resized ${intent.quantity} → ${affordable} shares ` +
-      `at ${intent.limitPrice.toFixed(2)} to fit remaining headroom ${headroom.toFixed(2)} ` +
+      `${ceiling.label} binds: resized ${intent.quantity} → ${affordable} ${unit} ` +
+      `at ${unitCost.toFixed(2)} to fit remaining headroom ${headroom.toFixed(2)} ` +
       `(${ceiling.used.toFixed(2)} of ${ceiling.limit.toFixed(2)} deployed)`,
   };
 }
@@ -213,9 +215,9 @@ export function withIntentDeployed(
   intent: RiskIntent,
   quantity: number,
 ): DeployedCapital {
-  const notional = roundToCents(quantity * intent.limitPrice);
+  const notional = intentNotional({ ...intent, quantity });
   // A sell releases capital; a buy commits it.
-  const delta = intent.side === 'SELL' ? -notional : notional;
+  const delta = reducesExposure(intent) ? -notional : notional;
 
   return {
     total: roundToCents(Math.max(0, deployed.total + delta)),

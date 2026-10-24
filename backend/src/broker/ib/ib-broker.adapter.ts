@@ -665,6 +665,24 @@ export class IBBrokerAdapter implements BrokerAdapter, OnModuleDestroy {
     return this.socket.getAccountSummary();
   }
 
+  async getAccountOpenOrders(): Promise<OpenOrder[]> {
+    if (!this.isConnected() || !this.socket.getAccountOpenOrders)
+      throw new Error('account orders unavailable');
+    return this.socket.getAccountOpenOrders();
+  }
+
+  async scanOptions(request: Parameters<NonNullable<BrokerAdapter['scanOptions']>>[0]) {
+    if (!this.isConnected() || !this.socket.scanOptions)
+      throw new Error('options data unavailable');
+    return this.socket.scanOptions(request);
+  }
+
+  async getWheelFunds() {
+    if (!this.isConnected() || !this.socket.getWheelFunds)
+      throw new Error('USD cash/P&L unavailable');
+    return this.socket.getWheelFunds();
+  }
+
   onFill(handler: (fill: Fill) => void): () => void {
     return this.socket.onFill(handler);
   }

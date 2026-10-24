@@ -30,6 +30,11 @@ export function Tabs({ fallbackAccount = null }: { fallbackAccount?: string | nu
       ? [
           { href: accountPath(account), label: 'Execution', active: current?.rest === '' },
           {
+            href: accountPath(account, '/wheel'),
+            label: 'Wheel',
+            active: current?.rest.startsWith('/wheel') ?? false,
+          },
+          {
             href: accountPath(account, '/parameters'),
             label: 'Parameters',
             active: current?.rest.startsWith('/parameters') ?? false,

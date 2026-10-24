@@ -130,6 +130,8 @@ export interface StrategyState {
  * tell which broker exists.
  */
 export interface StrategyContext {
+  /** Prepared options evidence; fetching remains outside the strategy. */
+  readonly wheel?: import('./wheel/wheel.strategy').WheelEvaluation;
   readonly strategyId: string;
   readonly symbols: readonly string[];
   /** ISO-8601 ET, supplied by the caller. Strategies never read a clock. */

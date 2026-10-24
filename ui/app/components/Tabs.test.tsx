@@ -38,6 +38,7 @@ describe('Tabs', () => {
   it.each([
     ['/accounts/nuuixl118', 'Execution'],
     ['/accounts/nuuixl118/parameters', 'Parameters'],
+    ['/accounts/nuuixl118/wheel', 'Wheel'],
     ['/backtest', 'Backtesting'],
   ])('marks the tab for %s as current', (pathname, expected) => {
     mockPathname.mockReturnValue(pathname);

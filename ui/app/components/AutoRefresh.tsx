@@ -29,7 +29,8 @@ import { accountFromPath } from '../lib/api';
  * `revalidatePath` after a successful edit still updates the page.
  */
 function isPaused(pathname: string): boolean {
-  return accountFromPath(pathname)?.rest.startsWith('/parameters') ?? false;
+  const rest = accountFromPath(pathname)?.rest;
+  return rest?.startsWith('/parameters') === true || rest?.startsWith('/wheel') === true;
 }
 
 export function AutoRefresh({ intervalMs = 3000 }: { intervalMs?: number }) {

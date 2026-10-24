@@ -1402,3 +1402,29 @@ export function accountFromPath(pathname: string): { account: string; rest: stri
 export function accountPath(account: string, rest = ''): string {
   return `/accounts/${encodeURIComponent(account)}${rest}`;
 }
+
+export interface WheelState {
+  config: { symbol: string; allocation: number } | null;
+  enabled: boolean;
+  halt: string | null;
+  shares: number;
+  stockCost: number;
+  orders: {
+    id: string;
+    quantity: number;
+    status: string;
+    settled: boolean;
+    contract: { symbol: string; expiry: string; strike: number; right: string };
+  }[];
+  audit: { at: string; action: string; reason: string }[];
+}
+
+export async function loadWheel(
+  account: string,
+): Promise<{ state: WheelState | null; error: string | null }> {
+  try {
+    return { state: await get<WheelState>(await baseUrlFor(account), '/wheel', 5000), error: null };
+  } catch (error) {
+    return { state: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}

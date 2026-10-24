@@ -24,6 +24,11 @@ export type RiskSide = 'BUY' | 'SELL';
 
 /** An intent as the risk manager receives it, from any strategy. */
 export interface RiskIntent {
+  contract?: import('../domain/contract').Contract;
+  exposureEffect?: 'OPEN' | 'CLOSE';
+  coverage?: { cash: number; shares: number };
+  /** Fully funded assignment liability; zero only for a share-covered call. */
+  capitalPerUnit?: number;
   /**
    * Which strategy emitted this. Required, because per-strategy allocation
    * limits cannot be enforced without it and the global cap has to attribute
@@ -108,8 +113,17 @@ export function isSubmittable(decision: RiskDecision): boolean {
  * limit order can never fill above it — this is the worst case, and a capital
  * cap has to be enforced against the worst case.
  */
-export function intentNotional(intent: Pick<RiskIntent, 'quantity' | 'limitPrice'>): number {
-  return roundToCents(intent.quantity * intent.limitPrice);
+export function intentNotional(
+  intent: Pick<RiskIntent, 'quantity' | 'limitPrice' | 'capitalPerUnit'>,
+): number {
+  return roundToCents(intent.quantity * (intent.capitalPerUnit ?? intent.limitPrice));
+}
+
+export function reducesExposure(intent: RiskIntent): boolean {
+  return (
+    intent.exposureEffect === 'CLOSE' ||
+    (intent.exposureEffect === undefined && intent.side === 'SELL')
+  );
 }
 
 export function roundToCents(value: number): number {

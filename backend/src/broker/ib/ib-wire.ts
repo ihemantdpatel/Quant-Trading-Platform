@@ -27,6 +27,23 @@ import { DateTime } from 'luxon';
 import { maskAccountId } from '../../config/account-registration';
 import { manualFillClientOrderId } from '../../domain/client-order-id';
 import { Contract, SecurityType } from '../../domain/contract';
+
+export function fromIbContract(c: IbContract): Contract {
+  return {
+    symbol: c.symbol ?? '',
+    secType: c.secType as unknown as SecurityType,
+    exchange: c.exchange ?? 'SMART',
+    currency: c.currency ?? '',
+    multiplier: c.secType === SecType.OPT ? Number(c.multiplier) : 1,
+    ...(c.secType === SecType.OPT
+      ? {
+          strike: c.strike,
+          right: c.right as Contract['right'],
+          expiry: c.lastTradeDateOrContractMonth?.replace(/^(\d{4})(\d{2})(\d{2}).*$/, '$1-$2-$3'),
+        }
+      : {}),
+  };
+}
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
 import { BrokerOrder, CompletedOrder, OrderStatus } from '../broker-adapter.interface';

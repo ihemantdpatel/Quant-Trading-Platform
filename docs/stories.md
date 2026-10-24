@@ -1252,6 +1252,11 @@ clean weeks.
 
 ## Story 16 — Phase 4 handoff: Grid, Wheel, LEAPs
 
+**Wheel paper slice:** QQQ cash-secured puts and covered calls now have an opt-in
+options-data/runtime path and dashboard controls. The first version uses an explicit
+operator checkpoint for expiration/assignment; rolling, historical options backtests,
+and the full paper-cycle sign-off remain outstanding. See [wheel-paper.md](wheel-paper.md).
+
 **Goal:** Build out the three scaffolded strategies against the now-proven engine.
 
 **Depends on:** Story 15

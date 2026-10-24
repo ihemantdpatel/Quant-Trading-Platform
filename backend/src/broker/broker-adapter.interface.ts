@@ -64,6 +64,7 @@ export interface OrderAck {
 }
 
 export interface Fill {
+  contract?: Contract;
   clientOrderId: string;
   brokerOrderId: string;
   /** Unique per fill. One order can produce several. */
@@ -88,6 +89,7 @@ export interface Fill {
  * differently: the former already has shares the ladder may not know about.
  */
 export interface OpenOrder {
+  contract?: Contract;
   clientOrderId: string;
   brokerOrderId: string;
   symbol: string;
@@ -143,6 +145,7 @@ export interface CompletedOrder {
  * composition and the broker is authoritative on the total.
  */
 export interface BrokerPosition {
+  contract?: Contract;
   symbol: string;
   quantity: number;
   averageCost: number;
@@ -174,6 +177,12 @@ export interface ConnectionHealth {
 }
 
 export interface BrokerAdapter {
+  getAccountOpenOrders?(): Promise<OpenOrder[]>;
+  /** Optional capabilities: wheel refuses to trade without both. */
+  scanOptions?(
+    request: Omit<import('../domain/options').OptionScan, 'underlyingPrice' | 'quotes'>,
+  ): Promise<import('../domain/options').OptionScan>;
+  getWheelFunds?(): Promise<{ cashUsd: number; realized: number; unrealized: number }>;
   readonly name: string;
 
   connect(): Promise<void>;

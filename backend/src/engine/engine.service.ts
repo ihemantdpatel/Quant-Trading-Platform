@@ -47,6 +47,7 @@ import { ReplayService } from '../market-data/mock/replay.service';
 import { isRegularSession } from '../market-data/session';
 import { Bar, BarSize } from '../market-data/types';
 import { AccountSnapshot, RiskManagerService } from '../risk/risk-manager.service';
+import { committedCapital } from '../risk/committed-capital';
 import { RiskIntent, RiskOutcome } from '../risk/types';
 import { CoordinatorService } from '../strategies/coordinator.service';
 import { DipLadderConfig, OrderPlacement } from '../strategies/dip-ladder/config';
@@ -260,6 +261,19 @@ function roundPrice(value: number): number {
 
 @Injectable()
 export class EngineService {
+  private accountSubmissionQueue: Promise<unknown> = Promise.resolve();
+  private wheelRiskEnabled = false;
+
+  setWheelRiskEnabled(): void {
+    this.wheelRiskEnabled = true;
+  }
+
+  /** Shared by scheduled options and stock entries: snapshot → decision → submit is serialized. */
+  runAccountSubmission<T>(action: () => Promise<T>): Promise<T> {
+    const next = this.accountSubmissionQueue.then(action);
+    this.accountSubmissionQueue = next.catch(() => undefined);
+    return next;
+  }
   private readonly logger = new Logger(EngineService.name);
 
   /**
@@ -599,7 +613,13 @@ export class EngineService {
    * fill can arrive, and therefore trigger a recompute, on the very bar
    * whose own `intent-<timestamp>-<i>` ids share that same timestamp.
    */
-  private async submitIntents(
+  private async submitIntents(intents: OrderIntent[], timestamp: string, recordIdPrefix: string) {
+    return this.runAccountSubmission(() =>
+      this.submitIntentsUnlocked(intents, timestamp, recordIdPrefix),
+    );
+  }
+
+  private async submitIntentsUnlocked(
     intents: OrderIntent[],
     timestamp: string,
     recordIdPrefix: string,
@@ -2498,6 +2518,12 @@ export class EngineService {
    * the safe direction.
    */
   private async accountSnapshot(): Promise<AccountSnapshot> {
+    if (this.wheelRiskEnabled) {
+      const open = await (this.broker.getAccountOpenOrders?.() ?? this.broker.getOpenOrders());
+      const positions = await this.broker.getPositions();
+      const funds = await this.broker.getWheelFunds!();
+      return { deployed: committedCapital(positions, open), pnl: funds };
+    }
     const deployed = { total: 0, bySymbol: {}, byStrategy: {} };
 
     try {
@@ -2551,6 +2577,12 @@ export class EngineService {
    * decided to close.
    */
   async placeMissingOrders(candidates: MissingOrderCandidate[]): Promise<PlacementResult> {
+    return this.runAccountSubmission(() => this.placeMissingOrdersUnlocked(candidates));
+  }
+
+  private async placeMissingOrdersUnlocked(
+    candidates: MissingOrderCandidate[],
+  ): Promise<PlacementResult> {
     const result: PlacementResult = { placed: [], declined: [] };
 
     if (candidates.length === 0) {
@@ -3030,6 +3062,8 @@ export class EngineService {
   }
 
   async reset(): Promise<void> {
+    if (this.wheelRiskEnabled)
+      throw new Error('engine reset is disabled while a durable wheel ledger exists');
     this.entryHalt = null;
     this.alerts.length = 0;
     this.clientOrderSequence = 0;
@@ -3060,6 +3094,7 @@ export class EngineService {
  */
 export function toRiskIntent(intent: OrderIntent): RiskIntent {
   return {
+    ...(intent.contract.secType === 'OPT' ? { contract: intent.contract } : {}),
     strategyId: intent.strategyId,
     symbol: intent.contract.symbol,
     side: intent.side,

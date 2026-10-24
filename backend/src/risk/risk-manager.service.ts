@@ -28,6 +28,8 @@
  */
 
 import { Injectable, Logger } from '@nestjs/common';
+import { SecurityType } from '../domain/contract';
+import { validStandardOption } from '../domain/options';
 import { ExecutionMode } from '../config/execution-mode';
 import {
   applyCapitalCap,
@@ -181,6 +183,33 @@ export class RiskManagerService {
       );
     }
 
+    if (
+      intent.contract?.secType === SecurityType.OPTION &&
+      (!validStandardOption(intent.contract) ||
+        !Number.isInteger(intent.quantity) ||
+        intent.side !== 'SELL' ||
+        intent.exposureEffect !== 'OPEN' ||
+        intent.capitalPerUnit !==
+          (intent.contract.right === 'P' ? intent.contract.strike! * 100 : 0) ||
+        !intent.coverage ||
+        !Number.isFinite(intent.coverage.cash) ||
+        !Number.isFinite(intent.coverage.shares) ||
+        (intent.contract.right === 'P'
+          ? intent.quantity * intent.capitalPerUnit > intent.coverage.cash
+          : intent.quantity * 100 > intent.coverage.shares))
+    ) {
+      return reject(
+        RiskReason.INVALID_INTENT,
+        'option entries require explicit cash/share coverage and whole standard contracts',
+      );
+    }
+    if (
+      intent.capitalPerUnit !== undefined &&
+      (!Number.isFinite(intent.capitalPerUnit) || intent.capitalPerUnit < 0)
+    ) {
+      return reject(RiskReason.INVALID_INTENT, 'invalid collateral per unit');
+    }
+
     if (this.killSwitch.isEngaged()) {
       const state = this.killSwitch.snapshot();
       return reject(
@@ -257,7 +286,7 @@ export class RiskManagerService {
       orderType: 'LMT',
       limitPrice: intent.limitPrice,
       timeInForce: 'DAY',
-      notional: intentNotional({ quantity: approvedQuantity, limitPrice: intent.limitPrice }),
+      notional: intentNotional({ ...intent, quantity: approvedQuantity }),
       strategyId: intent.strategyId,
       timestamp: intent.timestamp,
     };

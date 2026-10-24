@@ -6,9 +6,9 @@
  * registrations, so enabling the Wheel at Story 16 is a change here rather
  * than anywhere in the strategy layer.
  *
- * **Current operator choice: the grid strategy trades TQQQ; Wheel and Leaps
- * are disabled, and the dip ladder is retired** — not registered at all, so
- * nothing can re-enable it. See `onModuleInit`.
+ * GRID trades TQQQ through the bar-driven engine. The wheel has a separate,
+ * opt-in scheduled runtime on the same account; LEAPs stays disabled. The dip
+ * ladder is retired and unregistered, so nothing can re-enable it.
  */
 
 import { AccountsController } from '../api/accounts.controller';
@@ -92,6 +92,8 @@ import { GridConfig } from '../strategies/grid/config';
 import { GridStrategy } from '../strategies/grid/grid.strategy';
 import { GridParameterService } from '../strategies/grid/parameter.service';
 import { LeapsStrategy } from '../strategies/leaps/leaps.strategy';
+import { WheelController } from '../api/wheel.controller';
+import { WheelService } from './wheel.service';
 import { WheelStrategy } from '../strategies/wheel/wheel.strategy';
 import { ParameterService } from '../strategies/dip-ladder/parameter.service';
 import { DIP_LADDER_CONFIG, GRID_CONFIG, StrategiesModule } from '../strategies/strategies.module';
@@ -112,6 +114,7 @@ import { StartupSequence } from './startup.sequence';
     StrategiesModule,
   ],
   controllers: [
+    WheelController,
     AccountsController,
     BacktestController,
     EngineController,
@@ -119,6 +122,7 @@ import { StartupSequence } from './startup.sequence';
     RiskParametersController,
   ],
   providers: [
+    WheelService,
     ParameterService,
     GridParameterService,
     RiskParameterService,
