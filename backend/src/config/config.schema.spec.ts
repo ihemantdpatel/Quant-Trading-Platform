@@ -165,3 +165,12 @@ describe('validateConfig', () => {
     });
   });
 });
+
+describe('GRID startup preference', () => {
+  it('preserves the enabled default and supports an explicit clean-wheel startup', () => {
+    expect(validateConfig({}).GRID_ENABLED).toBe(true);
+    expect(validateConfig({ GRID_ENABLED: 'false' }).GRID_ENABLED).toBe(false);
+    expect(validateConfig({ GRID_ENABLED: 'true' }).GRID_ENABLED).toBe(true);
+    expect(() => validateConfig({ GRID_ENABLED: 'no' })).toThrow(/GRID_ENABLED/);
+  });
+});

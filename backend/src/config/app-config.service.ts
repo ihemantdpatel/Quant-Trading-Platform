@@ -36,6 +36,11 @@ export class AppConfigService {
     return this.config.get('IB_ACCOUNT_ID', { infer: true });
   }
 
+  /** Startup preference; runtime dashboard controls can still change enablement. */
+  get gridEnabled(): boolean {
+    return String(this.config.get('GRID_ENABLED', { infer: true })) !== 'false';
+  }
+
   get executionMode(): ExecutionMode {
     return this.config.get('EXECUTION_MODE', { infer: true });
   }

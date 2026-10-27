@@ -383,7 +383,6 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
    * used to. The ladder is retired, not merely disabled — see
    * `onModuleInit`.
    */
-  private readonly gridEnabled = true;
 
   constructor(
     private readonly coordinator: CoordinatorService,
@@ -478,7 +477,7 @@ export class EngineModule implements OnModuleInit, OnModuleDestroy {
 
     this.coordinator.register({
       strategy: grid,
-      enabled: this.gridEnabled,
+      enabled: this.appConfig.gridEnabled !== false,
       symbols: [this.gridConfig.symbol],
     });
 

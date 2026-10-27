@@ -54,6 +54,9 @@ export const configSchema = z
         })
         .optional(),
     ),
+    GRID_ENABLED: z
+      .preprocess(blankAsUnset, z.enum(['true', 'false']).default('true'))
+      .transform((value) => value === 'true'),
     EXECUTION_MODE: z.nativeEnum(ExecutionMode).default(DEFAULT_EXECUTION_MODE),
     PORT: z.coerce.number().int().positive().default(3000),
     /**

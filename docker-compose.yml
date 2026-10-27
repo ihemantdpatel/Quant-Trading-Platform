@@ -163,6 +163,7 @@ services:
       # PAPER is the default since Story 13; SHADOW is retired and refused at
       # boot. LIVE stays refused by the startup assertions until Story 15.
       EXECUTION_MODE: ${EXECUTION_MODE:-PAPER}
+      GRID_ENABLED: ${GRID_ENABLED:-true}
       PORT: 3000
       # Presence of this variable is what selects the Prisma repositories over
       # the in-memory ones (`engine.module.ts`). Unset it and the engine still

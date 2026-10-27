@@ -5,6 +5,13 @@ put/call workflow. It does not copy its Python execution engine. GRID continues 
 TQQQ in the same daemon and IB paper account. Do not start a second daemon against
 the same account to run the wheel.
 
+## Wheel-only startup
+
+Set `GRID_ENABLED=false` in the existing account environment before starting Compose
+for a clean Wheel-only run. This keeps GRID disabled across container restarts;
+the dashboard can still enable it deliberately. The retired ladder stays unregistered.
+Historical rows remain stored and are not fabricated into Wheel positions.
+
 ## Configuration and first run
 
 Open the account's **Wheel** tab. The form is prefilled with the operator's choices:
