@@ -75,6 +75,8 @@ import {
 import {
   durationString,
   fromIbContract,
+  isRequestScopedIbError,
+  usdCashBalance,
   parseIbTime,
   executionClientOrderId,
   resolveClientOrderId,
@@ -665,8 +667,7 @@ export class StoqeyIbSocket implements IbSocket {
     const update = await firstValue(this.api.getAccountSummary('All', '$LEDGER:USD'));
     let cashUsd: number | null = null;
     for (const values of entriesForAccount(update.all, this.config.accountId)) {
-      const cash = values.get('CashBalance')?.get('USD');
-      if (cash && Number.isFinite(Number(cash.value))) cashUsd = Number(cash.value);
+      cashUsd = usdCashBalance(values);
     }
     const pnl = await firstValue(this.api.getPnL(this.config.accountId));
     if (
@@ -795,7 +796,7 @@ export class StoqeyIbSocket implements IbSocket {
   private wireErrorHandling(): void {
     this.api.errorSubject.subscribe((error: IBApiNextError) => {
       const code = typeof error.code === 'number' ? error.code : null;
-      this.classifyError(code, error.error.message);
+      this.classifyError(code, error.error.message, error.reqId);
     });
 
     // The execution stream's client needs the same treatment. It is a second,
@@ -808,6 +809,7 @@ export class StoqeyIbSocket implements IbSocket {
       this.classifyError(
         typeof code === 'number' ? code : null,
         `${error.message}${reqId >= 0 ? ` (reqId ${reqId})` : ''}`,
+        reqId,
       );
     });
 
@@ -940,7 +942,11 @@ export class StoqeyIbSocket implements IbSocket {
    * Shared rather than duplicated per socket: the re-auth/fault split is the
    * load-bearing decision, and two copies would be two things to keep in step.
    */
-  private classifyError(code: number | null, message: string): void {
+  private classifyError(code: number | null, message: string, reqId = -1): void {
+    if (isRequestScopedIbError(code, reqId)) {
+      this.logger.warn(`IB request ${reqId} failed [${code}]: ${message}`);
+      return;
+    }
     if (isReauthCode(code)) {
       // 1102 means connectivity was restored *with* data retained — the
       // session is already usable again, so it is reported as routine and

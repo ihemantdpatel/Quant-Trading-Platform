@@ -472,3 +472,18 @@ export function checkManagedAccount(managed: readonly string[], accountId: strin
     'login cannot see.'
   );
 }
+
+/** Contract/data/order request failures do not imply that the socket was lost. */
+export function isRequestScopedIbError(code: number | null, reqId: number): boolean {
+  return reqId >= 0 && code !== null && ![502, 504, 1100, 1101, 1102, 1300].includes(code);
+}
+
+/** Newer TWS versions prefix per-currency fields; never use a CAD aggregate as USD. */
+export function usdCashBalance(
+  values: ReadonlyMap<string, ReadonlyMap<string, { value: unknown }>>,
+): number | null {
+  const raw = (values.get('$LEDGER-CashBalance') ?? values.get('CashBalance'))?.get('USD')?.value;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
