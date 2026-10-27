@@ -88,3 +88,25 @@ export function scanStrikes(
   }
   return [...selected];
 }
+
+/** The chain's strike list spans expiries; only qualified contracts prove a strike exists for this date. */
+export function strikesForExpiry(
+  contracts: readonly Contract[],
+  symbol: string,
+  expiry: string,
+  right: 'P' | 'C',
+): number[] {
+  return [
+    ...new Set(
+      contracts
+        .filter(
+          (c) =>
+            validStandardOption(c) &&
+            c.symbol === symbol &&
+            c.expiry === expiry &&
+            c.right === right,
+        )
+        .map((c) => c.strike!),
+    ),
+  ].sort((a, b) => a - b);
+}

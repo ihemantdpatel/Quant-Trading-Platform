@@ -47,7 +47,13 @@ import {
 import { Observable } from 'rxjs';
 import { DateTime } from 'luxon';
 import { Contract, equityContract, optionContract, OptionRight } from '../../domain/contract';
-import { OptionScan, OptionQuote, liquidSessionOpen, scanStrikes } from '../../domain/options';
+import {
+  OptionScan,
+  OptionQuote,
+  liquidSessionOpen,
+  scanStrikes,
+  strikesForExpiry,
+} from '../../domain/options';
 import { LiveBarGate } from './live-bar-gate';
 import { formatEt } from '../../market-data/session';
 import { Bar, BarSize, ET_ZONE } from '../../market-data/types';
@@ -602,7 +608,31 @@ export class StoqeyIbSocket implements IbSocket {
         return dte >= request.minDte && dte <= request.maxDte;
       });
     if (!expiry) return { ...request, underlyingPrice, quotes: [] };
-    const strikes = scanStrikes(chain.strikes, underlyingPrice, request.right, request.strikeLimit);
+    const qualified = await withTimeout(
+      this.api.getContractDetails({
+        symbol: request.symbol,
+        secType: SecType.OPT,
+        exchange: 'SMART',
+        currency: 'USD',
+        lastTradeDateOrContractMonth: expiry,
+        right: request.right as unknown as IbContract['right'],
+        multiplier: 100,
+        tradingClass: request.symbol,
+      }),
+      15000,
+    );
+    const availableStrikes = strikesForExpiry(
+      qualified.map((d) => fromIbContract(d.contract ?? {})),
+      request.symbol,
+      DateTime.fromFormat(expiry, 'yyyyMMdd').toISODate()!,
+      request.right,
+    );
+    const strikes = scanStrikes(
+      availableStrikes,
+      underlyingPrice,
+      request.right,
+      request.strikeLimit,
+    );
     const quotes: OptionQuote[] = [];
     for (let i = 0; i < strikes.length; i += 4) {
       const batch = await Promise.all(

@@ -27,3 +27,24 @@ it('returns broker refusal details and does not refresh a preview', async () => 
   expect((await wheelAction('paper', 'preview')).message).toBe('cash unavailable; try again');
   expect(revalidatePath).not.toHaveBeenCalled();
 });
+
+it('shows the actual reason when a successful check places no order', async () => {
+  send.mockResolvedValue({
+    ok: true,
+    status: 201,
+    data: { submitted: null, reason: 'daily loss breaker active' },
+    error: null,
+  });
+  expect((await wheelAction('paper', 'run')).message).toBe(
+    'No order placed: daily loss breaker active',
+  );
+});
+it('distinguishes an acknowledged order from a check that places nothing', async () => {
+  send.mockResolvedValue({
+    ok: true,
+    status: 201,
+    data: { submitted: 'wheel-1', reason: 'SUBMITTED' },
+    error: null,
+  });
+  expect((await wheelAction('paper', 'run')).message).toBe('Paper order submitted: SUBMITTED');
+});

@@ -299,7 +299,11 @@ export class WheelService implements OnModuleInit, OnModuleDestroy {
         return await this.engine.runAccountSubmission(async () => {
           const evidence = await this.evidence();
           if (this.engine.isHalted() || !this.risk.canSubmit())
-            throw new Error('submission halted');
+            throw new Error(
+              this.risk.isHalted()
+                ? 'submission halted: daily loss breaker is active'
+                : 'submission halted: kill switch or technical halt is active',
+            );
           const intent = this.decide(scan, evidence.cash)[0];
           if (!intent)
             return { submitted: null, reason: 'no eligible contract or cycle already open' };

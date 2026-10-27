@@ -24,11 +24,16 @@ export async function wheelAction(
   const result = await post<unknown>(account, `/wheel/${action}`, input);
   if (action !== 'preview') revalidatePath(`/accounts/${encodeURIComponent(account)}/wheel`);
   const body = result.error as { message?: string | string[] } | null;
+  const outcome = result.data as { submitted?: string | null; reason?: string } | null;
+  const runMessage =
+    action === 'run' && typeof outcome?.reason === 'string'
+      ? `${outcome.submitted ? 'Paper order submitted' : 'No order placed'}: ${outcome.reason}`
+      : null;
   return {
     ok: result.ok,
     data: result.data,
     message: result.ok
-      ? `${action} completed`
+      ? (runMessage ?? `${action} completed`)
       : Array.isArray(body?.message)
         ? body.message.join('; ')
         : (body?.message ?? 'The wheel request failed.'),

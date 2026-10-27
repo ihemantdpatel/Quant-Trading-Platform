@@ -43,3 +43,18 @@ it('samples enough OTM distance to find low-delta QQQ contracts and honors a cal
   expect(scanStrikes([], 550, 'P')).toEqual([]);
   expect(scanStrikes(strikes, 550, 'P', 500).every((s) => s <= 500)).toBe(true);
 });
+
+import { strikesForExpiry } from './options';
+it('samples only strikes confirmed for the selected expiry, excluding other series and adjusted contracts', () => {
+  const contracts = [
+    put,
+    { ...put, strike: 505 },
+    { ...put, strike: 505 },
+    { ...put, strike: 666, expiry: '2026-11-27' },
+    { ...put, strike: 510, right: OptionRight.CALL },
+    { ...put, strike: 515, multiplier: 10 },
+    { ...put, symbol: 'SPY' },
+  ];
+  expect(strikesForExpiry(contracts, 'QQQ', '2026-11-20', 'P')).toEqual([500, 505]);
+  expect(strikesForExpiry([], 'QQQ', '2026-11-20', 'P')).toEqual([]);
+});
